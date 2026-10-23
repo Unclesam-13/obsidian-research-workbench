@@ -61,7 +61,7 @@
 
 目前还没有上架社区插件市场，可以手动安装：
 
-1. 打开 [Releases](https://github.com/Unclesam-13/obsidian-research-workbench/releases)，下载 `main.js`、`manifest.json`、`styles.css`、`vendor-katex.js`、`vendor-katex.css` 五个文件。
+1. 在本页点 **Code → Download ZIP**，解压后取出 `main.js`、`manifest.json`、`styles.css`、`vendor-katex.js`、`vendor-katex.css` 五个文件（有 [Releases](https://github.com/Unclesam-13/obsidian-research-workbench/releases) 时也可以直接在那里下载）。
 2. 在库里新建文件夹 `.obsidian/plugins/research-workbench/`，把这五个文件放进去。
 3. 打开 Obsidian → 设置 → 第三方插件，关闭安全模式，然后启用「科研工作台」。
 4. 点左侧边栏的 🧪 图标，或在命令面板搜索「打开科研工作台」。
