@@ -1,0 +1,10 @@
+{
+  "id": "research-workbench",
+  "name": "科研工作台 Research Workbench",
+  "version": "0.21.9",
+  "minAppVersion": "1.4.0",
+  "description": "多项目 × 科研流程工作台：灵感、文献综述、实验、数据分析、论文写作、投稿发表，一屏看清每个项目走到哪一步。",
+  "author": "Unclesam-13",
+  "isDesktopOnly": false,
+  "authorUrl": "https://github.com/Unclesam-13"
+}

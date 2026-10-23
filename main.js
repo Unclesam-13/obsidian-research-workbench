@@ -1,0 +1,16225 @@
+'use strict';
+/*
+ * 科研工作台 Research Workbench — Obsidian plugin
+ * 多项目 × 科研流程（灵感 → 文献综述 → 实验 → 数据分析 → 论文写作 → 投稿发表）
+ * 所有数据都是普通 Markdown + YAML frontmatter，插件只负责读取、汇总和修改属性。
+ */
+const obsidian = require('obsidian');
+const { Plugin, ItemView, Modal, Setting, PluginSettingTab, Notice, Menu, setIcon, TFile, normalizePath, requestUrl } = obsidian;
+
+const VIEW_TYPE = 'research-workbench-view';
+
+/* ───────────────────────── 配置 ───────────────────────── */
+
+const STAGES = [
+  { id: '灵感', icon: 'lightbulb', color: '#eab308', noteType: 'idea', desc: '捕捉想法 · 评估可行性' },
+  { id: '文献综述', icon: 'book-open', color: '#3b82f6', noteType: 'literature', desc: '检索 · 精读 · 综述' },
+  { id: '实验', icon: 'flask-conical', color: '#10b981', noteType: 'experiment', desc: '方案设计 · 执行记录' },
+  { id: '数据分析', icon: 'bar-chart-3', color: '#8b5cf6', noteType: 'data', desc: '处理 · 统计 · 出图' },
+  { id: '论文写作', icon: 'pen-line', color: '#ec4899', noteType: 'draft', desc: '大纲 · 初稿 · 修改' },
+  { id: '投稿发表', icon: 'send', color: '#f97316', noteType: 'submission', desc: '投稿 · 审稿 · 返修' },
+];
+/* 项目类型：每种类型有自己的流程（资料库没有流程，只存文件） */
+const KINDS = {
+  paper: {
+    label: '论文', icon: 'pen-line', color: '#2a78d6', slot: 1,
+    desc: '以写出并发表一篇论文为目标，从灵感一路推进到投稿',
+    stages: STAGES,
+  },
+  direction: {
+    label: '研究方向', icon: 'compass', color: '#eb6834', slot: 2,
+    desc: '长期关注的方向或课题：梳理领域、找空白、产出选题，下面可以挂多个论文项目',
+    stages: [
+      { id: '入门调研', icon: 'search', color: '#60a5fa', noteType: 'literature', desc: '读综述 · 建立认知' },
+      { id: '系统梳理', icon: 'git-branch', color: '#8b5cf6', noteType: 'literature', desc: '分类 · 对比 · 找空白' },
+      { id: '形成选题', icon: 'lightbulb', color: '#eab308', noteType: 'idea', desc: '提出问题 · 评估可行性' },
+      { id: '持续跟踪', icon: 'activity', color: '#10b981', noteType: 'literature', desc: '跟踪新文献 · 定期更新' },
+    ],
+  },
+  study: {
+    label: '研读他人工作', icon: 'glasses', color: '#1baf7a', slot: 3,
+    desc: '研究某篇论文、某个团队或开源项目：精读、复现、组会汇报',
+    stages: [
+      { id: '收集资料', icon: 'inbox', color: '#94a3b8', noteType: 'literature', desc: '论文 · 代码 · 数据' },
+      { id: '精读理解', icon: 'book-open', color: '#3b82f6', noteType: 'literature', desc: '方法 · 公式 · 细节' },
+      { id: '复现验证', icon: 'flask-conical', color: '#10b981', noteType: 'experiment', desc: '跑代码 · 对结果' },
+      { id: '总结汇报', icon: 'presentation', color: '#f97316', noteType: 'meeting', desc: '组会 PPT · 心得' },
+    ],
+  },
+  grant: {
+    label: '基金 / 申报', icon: 'award', color: '#eda100', slot: 4,
+    desc: '基金、课题、开题 / 中期报告等申报材料的准备',
+    stages: [
+      { id: '选题论证', icon: 'lightbulb', color: '#eab308', noteType: 'idea', desc: '方向 · 创新点' },
+      { id: '材料准备', icon: 'files', color: '#60a5fa', noteType: 'literature', desc: '文献 · 前期成果' },
+      { id: '撰写', icon: 'pen-line', color: '#ec4899', noteType: 'draft', desc: '正文 · 预算' },
+      { id: '修改定稿', icon: 'check-check', color: '#8b5cf6', noteType: 'draft', desc: '征求意见 · 修改' },
+      { id: '提交答辩', icon: 'send', color: '#f97316', noteType: 'submission', desc: '提交 · 答辩 · 结果' },
+    ],
+  },
+  collection: {
+    label: '资料库', icon: 'archive', color: '#e87ba4', slot: 5,
+    desc: '只存放文件和资料，没有流程：课程资料、数据集、别人分享的材料、讲座 PPT…',
+    stages: [],
+  },
+};
+const KIND_ORDER = ['paper', 'direction', 'study', 'grant', 'collection'];
+const KIND_ALIASES = {
+  paper: 'paper', 论文: 'paper', 写论文: 'paper',
+  direction: 'direction', 研究方向: 'direction', 方向: 'direction', 课题: 'direction',
+  study: 'study', 研读: 'study', 研读他人工作: 'study', 研究他人工作: 'study', 复现: 'study',
+  grant: 'grant', 基金: 'grant', '基金 / 申报': 'grant', '基金/申报': 'grant', 申报: 'grant',
+  collection: 'collection', 资料库: 'collection', 资料: 'collection', 其他: 'collection', 文件: 'collection',
+};
+function normKind(v) {
+  if (v == null || v === '') return 'paper';
+  const s = String(Array.isArray(v) ? v[0] : v).trim();
+  return KIND_ALIASES[s] || KIND_ALIASES[s.toLowerCase()] || 'paper';
+}
+function stagesOfKind(k) { return (KINDS[k] || KINDS.paper).stages; }
+function stagesOf(p) { return stagesOfKind(p.pkind); }
+function stageIdxOf(p) { return stagesOf(p).findIndex((s) => s.id === p.stage); }
+function stageDefOf(p) { return stagesOf(p)[stageIdxOf(p)] || null; }
+
+const STAGE_ALIASES = {
+  idea: '灵感', literature: '文献综述', 文献: '文献综述', review: '文献综述',
+  experiment: '实验', analysis: '数据分析', 数据: '数据分析', data: '数据分析',
+  writing: '论文写作', 写作: '论文写作', submission: '投稿发表', 投稿: '投稿发表',
+};
+
+const ACT_PROP_LABELS = { status: '状态', stage: '阶段', kind: '类型', project: '所属项目', priority: '优先级', deadline: '截止日期', due: '截止日期', tags: '标签', category: '分类', type: '类型' };
+const NOTE_TYPES = {
+  idea:       { label: '灵感',     folder: '灵感', icon: 'lightbulb',     stage: '灵感',     statuses: ['待评估', '值得做', '已立项', '搁置'], desc: '随手记录研究想法，评估后转化为项目' },
+  literature: { label: '文献',     folder: '文献', icon: 'book-open',     stage: '文献综述', statuses: ['待读', '在读', '已读', '已整理'], desc: '文献阅读笔记与综述素材' },
+  experiment: { label: '实验',     folder: '实验', icon: 'flask-conical', stage: '实验',     statuses: ['计划中', '进行中', '已完成', '需重做'], desc: '实验方案、过程记录与结果' },
+  data:       { label: '数据',     folder: '数据', icon: 'bar-chart-3',   stage: '数据分析', statuses: ['待分析', '分析中', '已出图', '已归档'], desc: '数据处理、统计分析与图表' },
+  draft:      { label: '写作',     folder: '写作', icon: 'pen-line',      stage: '论文写作', statuses: ['大纲', '初稿', '修改中', '定稿'], desc: '论文各章节草稿' },
+  submission: { label: '投稿',     folder: '投稿', icon: 'send',          stage: '投稿发表', statuses: ['准备中', '已投稿', '审稿中', '返修', '接收', '拒稿'], desc: '投稿记录、审稿意见与回复' },
+  meeting:    { label: '会议纪要', folder: '会议', icon: 'users',         stage: null,       statuses: ['待整理', '已整理'], desc: '组会、合作讨论与导师沟通' },
+};
+const TYPE_ALIASES = {
+  project: 'project', 项目: 'project',
+  idea: 'idea', 灵感: 'idea',
+  literature: 'literature', paper: 'literature', 文献: 'literature',
+  experiment: 'experiment', 实验: 'experiment',
+  data: 'data', analysis: 'data', 数据: 'data',
+  draft: 'draft', writing: 'draft', 写作: 'draft', 草稿: 'draft',
+  submission: 'submission', 投稿: 'submission',
+  meeting: 'meeting', 会议: 'meeting', 会议纪要: 'meeting',
+  resource: 'resource', 资源: 'resource', 链接文件: 'resource',
+  log: 'log', 日志: 'log',
+};
+
+/* 文件分类：拖入的文件按扩展名自动归类，存到 项目/<项目名>/<folder>/ */
+const FILE_CATS = {
+  literature: { label: '文献', folder: '文献', icon: 'book-open', exts: ['pdf', 'epub', 'caj', 'nh', 'kdh', 'djvu', 'ris', 'enw'] },
+  slides:     { label: 'PPT 汇报', folder: '汇报', icon: 'presentation', exts: ['ppt', 'pptx', 'pps', 'ppsx', 'key', 'odp'] },
+  data:       { label: '实验数据', folder: '数据', icon: 'database', exts: ['csv', 'tsv', 'xlsx', 'xls', 'xlsm', 'ods', 'dat', 'txt', 'mat', 'h5', 'hdf5', 'nc', 'npy', 'npz', 'json', 'xml', 'opj', 'opju', 'spe', 'raw', 'xy', 'xrdml', 'tif', 'tiff', 'fcs', 'sav', 'dta', 'parquet', 'pzfx'] },
+  meeting:    { label: '会议资料', folder: '会议', icon: 'mic', exts: ['m4a', 'mp3', 'wav', 'aac', 'flac', 'ogg', 'amr', 'mp4', 'mov', 'webm', 'mkv', 'avi'] },
+  writing:    { label: '文稿', folder: '写作', icon: 'file-text', exts: ['doc', 'docx', 'odt', 'rtf', 'tex', 'bib', 'pages', 'wps'] },
+  image:      { label: '图片', folder: '图片', icon: 'image', exts: ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'heic', 'eps', 'ai', 'psd'] },
+  code:       { label: '代码', folder: '代码', icon: 'code', exts: ['py', 'ipynb', 'm', 'r', 'rmd', 'jl', 'sh', 'bat', 'ps1', 'cpp', 'c', 'h', 'java', 'js', 'ts', 'zip', '7z', 'rar', 'gz', 'tar'] },
+  other:      { label: '其他', folder: '附件', icon: 'paperclip', exts: [] },
+};
+const EXT_CAT = {};
+for (const k of Object.keys(FILE_CATS)) for (const e of FILE_CATS[k].exts) EXT_CAT[e] = k;
+const FOLDER_CAT = {};
+for (const k of Object.keys(FILE_CATS)) FOLDER_CAT[FILE_CATS[k].folder] = k;
+/* Obsidian 自己能打开的格式，其余用系统默认程序打开 */
+const IS_MOBILE = !!(obsidian.Platform && obsidian.Platform.isMobile);
+const TOUCH = IS_MOBILE || (typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(hover: none)').matches);
+const OBSIDIAN_EXTS = ['md', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'canvas', 'mp3', 'wav', 'm4a', 'ogg', 'flac', 'webm', 'mp4', 'mov', 'mkv'];
+/* 在某个笔记标签页里拖入文件时，默认归入的分类 */
+const TAB_TO_CAT = { idea: 'other', literature: 'literature', experiment: 'data', data: 'data', draft: 'writing', submission: 'writing', meeting: 'meeting' };
+
+/* Zotero 会拒绝带浏览器 User-Agent 的请求（Obsidian 的请求就是这种），必须带放行标记 */
+const ZOTERO_HEADERS = { 'Zotero-API-Version': '3', 'Zotero-Allowed-Request': '1', 'User-Agent': 'ResearchWorkbench/0.2 (Obsidian plugin)' };
+
+const PROJECT_STATUSES = ['进行中', '卡住', '暂停', '已完成'];
+const PRIORITIES = ['高', '中', '低'];
+
+const TABS = [
+  { id: 'home', label: '首页', icon: 'home' },
+  { id: 'projects', label: '项目', icon: 'folder-kanban' },
+  { id: 'idea', label: '灵感', icon: 'lightbulb' },
+  { id: 'literature', label: '文献', icon: 'book-open' },
+  { id: 'experiment', label: '实验', icon: 'flask-conical' },
+  { id: 'data', label: '数据', icon: 'bar-chart-3' },
+  { id: 'draft', label: '写作', icon: 'pen-line' },
+  { id: 'submission', label: '投稿', icon: 'send' },
+  { id: 'meeting', label: '会议', icon: 'users' },
+  { id: 'files', label: '文件', icon: 'paperclip' },
+  { id: 'plan', label: '计划', icon: 'calendar-check' },
+  { id: 'activity', label: '全局记录', icon: 'activity' },
+  { id: 'assistant', label: 'AI 助手', icon: 'bot' },
+  { id: 'mindflow', label: 'Mindflow', icon: 'git-fork' },
+];
+
+const DEFAULT_SETTINGS = {
+  rootFolder: '科研',
+  openOnStartup: true,
+  defaultTab: 'home',
+  lastTab: 'home',
+  homeView: 'board',
+  showDoneOnBoard: false,
+  projectFilter: '活跃',
+  projectKind: 'all',
+  homeKind: 'all',
+  noteViews: {},
+  linkThresholdMB: 200,
+  zoteroPort: 23119,
+  zoteroAnnotations: true,
+  zoteroLastCollection: '',
+  prompts: null,
+  inspireLinks: null,
+  linkOpen: 'obsidian',
+  theme: 'obsidian',
+  customBg: '#1e2430',
+  customAccent: '#d4f27a',
+  panelTint: false,
+  detailFileView: 'folder',
+  litTitleClick: 'reader',
+  transService: 'google',
+  transTo: 'zh-CN',
+  transTrigger: 'auto',
+  transScope: 'pdf',
+  transShowSource: false,
+  transPinned: false,
+  deeplKey: '',
+  baiduAppId: '',
+  baiduKey: '',
+  llmBase: 'https://api.deepseek.com',
+  llmKey: '',
+  llmModel: 'deepseek-flash',
+  llmThinking: 'auto',
+  activityOn: true,
+  litAutoMeta: true,
+  litMetaAi: true,
+  ftProvider: 'local',
+  ftEngine: 'ai',
+  ftAutoHtml: true,
+  ftHtmlMode: 'dual',
+  mineruToken: '',
+  mineruModel: 'vlm',
+  mineruLang: 'en',
+  mineruOcr: false,
+  mistralKey: '',
+  activityEdits: true,
+  homeLogMode: 'log',
+  llmMaxTokens: '',
+  llmPrompt: '',
+  readerAuto: true,
+  readerTab: 'chat',
+  glossShow: true,
+  glossColor: '#9f1239',
+  glossScale: 0.5,
+  glossService: '',
+  glossPlace: 'above',
+  glossGap: 0.18,
+  pdfOpenIn: 'reader',
+  pdfZoomMode: 'fit',
+  pdfZoom: 1.2,
+  prSideWidth: 420,
+  prSideHidden: false,
+  aiContextChars: 60000,
+  mfPresets: [],
+  pgColumns: [],
+  pgMyPresets: [],
+  pgSort: '',
+  litMode: 'table',
+  logTags: null,
+};
+
+/* ───────────────────────── 工具函数 ───────────────────────── */
+
+function h(parent, tag, o) {
+  o = o || {};
+  const doc = (parent && parent.ownerDocument) || document;
+  const el = doc.createElement(tag);
+  if (o.cls) el.className = o.cls;
+  if (o.text != null) el.textContent = String(o.text);
+  if (o.title) el.title = o.title;
+  if (o.attr) for (const k in o.attr) el.setAttribute(k, o.attr[k]);
+  if (o.onclick) el.addEventListener('click', o.onclick);
+  if (parent) parent.appendChild(el);
+  return el;
+}
+const ICON_FALLBACK = {
+  'bar-chart-3': 'chart-column', 'kanban-square': 'square-kanban', 'check-square': 'square-check',
+  'more-horizontal': 'ellipsis', 'arrow-right-circle': 'circle-arrow-right', 'file-cog': 'settings',
+  'folder-kanban': 'folder', 'flask-conical': 'beaker', 'file-spreadsheet': 'sheet',
+};
+function ic(parent, name, cls) {
+  // 同一位置再设图标时替换原来的，而不是再加一个（例如切换后的眼睛、勾）
+  const want = cls || 'rw-icon';
+  let s = null;
+  for (const c of parent.children || []) if (c.tagName === 'SPAN' && c.className === want && c.querySelector && c.querySelector('svg')) { s = c; break; }
+  if (s) clear(s); else s = h(parent, 'span', { cls: want });
+  try {
+    setIcon(s, name);
+    if (!s.querySelector('svg') && ICON_FALLBACK[name]) setIcon(s, ICON_FALLBACK[name]);
+    if (!s.querySelector('svg')) setIcon(s, 'circle');
+  } catch (e) { /* ignore */ }
+  return s;
+}
+function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+function pad(n) { return String(n).padStart(2, '0'); }
+function fmtDate(d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); }
+function today() { return fmtDate(new Date()); }
+function parseDate(v) {
+  if (!v) return null;
+  const s = String(v).trim();
+  const m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+function daysUntil(v) {
+  const d = parseDate(v);
+  if (!d) return null;
+  const t = new Date(); t.setHours(0, 0, 0, 0);
+  return Math.round((d - t) / 86400000);
+}
+function relTime(ms) {
+  const diff = Date.now() - ms;
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return '刚刚';
+  if (m < 60) return m + ' 分钟前';
+  const hh = Math.floor(m / 60);
+  if (hh < 24) return hh + ' 小时前';
+  const d = Math.floor(hh / 24);
+  if (d < 30) return d + ' 天前';
+  return fmtDate(new Date(ms));
+}
+function str(v) {
+  if (v == null) return '';
+  if (Array.isArray(v)) return v.map(str).join(', ');
+  if (v instanceof Date) return fmtDate(v);
+  return String(v);
+}
+function parseLinkName(v) {
+  if (v == null) return '';
+  if (Array.isArray(v)) v = v[0];
+  let s = String(v).trim();
+  const m = s.match(/\[\[([^\]]+)\]\]/);
+  if (m) s = m[1];
+  s = s.split('|')[0].split('#')[0].trim();
+  if (s.includes('/')) s = s.split('/').pop();
+  return s.replace(/\.md$/i, '');
+}
+function normType(v) {
+  if (v == null) return null;
+  const s = String(Array.isArray(v) ? v[0] : v).trim().toLowerCase();
+  return TYPE_ALIASES[s] || TYPE_ALIASES[String(v).trim()] || null;
+}
+function normStage(v) {
+  if (v == null || v === '') return null;
+  const s = String(v).trim();
+  if (STAGES.some((x) => x.id === s)) return s;
+  return STAGE_ALIASES[s] || STAGE_ALIASES[s.toLowerCase()] || null;
+}
+function stageIndex(id) { return STAGES.findIndex((s) => s.id === id); }
+function sanitize(name) { return String(name).replace(/[\\/:*?"<>|#^[\]]/g, '-').trim(); }
+function q(v) { return JSON.stringify(v == null ? '' : String(v)); }
+function hue(name) {
+  let x = 0;
+  for (let i = 0; i < name.length; i++) x = (x * 31 + name.charCodeAt(i)) % 360;
+  return x;
+}
+function projectColor(name) { return 'hsl(' + hue(name || '?') + ', 62%, 58%)'; }
+function deadlineText(v) {
+  const d = daysUntil(v);
+  if (d == null) return '';
+  if (d < 0) return '已逾期 ' + -d + ' 天';
+  if (d === 0) return '今天截止';
+  return '还剩 ' + d + ' 天';
+}
+function deadlineCls(v) {
+  const d = daysUntil(v);
+  if (d == null) return '';
+  if (d < 0) return 'is-overdue';
+  if (d <= 7) return 'is-soon';
+  return '';
+}
+
+/* 按所在文件夹推断笔记类型：科研/会议/x.md → meeting；科研/项目/P/文献/x.md → literature */
+const FOLDER_NOTE_TYPE = {};
+for (const k of Object.keys(NOTE_TYPES)) FOLDER_NOTE_TYPE[NOTE_TYPES[k].folder] = k;
+Object.assign(FOLDER_NOTE_TYPE, { 会议纪要: 'meeting', 组会: 'meeting', 文献笔记: 'literature', 论文: 'draft', 草稿: 'draft', 实验记录: 'experiment', 数据分析: 'data', 想法: 'idea' });
+function noteTypeOfPath(path, root) {
+  const segs = path.slice(root.length + 1).split('/');
+  segs.pop();
+  for (let i = segs.length - 1; i >= 0; i--) if (FOLDER_NOTE_TYPE[segs[i]]) return FOLDER_NOTE_TYPE[segs[i]];
+  return null;
+}
+function dateFromName(name) {
+  const m = String(name || '').match(/(\d{4})[-_.年](\d{1,2})[-_.月](\d{1,2})/);
+  return m ? m[1] + '-' + pad(Number(m[2])) + '-' + pad(Number(m[3])) : '';
+}
+/* 文件名只是日期 / 未命名时，用第一个标题补充，方便辨认 */
+/* 文献笔记没写 title 属性时：正文第一个一级标题像真标题（不是文件名）就用它 */
+function litH1Title(file, cache) {
+  const h1 = cache && cache.headings && cache.headings.find((x) => x.level === 1);
+  const t = h1 && String(h1.heading || '').replace(/[#*_`]/g, '').trim();
+  const norm = (x) => String(x).replace(/[^A-Za-z0-9\u4e00-\u9fff]/g, '').toLowerCase();
+  if (!t || t === file.basename || norm(t) === norm(file.basename) || looksLikeFileName(t)) return '';
+  return t;
+}
+function looksLikeFileName(t) {
+  t = String(t || '').trim();
+  if (!t) return true;
+  if (/\.(pdf|docx?|md)$/i.test(t)) return true;
+  if (!/\s/.test(t) && /[_]/.test(t)) return true; // Author_02_2024_Title_in_...
+  if ((t.match(/_/g) || []).length >= 3) return true;
+  return false;
+}
+function smartTitle(file, cache) {
+  const base = file.basename;
+  const plain = /^(\d{4}[-_.]\d{1,2}[-_.]\d{1,2}|未命名|Untitled)( \d+)?$/i.test(base.trim());
+  if (!plain) return base;
+  const hd = cache && cache.headings && cache.headings.find((x) => x.heading && x.heading.trim() && x.heading.trim() !== base);
+  return hd ? base + ' · ' + hd.heading.trim().replace(/[#*_`]/g, '').slice(0, 40) : base;
+}
+
+/* 菜单里的“删除”项（红色警示） */
+function addDeleteItem(m, title, fn) {
+  m.addSeparator();
+  m.addItem((i) => { i.setTitle(title).setIcon('trash-2').onClick(fn); if (i.setWarning) i.setWarning(true); });
+}
+function fmtSize(b) {
+  if (b == null || isNaN(b)) return '';
+  b = Number(b);
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b / 1048576).toFixed(1) + ' MB';
+  return (b / 1073741824).toFixed(2) + ' GB';
+}
+function extOf(name) {
+  const m = String(name || '').match(/\.([^./\\]+)$/);
+  return m ? m[1].toLowerCase() : '';
+}
+function catOfExt(ext) { return EXT_CAT[String(ext || '').toLowerCase()] || 'other'; }
+function fileIcon(ext) {
+  ext = String(ext || '').toLowerCase();
+  if (ext === 'pdf') return 'file-text';
+  if (['ppt', 'pptx', 'key', 'odp', 'pps', 'ppsx'].includes(ext)) return 'presentation';
+  if (['xlsx', 'xls', 'xlsm', 'csv', 'tsv', 'ods'].includes(ext)) return 'file-spreadsheet';
+  if (['doc', 'docx', 'odt', 'rtf', 'pages', 'wps'].includes(ext)) return 'file-type';
+  const c = catOfExt(ext);
+  return FILE_CATS[c].icon;
+}
+function hasFiles(e) {
+  const dt = e && e.dataTransfer;
+  if (!dt) return false;
+  const types = dt.types ? Array.from(dt.types) : [];
+  return types.includes('Files');
+}
+function electronMod() { try { return require('electron'); } catch (e) { return null; } }
+/* 拖入的 File 对象在桌面端的绝对路径（用于“仅链接”模式） */
+function fsPathOf(file) {
+  if (!file) return '';
+  if (file.path) return file.path;
+  const el = electronMod();
+  try { if (el && el.webUtils && el.webUtils.getPathForFile) return el.webUtils.getPathForFile(file) || ''; } catch (e) { /* ignore */ }
+  return '';
+}
+function openExternalUrl(url) {
+  const el = electronMod();
+  try { if (el && el.shell) { el.shell.openExternal(url); return; } } catch (e) { /* ignore */ }
+  window.open(url);
+}
+function openFsPath(p) {
+  const el = electronMod();
+  if (el && el.shell && el.shell.openPath) return el.shell.openPath(p);
+  window.open('file:///' + String(p).replace(/\\/g, '/'));
+}
+function showFsPath(p) {
+  const el = electronMod();
+  if (el && el.shell && el.shell.showItemInFolder) el.shell.showItemInFolder(p);
+}
+function fileUrl(p) { return 'file:///' + encodeURI(String(p).replace(/\\/g, '/')).replace(/#/g, '%23'); }
+function yv(v) {
+  if (v == null || v === '') return '';
+  if (typeof v === 'number') return String(v);
+  if (Array.isArray(v)) return '[' + v.map((x) => q(x)).join(', ') + ']';
+  return q(v);
+}
+function fmBlock(obj) {
+  const lines = ['---'];
+  for (const k of Object.keys(obj)) lines.push(k + ': ' + yv(obj[k]));
+  lines.push('---');
+  return lines.join('\n') + '\n';
+}
+
+/* ───────────────────────── 模板 ───────────────────────── */
+
+const KIND_BODY = {
+  paper: ['## 🎯 研究目标', '', '', '## ❓ 关键问题 / 假设', '', '', '## 💡 创新点', '', ''],
+  direction: ['## 🧭 方向概述', '', '', '## 🗺 领域地图（主要方法 / 流派）', '', '', '## 👥 关键团队与代表作', '', '', '## 🕳 研究空白', '', '', '## 💡 候选选题', '', ''],
+  study: ['## 📄 研读对象', '- 论文 / 团队 / 项目：', '- 链接 / 代码：', '', '## 🔍 核心方法', '', '', '## 🧪 复现记录', '', '', '## 📝 心得与可借鉴之处', '', ''],
+  grant: ['## 📋 申报信息', '- 类型：', '- 截止日期：', '- 字数 / 格式要求：', '', '## 🎯 研究内容与目标', '', '', '## 💡 创新点', '', '', '## 📚 前期基础', '', ''],
+  collection: ['## 📦 说明', '这里存放什么资料、来自哪里。', '', ''],
+};
+function projectTemplate(o) {
+  const kind = KINDS[o.kind] ? o.kind : 'paper';
+  const stages = stagesOfKind(kind);
+  const body = KIND_BODY[kind];
+  return [
+    '---',
+    'type: project',
+    'kind: ' + KINDS[kind].label,
+    'stage: ' + (stages.length ? o.stage || stages[0].id : ''),
+    'status: ' + (o.status || '进行中'),
+    'priority: ' + (o.priority || '中'),
+    'deadline: ' + (o.deadline || ''),
+    'next: ' + q(o.next || ''),
+    'description: ' + q(o.description || ''),
+    'parent: ' + (o.parent ? q('[[' + o.parent + ']]') : ''),
+    'created: ' + today(),
+    'tags: [科研项目]',
+    '---',
+    '# ' + o.name,
+    '',
+    '> [!abstract] ' + KINDS[kind].label,
+    '> ' + (o.description || '一句话说明这个项目要做什么。'),
+    '',
+  ].concat(body).concat([
+    '## 📌 进展日志',
+    '- ' + today() + ' 创建项目',
+    '',
+    '## ✅ 待办',
+    '- [ ] ' + ({ paper: '明确研究问题与创新点', direction: '找 3 篇该方向的高质量综述', study: '收集论文、代码和数据', grant: '确认申报要求和截止日期', collection: '整理资料' }[kind]),
+    '',
+    '## 🔗 相关笔记',
+    '本项目下的笔记和文件会自动汇总到「科研工作台」中。',
+    '',
+  ]).join('\n');
+}
+
+const NOTE_FM_DEFAULTS = {
+  literature: { authors: '', year: '', journal: '', doi: '', citekey: '' },
+  experiment: { conditions: '' },
+  data: { source: '' },
+  draft: { section: '', target: '' },
+  submission: { journal: '', submitted: '', decision: '' },
+  meeting: { attendees: '' },
+};
+const NOTE_BODIES = {
+  idea: (o) => ['## 💡 想法', o.content || '', '', '## 为什么值得做', '', '## 可行性 / 需要的资源', '', '## 相关文献', ''],
+  literature: () => ['## 一句话总结', '', '## 研究问题', '', '## 方法', '', '## 主要发现', '', '## 优点 / 局限', '', '## 对我的项目的启发', '', '## 摘录', ''],
+  experiment: () => ['## 🎯 实验目的', '', '## 🧪 材料与方法', '', '## 📋 步骤', '1. ', '', '## 📝 过程记录', '', '## 📊 结果', '', '## 💭 分析与下一步', '- [ ] '],
+  data: () => ['## 数据来源', '', '## 处理流程', '', '## 统计方法', '', '## 结果与图表', '', '## 结论', ''],
+  draft: () => ['## 大纲', '', '## 正文', ''],
+  submission: () => ['## 投稿信息', '- 期刊：', '- 稿件编号：', '', '## 审稿意见', '', '## 回复与修改', '- [ ] '],
+  meeting: () => ['## 议题', '', '## 讨论记录', '', '## 结论 / 决定', '', '## 行动项', '- [ ] '],
+};
+/* o: { title, project, status, content, fm: 额外属性, prepend: 正文开头, append: 正文结尾 } */
+function noteTemplate(type, o) {
+  const fm = Object.assign(
+    { type, project: o.project ? '[[' + o.project + ']]' : '', status: o.status || NOTE_TYPES[type].statuses[0], date: today() },
+    NOTE_FM_DEFAULTS[type] || {},
+    o.fm || {}
+  );
+  const body = (NOTE_BODIES[type] ? NOTE_BODIES[type](o) : []).join('\n');
+  return fmBlock(fm) + '# ' + (o.heading || o.title) + '\n\n' + (o.prepend ? o.prepend + '\n\n' : '') + body + '\n' + (o.append ? '\n' + o.append + '\n' : '');
+}
+
+const AGENT_GUIDE = `# 科研工作台 · AI 协作约定
+
+本仓库用「科研工作台」插件管理多个科研项目。AI 助手（Claude Code / Codex 等）在本仓库中工作时，请遵守以下约定，生成的文件会自动出现在工作台里。
+
+## 目录结构
+- \`科研/项目/<项目名>/<项目名>.md\`：项目主页（type: project）
+- \`科研/项目/<项目名>/灵感|文献|实验|数据|写作|投稿|会议/\`：该项目的各类笔记
+- \`科研/灵感|文献|会议/...\`：暂不属于任何项目的笔记
+- 实验原始数据（csv / xlsx / 图片等）放在 \`科研/项目/<项目名>/数据/\`
+
+## 项目主页 frontmatter
+\`\`\`yaml
+type: project
+kind: 论文 | 研究方向 | 研读他人工作 | 基金 / 申报 | 资料库   # 不写则视为「论文」
+stage: 见下表（取决于 kind；资料库留空）
+parent: "[[研究方向项目名]]"   # 可选：所属研究方向
+status: 进行中 | 卡住 | 暂停 | 已完成
+priority: 高 | 中 | 低
+deadline: YYYY-MM-DD
+next: "下一步要做的事"
+description: "一句话描述"
+\`\`\`
+
+| kind | 用途 | stage 可选值（按顺序） |
+|---|---|---|
+| 论文 | 写一篇论文 | 灵感 → 文献综述 → 实验 → 数据分析 → 论文写作 → 投稿发表 |
+| 研究方向 | 长期方向 / 课题，可挂多个下属项目 | 入门调研 → 系统梳理 → 形成选题 → 持续跟踪 |
+| 研读他人工作 | 精读 / 复现某篇论文、某个团队的工作 | 收集资料 → 精读理解 → 复现验证 → 总结汇报 |
+| 基金 / 申报 | 基金、开题、中期等申报材料 | 选题论证 → 材料准备 → 撰写 → 修改定稿 → 提交答辩 |
+| 资料库 | 只存文件，没有流程 | （留空） |
+
+## 笔记 frontmatter
+每条笔记必须有 \`type\`、\`project\`、\`status\`、\`date\`：
+\`\`\`yaml
+type: idea | literature | experiment | data | draft | submission | meeting
+project: "[[项目名]]"   # 不属于项目时留空
+status: 见下表
+date: YYYY-MM-DD
+\`\`\`
+
+| type | 含义 | status 可选值 | 额外字段 |
+|---|---|---|---|
+| idea | 灵感 | 待评估 / 值得做 / 已立项 / 搁置 | |
+| literature | 文献笔记 | 待读 / 在读 / 已读 / 已整理 | authors, year, journal, doi, citekey |
+| experiment | 实验记录 | 计划中 / 进行中 / 已完成 / 需重做 | conditions |
+| data | 数据分析 | 待分析 / 分析中 / 已出图 / 已归档 | source |
+| draft | 论文草稿 | 大纲 / 初稿 / 修改中 / 定稿 | section, target |
+| submission | 投稿记录 | 准备中 / 已投稿 / 审稿中 / 返修 / 接收 / 拒稿 | journal, submitted, decision |
+| meeting | 会议纪要 | 待整理 / 已整理 | attendees |
+
+## 文件（非笔记）
+项目里的 PDF、PPT、Excel、录音等文件按分类放在项目文件夹下，工作台「文件」页会自动列出：
+| 分类 | 文件夹 | 常见格式 |
+|---|---|---|
+| 文献 | 文献/ | pdf, caj, epub |
+| PPT 汇报 | 汇报/ | ppt, pptx, key |
+| 实验数据 | 数据/ | csv, xlsx, mat, h5, txt, opj, tif |
+| 会议资料 | 会议/ | m4a, mp3, wav, mp4 |
+| 文稿 | 写作/ | docx, tex, bib |
+| 图片 | 图片/ | png, jpg, svg |
+| 代码 | 代码/ | py, ipynb, m, r, zip |
+| 其他 | 附件/ | 其他格式 |
+
+体积太大、只在库外保存的文件，用一条 \`type: resource\` 的“链接笔记”记录：
+\`\`\`yaml
+type: resource
+project: "[[项目名]]"
+category: data        # 上表的分类 key：literature / slides / data / meeting / writing / image / code / other
+path: "D:\\\\实验数据\\\\xxx.h5"   # 文件的绝对路径
+size: 123456789
+\`\`\`
+
+## Zotero
+从 Zotero 导入的文献笔记带有：\`zotero_key\`（条目 key）、\`zotero: "zotero://select/library/items/KEY"\`、\`pdf: "zotero://open-pdf/library/items/附件KEY"\`。
+笔记中 \`<!-- zotero-annotations:start -->\` 与 \`<!-- zotero-annotations:end -->\` 之间是从 Zotero 同步来的批注，会被工作台覆盖更新，请不要在这两行之间手写内容。
+
+## 写作规则
+- 文件名：会议、实验笔记以日期开头，如 \`2026-10-05 组会.md\`
+- 待办统一写成 \`- [ ] 任务内容 📅 YYYY-MM-DD\`，工作台「计划」页会自动汇总
+- 引用其他笔记用 \`[[笔记名]]\` 双链
+- 推进项目阶段时，修改项目主页的 \`stage\` 和 \`next\`，并在「进展日志」追加一行
+- 不要删除或重命名用户已有文件，除非用户明确要求
+`;
+
+const PROMPTS = [
+  { title: '精读一篇文献', icon: 'book-open', desc: '给 PDF 路径或 DOI，生成结构化文献笔记', text: '读一下这篇文献：<PDF 路径或 DOI>。按 CLAUDE.md 的约定，在 科研/项目/<项目名>/文献/ 下生成文献笔记（type: literature，status: 已读），填好 authors、year、journal、doi，并写清楚“对我的项目的启发”。' },
+  { title: '写文献综述', icon: 'library', desc: '汇总项目下已读文献，生成综述初稿', text: '汇总 科研/项目/<项目名>/文献/ 下所有 status 为 已读 或 已整理 的文献笔记，按主题归类，写一份文献综述初稿，保存到该项目的 写作/ 文件夹（type: draft，status: 初稿，section: 文献综述），引用用 [[笔记名]]。' },
+  { title: '评估一个灵感', icon: 'lightbulb', desc: '从新颖性、可行性、资源等维度打分', text: '评估灵感笔记 [[<灵感名>]]：从新颖性、可行性、所需资源、风险、与已有工作的差异五个维度分析，并检索仓库里相关的文献笔记。把评估写回该笔记，并把 status 更新为 值得做 或 搁置。' },
+  { title: '设计实验方案', icon: 'flask-conical', desc: '基于项目目标和文献设计实验', text: '阅读项目主页 [[<项目名>]] 和它的文献笔记，为下一步设计一个实验方案：目的、变量、对照组、步骤、预期结果、风险。保存为该项目 实验/ 下的新笔记（type: experiment，status: 计划中）。' },
+  { title: '整理会议纪要', icon: 'users', desc: '把录音转写或随手记整理成纪要', text: '把下面的会议记录整理成会议纪要，保存到 科研/项目/<项目名>/会议/（type: meeting，status: 已整理，文件名以日期开头）。行动项写成 - [ ] 任务 📅 日期，并同步更新项目主页的 next 字段：\n<粘贴会议记录>' },
+  { title: '分析实验数据', icon: 'bar-chart-3', desc: '处理数据文件并记录结论', text: '分析 科研/项目/<项目名>/数据/<文件名> 中的数据：做描述统计和合适的检验，出图保存到同一文件夹，结论写成 type: data 的笔记（status: 已出图），source 指向对应实验笔记。' },
+  { title: '生成科研周报', icon: 'calendar-check', desc: '汇总所有项目本周进展', text: '扫描 科研/ 下所有项目主页和本周修改过的笔记，生成本周科研周报：每个项目的当前阶段、本周进展、遇到的问题、下周计划，以及所有未完成的待办。保存到 科研/周报/<本周日期>.md。' },
+  { title: '回复审稿意见', icon: 'send', desc: '逐条整理审稿意见与修改计划', text: '读取 [[<投稿笔记名>]] 里的审稿意见，逐条整理成“意见 / 回复 / 修改位置”表格，并把需要做的修改写成待办 - [ ]。' },
+];
+
+/* ---- 工作台主题（背景配色） ---- */
+const THEMES = {
+  obsidian: { label: '跟随 Obsidian', desc: '使用当前 Obsidian 主题的颜色' },
+  midnight: { label: '墨夜蓝', dark: true, bg: '#0f1729', surface: '#16213a', alt: '#131d33', border: '#26324d', text: '#e3e8f2', muted: '#9aa7bd', faint: '#5f6b82', accent: '#7cc4ff', ink: '#06223a' },
+  forest: { label: '森林绿', dark: true, bg: '#0f1a16', surface: '#15241e', alt: '#12201a', border: '#23382f', text: '#e1ece6', muted: '#9db5a8', faint: '#5f7a6c', accent: '#7fd8a4', ink: '#062a16' },
+  plum: { label: '暗夜紫', dark: true, bg: '#19131f', surface: '#22192c', alt: '#1d1626', border: '#352a46', text: '#ece5f5', muted: '#ab9dc0', faint: '#6e6284', accent: '#c4a6ff', ink: '#2a1257' },
+  coffee: { label: '咖啡棕', dark: true, bg: '#1b1612', surface: '#251e18', alt: '#201a15', border: '#3a2f25', text: '#efe6dc', muted: '#b5a596', faint: '#7a6b5d', accent: '#f0b46a', ink: '#3a2205' },
+  oled: { label: '纯黑', dark: true, bg: '#000000', surface: '#0d0d0d', alt: '#080808', border: '#242424', text: '#e6e6e6', muted: '#9a9a9a', faint: '#5c5c5c', accent: '#d4f27a', ink: '#1c2108' },
+  paper: { label: '暖纸米', dark: false, bg: '#f7f3ea', surface: '#efe8da', alt: '#f3eee2', border: '#ddd3bf', text: '#2f2a22', muted: '#6f6656', faint: '#a39a88', accent: '#c2410c', ink: '#ffffff' },
+  mist: { label: '雾霾蓝', dark: false, bg: '#f4f7fb', surface: '#e8eef6', alt: '#eef2f8', border: '#d3dbe8', text: '#1d2633', muted: '#5b6678', faint: '#95a0b2', accent: '#2563eb', ink: '#ffffff' },
+  mint: { label: '薄荷绿', dark: false, bg: '#f3faf7', surface: '#e4f2ec', alt: '#ecf6f1', border: '#cbe2d8', text: '#1e2b26', muted: '#5a6f66', faint: '#93a69e', accent: '#0f9f6e', ink: '#ffffff' },
+  sakura: { label: '樱花粉', dark: false, bg: '#fdf6f8', surface: '#f7e7ed', alt: '#faeff3', border: '#ecd2dc', text: '#33232a', muted: '#7a5e69', faint: '#b096a0', accent: '#d6457a', ink: '#ffffff' },
+};
+const THEME_ORDER = ['obsidian', 'midnight', 'forest', 'plum', 'coffee', 'oled', 'paper', 'mist', 'mint', 'sakura'];
+function hexLum(hex) {
+  const m = String(hex || '').replace('#', '').match(/^([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i);
+  if (!m) return 0;
+  const f = (x) => { x = parseInt(x, 16) / 255; return x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4); };
+  return 0.2126 * f(m[1]) + 0.7152 * f(m[2]) + 0.0722 * f(m[3]);
+}
+/* 只给背景色和强调色，自动推算其余颜色 */
+function customTheme(bg, accent) {
+  const dark = hexLum(bg) < 0.35;
+  const mix = (c, p) => 'color-mix(in srgb, ' + c + ' ' + p + '%, ' + bg + ')';
+  return {
+    label: '自定义', dark, bg,
+    surface: dark ? mix('#ffffff', 5) : mix('#000000', 4),
+    alt: dark ? mix('#ffffff', 3) : mix('#000000', 2),
+    border: dark ? mix('#ffffff', 12) : mix('#000000', 12),
+    text: dark ? '#ececec' : '#1f1f1f', muted: dark ? '#a8a8a8' : '#5f5f5f', faint: dark ? '#6b6b6b' : '#9a9a9a',
+    accent, ink: hexLum(accent) > 0.45 ? '#111111' : '#ffffff',
+  };
+}
+function themeVars(t) {
+  const v = {
+    '--background-primary': t.bg, '--background-primary-alt': t.alt, '--background-secondary': t.surface, '--background-secondary-alt': t.surface,
+    '--background-modifier-border': t.border, '--background-modifier-hover': t.dark ? 'rgba(255,255,255,.07)' : 'rgba(0,0,0,.05)',
+    '--background-modifier-form-field': t.dark ? 'rgba(255,255,255,.04)' : '#ffffff',
+    '--text-normal': t.text, '--text-muted': t.muted, '--text-faint': t.faint, '--text-accent': t.accent,
+    '--interactive-normal': t.surface, '--interactive-hover': t.border,
+    '--rw-accent': t.accent, '--rw-accent-ink': t.ink, '--rw-accent-soft': 'color-mix(in srgb, ' + t.accent + ' 16%, transparent)',
+    '--rw-h0': t.dark ? 'color-mix(in srgb, #ffffff 8%, ' + t.bg + ')' : 'color-mix(in srgb, #000000 8%, ' + t.bg + ')',
+  };
+  return v;
+}
+
+/* ---- 日期工具 ---- */
+function startOfDay(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
+function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
+function mondayOf(d) { const x = startOfDay(d); return addDays(x, -((x.getDay() + 6) % 7)); }
+function isoWeek(d) { const t = startOfDay(d); t.setDate(t.getDate() + 3 - ((t.getDay() + 6) % 7)); const w1 = new Date(t.getFullYear(), 0, 4); return 1 + Math.round(((t - w1) / 864e5 - 3 + ((w1.getDay() + 6) % 7)) / 7); }
+const EVENT_LABEL = { deadline: '截止', task: '待办', meeting: '会议', note: '笔记' };
+const EVENT_ORDER = { deadline: 0, task: 1, meeting: 2, note: 3 };
+const DEFAULT_INSPIRE_LINKS = [
+  { name: 'Google Scholar', url: 'https://scholar.google.com/scholar?q={q}' },
+  { name: 'arXiv', url: 'https://arxiv.org/search/?query={q}&searchtype=all' },
+  { name: 'Semantic Scholar', url: 'https://www.semanticscholar.org/search?q={q}' },
+  { name: 'IEEE Xplore', url: 'https://ieeexplore.ieee.org/search/searchresult.jsp?queryText={q}' },
+  { name: 'Connected Papers', url: 'https://www.connectedpapers.com/search?q={q}' },
+  { name: 'Hugging Face Papers', url: 'https://huggingface.co/papers?q={q}' },
+  { name: '知网', url: 'https://www.cnki.net/' },
+];
+
+/* 提示词里的变量：{{项目}}、{{论文标题}}…；旧的 <xxx> 写法也识别 */
+function promptVars(text) {
+  const out = [];
+  const re = /\{\{\s*([^{}]+?)\s*\}\}|<([^<>\n]{1,20})>/g;
+  let m;
+  while ((m = re.exec(String(text || '')))) { const v = (m[1] || m[2]).trim(); if (v && !out.includes(v)) out.push(v); }
+  return out;
+}
+function fillPrompt(text, vals) {
+  return String(text).replace(/\{\{\s*([^{}]+?)\s*\}\}|<([^<>\n]{1,20})>/g, (all, a, b) => { const k = (a || b).trim(); return vals[k] != null && vals[k] !== '' ? vals[k] : all; });
+}
+const DEFAULT_PROMPTS = [
+  { title: '润色英文段落', tags: ['写作'], text: '请以 IEEE 期刊的学术风格润色下面这段英文，保持原意和专业术语不变，修改处用 **粗体** 标出，并在最后用中文简要说明主要改动：\n\n{{段落}}' },
+  { title: '解释一个公式', tags: ['读文献'], text: '请逐项解释下面这个公式中每个符号的含义、公式想表达的物理/数学意义，以及它在{{论文或方法}}中的作用；最后给一个直观的例子：\n\n{{公式}}' },
+  { title: '审稿人视角挑刺', tags: ['写作', '投稿'], text: '假设你是 {{期刊}} 的严格审稿人，请从创新性、实验充分性、对比方法、写作逻辑四个方面审阅下面的内容，列出最可能被质疑的 5 个问题和修改建议：\n\n{{内容}}' },
+];
+
+/* ───────────────────────── 主视图 ───────────────────────── */
+
+class WorkbenchView extends ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.tab = plugin.settings.lastTab || plugin.settings.defaultTab || 'home';
+    this.filters = {};
+    this.dragging = false;
+    this.searchSel = -1;
+  }
+  getViewType() { return VIEW_TYPE; }
+  getDisplayText() { return '科研工作台'; }
+  getIcon() { return 'flask-conical'; }
+
+  async onOpen() {
+    this.buildShell();
+    const refresh = () => this.requestRefresh();
+    this.registerEvent(this.app.metadataCache.on('changed', refresh));
+    this.registerEvent(this.app.vault.on('create', refresh));
+    this.registerEvent(this.app.vault.on('delete', refresh));
+    this.registerEvent(this.app.vault.on('rename', refresh));
+    this.registerDomEvent(this.contentEl.ownerDocument, 'click', (e) => {
+      if (this.searchWrap && !this.searchWrap.contains(e.target)) this.hideSearch();
+    });
+    this.setupResponsive();
+    this.render();
+  }
+  /* 移动端/窄屏：按宽度切换紧凑布局；触屏长按 = 右键菜单 */
+  setupResponsive() {
+    const el = this.contentEl;
+    el.classList.toggle('rw-mobile', IS_MOBILE);
+    el.classList.toggle('rw-touch', TOUCH);
+    const apply = () => {
+      const w = el.clientWidth || (el.ownerDocument.defaultView || window).innerWidth;
+      if (!w) return;
+      const narrow = w < 700;
+      const was = el.classList.contains('rw-narrow');
+      el.classList.toggle('rw-narrow', narrow);
+      el.classList.toggle('rw-xnarrow', w < 430);
+      if (was !== narrow && this.bodyEl && this.tab === 'home') this.render();
+    };
+    apply();
+    if (typeof ResizeObserver !== 'undefined') {
+      this._ro = new ResizeObserver(() => apply());
+      this._ro.observe(el);
+    } else this.registerDomEvent(window, 'resize', apply);
+    // 长按 → contextmenu（iOS 不会自己触发；Android 已触发时不重复）
+    let timer = null, start = null, fired = 0, target = null;
+    const cancel = () => { clearTimeout(timer); timer = null; };
+    el.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1) return cancel();
+      if (e.target && e.target.closest && e.target.closest('.rw-mfhost')) return cancel(); // Mindflow 自己处理长按选字
+      const t = e.touches[0];
+      start = { x: t.clientX, y: t.clientY }; target = e.target;
+      cancel();
+      timer = setTimeout(() => {
+        timer = null; fired = Date.now();
+        if (navigator.vibrate) try { navigator.vibrate(12); } catch (er) { /* ignore */ }
+        target.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: start.x, clientY: start.y, screenX: start.x, screenY: start.y }));
+      }, 480);
+    }, { passive: true });
+    el.addEventListener('touchmove', (e) => { const t = e.touches[0]; if (start && t && Math.hypot(t.clientX - start.x, t.clientY - start.y) > 10) cancel(); }, { passive: true });
+    el.addEventListener('touchend', cancel, { passive: true });
+    el.addEventListener('touchcancel', cancel, { passive: true });
+    el.addEventListener('contextmenu', (e) => {
+      if (!e.isTrusted) return;
+      if (timer) { cancel(); fired = Date.now(); return; } // 系统自己弹了，就不再合成
+      if (Date.now() - fired < 900) { e.preventDefault(); e.stopPropagation(); }
+    }, true);
+    el.addEventListener('click', (e) => { if (Date.now() - fired < 700) { e.preventDefault(); e.stopPropagation(); } }, true);
+  }
+  /* 在工作台里挂载 Mindflow 对话界面（复用 Mindflow 的视图类，只是装在工作台的「Mindflow」标签里） */
+  async showMindflow() {
+    const pl = this.plugin;
+    if (!this.mfHost) this.mfHost = h(this.contentEl, 'div', { cls: 'rw-mfhost' });
+    this.mfHost.style.display = '';
+    if (this.mfView) { try { this.mfView.updateCompact(); } catch (e) { /* ignore */ } return this.mfView; }
+    if (this._mfOpening) return this._mfOpening;
+    this._mfOpening = (async () => {
+      try { await pl._mfReady; } catch (e) { console.error('[科研工作台] Mindflow 加载失败', e); }
+      const chat = pl.mindflow && pl.mindflow.chat;
+      if (!chat) { clear(this.mfHost); h(this.mfHost, 'div', { cls: 'rw-empty', text: 'Mindflow 没有加载成功，打开开发者工具（Ctrl+Shift+I）看看报错' }); return null; }
+      const C = pl.mfClasses;
+      const v = new C.MindflowChatView(this.leaf, chat);
+      // Obsidian 新建视图时会把它自己的外框（带「Mindflow 对话」标题栏）挂到当前窗格里，这里不需要，拿掉
+      try { if (v.containerEl && v.containerEl !== this.mfHost) v.containerEl.remove(); } catch (e) { /* ignore */ }
+      clear(this.mfHost);
+      v.containerEl = this.mfHost;
+      v.contentEl = h(this.mfHost, 'div', { cls: 'view-content cmf-embed' });
+      v.load();
+      await v.onOpen();
+      this.mfView = v;
+      if (!v.session) { const list = await chat.store.list(); if (list.length) await v.openSession(list[0].id); else v.newChat(); }
+      return v;
+    })();
+    try { return await this._mfOpening; } finally { this._mfOpening = null; }
+  }
+  async onClose() { if (this.mfView) { try { await this.mfView.onClose(); this.mfView.unload(); } catch (e) { /* ignore */ } this.mfView = null; } if (this._ro) this._ro.disconnect(); clearTimeout(this._t); clearInterval(this._clockT); clearInterval(this._logT); if (this.tipEl) this.tipEl.remove(); }
+
+  requestRefresh() {
+    clearTimeout(this._t);
+    this._t = setTimeout(() => {
+      if (this.dragging) return this.requestRefresh();
+      this.render();
+    }, 350);
+  }
+
+  /* ---------- 外框：搜索栏 + 标签 ---------- */
+  buildShell() {
+    const root = this.contentEl;
+    clear(root);
+    root.classList.add('rw-root');
+
+    const top = h(root, 'div', { cls: 'rw-topbar' });
+    this.searchWrap = h(top, 'div', { cls: 'rw-search' });
+    ic(this.searchWrap, 'search', 'rw-search-icon');
+    this.searchInput = h(this.searchWrap, 'input', { cls: 'rw-search-input', attr: { type: 'text', placeholder: '搜索项目、文献、实验和笔记…（Enter 搜全文）' } });
+    this.searchDrop = h(this.searchWrap, 'div', { cls: 'rw-search-drop' });
+    this.searchInput.addEventListener('input', () => {
+      clearTimeout(this._st);
+      this._st = setTimeout(() => this.runSearch(false), 120);
+    });
+    this.searchInput.addEventListener('focus', () => { if (this.searchInput.value.trim()) this.runSearch(false); });
+    this.searchInput.addEventListener('keydown', (e) => this.onSearchKey(e));
+
+    const actions = h(top, 'div', { cls: 'rw-top-actions' });
+    const bTheme = h(actions, 'button', { cls: 'rw-top-btn', title: '切换工作台背景配色' });
+    ic(bTheme, 'palette'); h(bTheme, 'span', { text: '主题' });
+    bTheme.addEventListener('click', () => new ThemeModal(this.app, this.plugin).open());
+    const bSet = h(actions, 'button', { cls: 'rw-top-btn', onclick: () => this.plugin.openSettings() });
+    ic(bSet, 'settings'); h(bSet, 'span', { text: '设置' });
+    const bMore = h(actions, 'button', { cls: 'rw-top-btn' });
+    ic(bMore, 'more-horizontal'); h(bMore, 'span', { text: '更多' });
+    bMore.addEventListener('click', (e) => this.moreMenu(e));
+
+    this.tabsEl = h(root, 'div', { cls: 'rw-tabs' });
+    this.dropBanner = h(root, 'div', { cls: 'rw-drop-banner' });
+    this.bodyEl = h(root, 'div', { cls: 'rw-body' });
+
+    // 从电脑任意位置拖文件进工作台
+    let depth = 0;
+    root.addEventListener('dragenter', (e) => {
+      if (!hasFiles(e)) return;
+      depth++;
+      this.showDropBanner(true);
+    });
+    root.addEventListener('dragover', (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    });
+    root.addEventListener('dragleave', (e) => {
+      if (!hasFiles(e)) return;
+      depth = Math.max(0, depth - 1);
+      if (!depth) this.showDropBanner(false);
+    });
+    root.addEventListener('drop', (e) => {
+      depth = 0;
+      this.showDropBanner(false);
+      if (!hasFiles(e) || !e.dataTransfer.files || !e.dataTransfer.files.length) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.plugin.importFilesModal(e.dataTransfer.files, e.rwContext || this.dropContext());
+    });
+  }
+
+  showDropBanner(on) {
+    this.contentEl.classList.toggle('rw-file-over', on);
+    clear(this.dropBanner);
+    if (!on) return;
+    const ctx = this.dropContext();
+    ic(this.dropBanner, 'download');
+    let target = '松开鼠标，把文件加入工作台';
+    if (ctx.project) target += ' → 项目「' + ctx.project + '」';
+    if (ctx.cat) target += ' · ' + FILE_CATS[ctx.cat].label;
+    h(this.dropBanner, 'span', { text: target });
+    h(this.dropBanner, 'span', { cls: 'rw-muted', text: this.tab === 'detail' ? '（拖到某个文件夹上 = 放进该文件夹；导入前还能再选位置）' : '（拖到项目卡片上 = 放进该项目；导入前可选放进哪个文件夹）' });
+  }
+
+  /* 根据当前所在页面推断拖入文件的默认去处 */
+  dropContext() {
+    const valid = (p) => (p && p !== '__none' && this.index && this.index.byName.has(p) ? p : '');
+    if (this.tab === 'detail') return { project: valid(this.detailProject) };
+    const f = this.filters[this.tab] || {};
+    if (this.tab === 'files') return { project: valid(f.project), cat: f.cat && f.cat !== 'all' ? f.cat : '' };
+    if (NOTE_TYPES[this.tab]) return { project: valid(f.project), cat: TAB_TO_CAT[this.tab] || '', noteType: this.tab };
+    return {};
+  }
+
+  openProject(name) {
+    this.detailProject = name;
+    this.switchTab('detail');
+  }
+
+  renderTabs() {
+    clear(this.tabsEl);
+    const counts = {};
+    for (const n of this.index.notes) counts[n.type] = (counts[n.type] || 0) + 1;
+    for (const t of TABS) {
+      const b = h(this.tabsEl, 'button', { cls: 'rw-tab' + (this.tab === t.id ? ' is-active' : '') });
+      ic(b, t.icon);
+      h(b, 'span', { text: t.label });
+      let c = null;
+      if (NOTE_TYPES[t.id]) c = counts[t.id] || 0;
+      if (t.id === 'projects') c = this.index.projects.filter((p) => p.status !== '已完成').length;
+      if (t.id === 'files') c = this.index.files.length;
+      if (c) h(b, 'span', { cls: 'rw-tab-count', text: c });
+      b.addEventListener('click', () => this.switchTab(t.id));
+    }
+    if (this.contentEl.classList.contains('rw-narrow')) {
+      const act = this.tabsEl.querySelector('.is-active');
+      if (act) requestAnimationFrame(() => { const L = act.offsetLeft - 16; if (L < this.tabsEl.scrollLeft || act.offsetLeft + act.offsetWidth > this.tabsEl.scrollLeft + this.tabsEl.clientWidth) this.tabsEl.scrollLeft = Math.max(0, L); });
+    }
+    if (this.tab === 'detail' && this.detailProject) {
+      const p = this.index.byName.get(this.detailProject);
+      const b = h(this.tabsEl, 'button', { cls: 'rw-tab rw-tab-detail is-active' });
+      if (p) b.style.setProperty('--pc', projectColor(p.name));
+      ic(b, 'folder-open');
+      h(b, 'span', { text: p ? p.title : this.detailProject });
+      const x = h(b, 'span', { cls: 'rw-tab-close', title: '关闭' });
+      ic(x, 'x');
+      x.addEventListener('click', (e) => { e.stopPropagation(); this.switchTab('projects'); });
+    }
+  }
+
+  switchTab(id, filter) {
+    this.tab = id;
+    if (filter) this.filters[id] = Object.assign({}, this.filters[id] || {}, filter);
+    if (id !== 'detail') this.plugin.settings.lastTab = id;
+    this.plugin.saveSettingsSoon();
+    this.contentEl.scrollTop = 0;
+    this.render();
+  }
+
+  moreMenu(e) {
+    const m = new Menu();
+    m.addItem((i) => i.setTitle('新建项目').setIcon('folder-plus').onClick(() => this.plugin.newProjectModal()));
+    for (const k of Object.keys(NOTE_TYPES)) {
+      m.addItem((i) => i.setTitle('新建' + NOTE_TYPES[k].label).setIcon(NOTE_TYPES[k].icon).onClick(() => this.plugin.newNoteModal({ type: k })));
+    }
+    m.addSeparator();
+    m.addItem((i) => i.setTitle('导入文件…').setIcon('upload').onClick(() => this.plugin.pickFiles(this.dropContext())));
+    m.addItem((i) => i.setTitle('从 Zotero 导入文献…').setIcon('library').onClick(() => this.plugin.zoteroImportModal({ project: this.dropContext().project })));
+    m.addItem((i) => i.setTitle('同步 Zotero 批注').setIcon('refresh-ccw').onClick(() => this.plugin.syncZoteroAnnotations()));
+    m.addSeparator();
+    m.addItem((i) => i.setTitle('生成 / 更新 CLAUDE.md 与 AGENTS.md').setIcon('bot').onClick(() => this.plugin.writeAgentGuide()));
+    m.addItem((i) => i.setTitle('刷新').setIcon('refresh-cw').onClick(() => this.render()));
+    m.showAtMouseEvent(e);
+  }
+
+  /* ---------- 渲染主体 ---------- */
+  render() {
+    if (!this.bodyEl) return;
+    const scroll = this.contentEl.scrollTop;
+    // 重绘时保住滚动位置：有的面板（文献表格、摘录）是异步画的，清空后高度会瞬间塌掉，
+    // 所以先把高度撑住，等内容画好再把外层和表格内部的滚动位置都还原
+    const sameView = this._lastTab === this.tab && this._lastLit === this.plugin.settings.litMode;
+    this._lastTab = this.tab; this._lastLit = this.plugin.settings.litMode;
+    const keepSel = '.rw-pgt-scroll, .rw-pgc-list, .rw-exn-body, .rw-keep-scroll';
+    const inner = sameView ? [...this.bodyEl.querySelectorAll(keepSel)].map((e, i) => ({ i, cls: e.className, top: e.scrollTop, left: e.scrollLeft })).filter((x) => x.top || x.left) : [];
+    if (sameView) this.bodyEl.style.minHeight = this.bodyEl.offsetHeight + 'px';
+    else this.bodyEl.style.minHeight = '';
+    const token = (this._renderTok = (this._renderTok || 0) + 1);
+    this.index = this.plugin.buildIndex();
+    if (this.tab === 'detail' && !this.index.byName.has(this.detailProject)) this.tab = 'home';
+    this.contentEl.classList.toggle('rw-dash-mode', this.tab === 'home');
+    this.plugin.applyTheme(this.contentEl);
+    this.renderTabs();
+    // Mindflow：常驻挂载，切走只隐藏（生成中的回答不会被打断）
+    const mfMode = this.tab === 'mindflow';
+    this.contentEl.classList.toggle('rw-mfmode', mfMode);
+    this.bodyEl.style.display = mfMode ? 'none' : '';
+    if (this.mfHost) this.mfHost.style.display = mfMode ? '' : 'none';
+    if (mfMode) { this.bodyEl.style.minHeight = ''; this.showMindflow(); return; }
+    clear(this.bodyEl);
+    const el = this.bodyEl;
+    try {
+      if (this.tab === 'home') this.renderHome(el);
+      else if (this.tab === 'projects') this.renderProjects(el);
+      else if (NOTE_TYPES[this.tab]) this.renderNotesTab(el, this.tab);
+      else if (this.tab === 'files') this.renderFiles(el);
+      else if (this.tab === 'detail' && this.detailProject && this.index.byName.has(this.detailProject)) this.renderDetail(el, this.index.byName.get(this.detailProject));
+      else if (this.tab === 'plan') this.renderPlan(el);
+      else if (this.tab === 'assistant') this.renderAssistant(el);
+      else if (this.tab === 'activity') this.renderActivityPage(el);
+      else this.renderHome(el);
+    } catch (err) {
+      console.error('[科研工作台]', err);
+      h(el, 'div', { cls: 'rw-empty', text: '渲染出错：' + err.message });
+    }
+    if (!sameView) { this.contentEl.scrollTop = scroll; return; }
+    this.contentEl.scrollTop = scroll;
+    const win = this.contentEl.ownerDocument.defaultView || window;
+    const t0 = Date.now();
+    const restore = () => {
+      if (token !== this._renderTok) return; // 又重绘了，交给新的那次
+      const els = [...this.bodyEl.querySelectorAll(keepSel)];
+      let pending = false;
+      for (const x of inner) {
+        const e = els.find((el2) => el2.className === x.cls) || null;
+        if (!e) { pending = true; continue; }
+        if (e.scrollHeight - e.clientHeight < x.top - 1 || e.scrollWidth - e.clientWidth < x.left - 1) pending = true;
+        e.scrollTop = x.top; e.scrollLeft = x.left;
+      }
+      if (this.contentEl.scrollTop !== scroll) this.contentEl.scrollTop = scroll;
+      if (this.contentEl.scrollTop !== scroll && this.contentEl.scrollHeight - this.contentEl.clientHeight < scroll - 1) pending = true;
+      if (pending && Date.now() - t0 < 1500) { win.requestAnimationFrame(restore); return; }
+      // 内容到位了：松开撑高，再校一次
+      win.setTimeout(() => { if (token !== this._renderTok) return; this.bodyEl.style.minHeight = ''; }, 400);
+    };
+    win.requestAnimationFrame(restore);
+  }
+
+  header(el, title, sub, iconName) {
+    const hd = h(el, 'div', { cls: 'rw-header' });
+    const left = h(hd, 'div', { cls: 'rw-header-left' });
+    const t = h(left, 'div', { cls: 'rw-title' });
+    if (iconName) ic(t, iconName);
+    h(t, 'span', { text: title });
+    if (sub) h(left, 'div', { cls: 'rw-sub', text: sub });
+    return h(hd, 'div', { cls: 'rw-header-right' });
+  }
+  btn(parent, text, iconName, onclick, cls) {
+    const b = h(parent, 'button', { cls: 'rw-btn ' + (cls || '') });
+    if (iconName) ic(b, iconName);
+    h(b, 'span', { text });
+    b.addEventListener('click', onclick);
+    return b;
+  }
+  section(el, title, iconName) {
+    const s = h(el, 'div', { cls: 'rw-section' });
+    const hd = h(s, 'div', { cls: 'rw-section-head' });
+    const t = h(hd, 'div', { cls: 'rw-section-title' });
+    if (iconName) ic(t, iconName);
+    h(t, 'span', { text: title });
+    const right = h(hd, 'div', { cls: 'rw-section-right' });
+    const body = h(s, 'div', { cls: 'rw-section-body' });
+    return { el: s, right, body };
+  }
+  segmented(parent, options, value, onChange) {
+    const seg = h(parent, 'div', { cls: 'rw-seg' });
+    for (const [v, label] of options) {
+      const b = h(seg, 'button', { cls: 'rw-seg-btn' + (v === value ? ' is-active' : ''), text: label });
+      b.addEventListener('click', () => onChange(v));
+    }
+    return seg;
+  }
+
+  /* ---------- 首页 ---------- */
+  /* ---------- 首页：一屏仪表盘（各面板内部滚动，不需要整页往下翻） ---------- */
+  panel(parent, cls, title, iconName) {
+    const p = h(parent, 'div', { cls: 'rw-panel ' + cls });
+    const head = h(p, 'div', { cls: 'rw-panel-head' });
+    const t = h(head, 'div', { cls: 'rw-panel-title' });
+    if (iconName) ic(t, iconName);
+    h(t, 'span', { text: title });
+    const right = h(head, 'div', { cls: 'rw-panel-right' });
+    const body = h(p, 'div', { cls: 'rw-panel-body' });
+    return { el: p, head, title: t, right, body };
+  }
+  panelTabs(pn, key, tabs) {
+    const st = this.plugin.settings;
+    if (!tabs.some((t) => t[0] === st[key])) st[key] = tabs[0][0];
+    clear(pn.title);
+    const seg = h(pn.title, 'div', { cls: 'rw-seg rw-panel-tabs' });
+    for (const [v, label, iconName] of tabs) {
+      const b = h(seg, 'button', { cls: 'rw-seg-btn' + (st[key] === v ? ' is-active' : '') });
+      if (iconName) ic(b, iconName);
+      h(b, 'span', { text: label });
+      b.addEventListener('click', () => { st[key] = v; this.plugin.saveSettingsSoon(); this.render(); });
+    }
+    return st[key];
+  }
+
+  renderHome(el) {
+    const { projects, notes } = this.index;
+    const st = this.plugin.settings;
+    const active = projects.filter((p) => p.status !== '已完成');
+    const d = new Date();
+
+    // 顶栏：标题 + 统计小标签 + 按钮（一行）
+    const top = h(el, 'div', { cls: 'rw-dash-top' });
+    const tl = h(top, 'div', { cls: 'rw-dash-title' });
+    h(tl, 'b', { text: '科研进度总览' });
+    h(tl, 'span', { cls: 'rw-muted', text: (d.getMonth() + 1) + '月' + d.getDate() + '日 星期' + '日一二三四五六'[d.getDay()] });
+    const stats = h(top, 'div', { cls: 'rw-dash-stats' });
+    const week = Date.now() - 7 * 86400000;
+    const due = active.filter((p) => { const x = daysUntil(p.deadline); return x != null && x <= 30; }).length;
+    const stuck = active.filter((p) => p.status === '卡住').length;
+    const stat = (iconName, label, value, tab, warn) => {
+      const c = h(stats, 'div', { cls: 'rw-dash-stat' + (tab ? ' is-clickable' : '') + (warn ? ' is-warn' : '') });
+      ic(c, iconName);
+      h(c, 'b', { text: value });
+      h(c, 'span', { text: label });
+      if (tab) c.addEventListener('click', () => this.switchTab(tab));
+    };
+    stat('folder-kanban', '个项目进行中' + (stuck ? '（' + stuck + ' 个卡住）' : ''), active.length, 'projects', stuck > 0);
+    stat('file-text', '条本周新增笔记', notes.filter((n) => n.file.stat.ctime >= week).length, null);
+    stat('check-square', '项待办', this.plugin.countOpenTasks(this.index), 'plan');
+    stat('alarm-clock', '个 30 天内截止', due, 'plan', due > 0);
+    const btns = h(top, 'div', { cls: 'rw-dash-btns' });
+    this.btn(btns, '新建项目', 'folder-plus', () => this.plugin.newProjectModal(), 'mod-cta rw-btn-sm');
+    this.btn(btns, '新建笔记', 'file-plus', (e) => this.newNoteMenu(e), 'rw-btn-sm');
+    this.btn(btns, '导入文件', 'upload', () => this.plugin.pickFiles({}), 'rw-btn-sm');
+
+    const grid = h(el, 'div', { cls: 'rw-dash' });
+
+    // ① 左：科研日志（整列）
+    const actMode = st.homeLogMode === 'act';
+    const lp = this.panel(grid, 'rw-p-log', actMode ? '全局记录' : '科研日志', actMode ? 'activity' : 'history');
+    this.segmented(lp.right, [['log', '日志'], ['act', '全局记录']], actMode ? 'act' : 'log', (v) => { st.homeLogMode = v; this.plugin.saveSettingsSoon(); this.render(); });
+    if (actMode) this.renderActivity(lp.body, { compact: true });
+    else this.renderWorklog({ body: lp.body, right: lp.right }, true);
+
+    // ② 中上：流程看板
+    const bp = this.panel(grid, 'rw-p-board', '流程看板', 'kanban-square');
+    const shown = st.showDoneOnBoard ? projects : active;
+    const kindsPresent = KIND_ORDER.filter((k) => shown.some((p) => p.pkind === k));
+    if (kindsPresent.length > 1) {
+      if (st.homeKind !== 'all' && !kindsPresent.includes(st.homeKind)) st.homeKind = kindsPresent[0];
+      const ksel = h(bp.right, 'select', { cls: 'dropdown rw-select rw-select-sm' });
+      const add = (v, t) => { const o = h(ksel, 'option', { text: t }); o.value = v; };
+      kindsPresent.forEach((k) => add(k, KINDS[k].label + '（' + shown.filter((p) => p.pkind === k).length + '）'));
+      add('all', '全部类型');
+      ksel.value = st.homeKind || kindsPresent[0];
+      ksel.addEventListener('change', () => { st.homeKind = ksel.value; this.plugin.saveSettingsSoon(); this.render(); });
+    }
+    this.segmented(bp.right, [['board', '看板'], ['matrix', '矩阵']], st.homeView, (v) => { st.homeView = v; this.plugin.saveSettingsSoon(); this.render(); });
+    const doneToggle = h(bp.right, 'label', { cls: 'rw-check', title: '显示已完成的项目' });
+    const cb = h(doneToggle, 'input', { attr: { type: 'checkbox' } });
+    cb.checked = !!st.showDoneOnBoard;
+    h(doneToggle, 'span', { text: '已完成' });
+    cb.addEventListener('change', () => { st.showDoneOnBoard = cb.checked; this.plugin.saveSettingsSoon(); this.render(); });
+    if (!projects.length) {
+      const empty = h(bp.body, 'div', { cls: 'rw-empty' });
+      h(empty, 'div', { text: '还没有科研项目。' });
+      this.btn(empty, '创建第一个项目', 'folder-plus', () => this.plugin.newProjectModal(), 'mod-cta');
+    } else {
+      const ks = kindsPresent.length <= 1 ? kindsPresent : st.homeKind === 'all' ? kindsPresent : [st.homeKind || kindsPresent[0]];
+      for (const k of ks) {
+        const list = shown.filter((p) => p.pkind === k);
+        if (ks.length > 1 || kindsPresent.length <= 1) this.kindHeader(bp.body, k, list.length);
+        if (!stagesOfKind(k).length) this.renderCollection(bp.body, list);
+        else if (st.homeView === 'matrix') this.renderMatrix(bp.body, list, k);
+        else this.renderBoard(bp.body, list, k);
+      }
+    }
+
+    // ③ 中下：图表（时间轴 / 活跃度 / 每月新增，三选一）
+    const cp = this.panel(grid, 'rw-p-chart', '', null);
+    const which = this.panelTabs(cp, 'homeChart', [['gantt', '项目时间轴', 'gantt-chart'], ['heat', '科研活跃度', 'flame'], ['monthly', '每月新增', 'bar-chart-3']]);
+    const csec = { body: cp.body, right: cp.right };
+    if (which === 'heat') this.renderHeatmap(csec);
+    else if (which === 'monthly') this.renderMonthly(csec);
+    else this.renderGantt(csec, projects);
+
+    // ④ 右上：日历
+    const calp = this.panel(grid, 'rw-p-cal', '日历', 'calendar-days');
+    const go = h(calp.right, 'button', { cls: 'rw-linkbtn', text: '去计划页 →' });
+    go.addEventListener('click', () => this.switchTab('plan'));
+    this.renderCalendar(calp.body, false);
+
+    // ⑤ 右下：即将截止 / 最近更新
+    const ip = this.panel(grid, 'rw-p-list', '', null);
+    const lw = this.panelTabs(ip, 'homeList', [['due', '即将截止', 'alarm-clock'], ['recent', '最近更新', 'clock']]);
+    if (lw === 'recent') {
+      const items = projects.concat(notes).sort((a, b) => b.file.stat.mtime - a.file.stat.mtime).slice(0, 20);
+      if (!items.length) h(ip.body, 'div', { cls: 'rw-empty-sm', text: '暂无' });
+      for (const it of items) this.rowItem(ip.body, it, relTime(it.file.stat.mtime));
+    } else {
+      const dls = this.collectDeadlines().filter((x) => daysUntil(x.date) >= -30).slice(0, 20);
+      if (!dls.length) h(ip.body, 'div', { cls: 'rw-empty-sm', text: '没有设置截止日期的项目或笔记' });
+      for (const x of dls) this.rowItem(ip.body, x.item, deadlineText(x.date), deadlineCls(x.date));
+    }
+  }
+
+  newNoteMenu(e, project) {
+    const m = new Menu();
+    for (const k of Object.keys(NOTE_TYPES)) {
+      m.addItem((i) => i.setTitle(NOTE_TYPES[k].label).setIcon(NOTE_TYPES[k].icon).onClick(() => this.plugin.newNoteModal({ type: k, project })));
+    }
+    m.showAtMouseEvent(e);
+  }
+
+  collectDeadlines() {
+    const out = [];
+    for (const p of this.index.projects) if (p.status !== '已完成' && parseDate(p.deadline)) out.push({ item: p, date: p.deadline });
+    for (const n of this.index.notes) {
+      const v = n.fm.deadline || n.fm.due;
+      if (v && parseDate(v)) out.push({ item: n, date: v });
+    }
+    return out.sort((a, b) => parseDate(a.date) - parseDate(b.date));
+  }
+
+  rowItem(parent, it, rightText, rightCls) {
+    const r = h(parent, 'div', { cls: 'rw-row' });
+    const isProject = it.kind === 'project';
+    ic(r, isProject ? 'folder-kanban' : NOTE_TYPES[it.type].icon, 'rw-row-icon');
+    const mid = h(r, 'div', { cls: 'rw-row-mid' });
+    h(mid, 'div', { cls: 'rw-row-title', text: it.title });
+    const sub = h(mid, 'div', { cls: 'rw-row-sub' });
+    if (isProject) h(sub, 'span', { text: KINDS[it.pkind].label + (it.stage ? ' · ' + it.stage : '') });
+    else {
+      h(sub, 'span', { text: NOTE_TYPES[it.type].label + (it.status ? ' · ' + it.status : '') });
+      if (it.projectName) this.projectChip(sub, it.projectName);
+    }
+    if (rightText) h(r, 'div', { cls: 'rw-row-right ' + (rightCls || ''), text: rightText });
+    r.addEventListener('click', () => (isProject ? this.openProject(it.name) : this.plugin.openFile(it.file)));
+    r.addEventListener('contextmenu', (e) => (isProject ? this.projectMenu(e, it) : this.noteMenu(e, it)));
+  }
+
+  projectChip(parent, name) {
+    const c = h(parent, 'span', { cls: 'rw-pchip', text: name });
+    c.style.setProperty('--pc', projectColor(name));
+    return c;
+  }
+
+  kindHeader(parent, k, n) {
+    const d = KINDS[k];
+    const hd = h(parent, 'div', { cls: 'rw-kind-head' });
+    hd.style.setProperty('--kc', d.color);
+    ic(hd, d.icon);
+    h(hd, 'span', { cls: 'rw-kind-name', text: d.label });
+    h(hd, 'span', { cls: 'rw-tab-count', text: n });
+    h(hd, 'span', { cls: 'rw-muted', text: d.stages.length ? d.stages.map((s) => s.id).join(' → ') : '无流程，只存放文件' });
+    const add = h(hd, 'button', { cls: 'rw-iconbtn', title: '新建' + d.label + '项目' });
+    ic(add, 'plus');
+    add.addEventListener('click', () => this.plugin.newProjectModal({ kind: k }));
+  }
+
+  /* 没有流程的项目（资料库）：只排成卡片 */
+  renderCollection(parent, projects) {
+    const grid = h(parent, 'div', { cls: 'rw-grid rw-coll-grid' });
+    for (const p of projects) this.projectCard(grid, p, false);
+  }
+
+  /* 看板：列 = 阶段，卡片 = 项目 */
+  renderBoard(parent, projects, kind) {
+    const board = h(parent, 'div', { cls: 'rw-board' });
+    for (const stage of stagesOfKind(kind || 'paper')) {
+      const col = h(board, 'div', { cls: 'rw-col' });
+      col.style.setProperty('--sc', stage.color);
+      const hd = h(col, 'div', { cls: 'rw-col-head' });
+      ic(hd, stage.icon);
+      h(hd, 'span', { cls: 'rw-col-name', text: stage.id });
+      const list = projects.filter((p) => p.stage === stage.id);
+      h(hd, 'span', { cls: 'rw-col-count', text: list.length });
+      h(col, 'div', { cls: 'rw-col-desc', text: stage.desc });
+      const body = h(col, 'div', { cls: 'rw-col-body' });
+      for (const p of list) this.projectCard(body, p, false);
+      if (!list.length) h(body, 'div', { cls: 'rw-col-empty', text: TOUCH ? '长按卡片改阶段' : '拖动项目到这里' });
+      this.makeDropZone(col, async (path) => {
+        const p = this.index.projects.find((x) => x.file.path === path);
+        if (!p || p.stage === stage.id) return;
+        if (!stagesOf(p).some((x) => x.id === stage.id)) { new Notice('「' + p.title + '」是' + KINDS[p.pkind].label + '项目，流程不同；可右键 →「类型 →」修改项目类型'); return; }
+        await this.plugin.setProjectStage(p, stage.id);
+      });
+    }
+  }
+
+  makeDropZone(zone, onDrop) {
+    zone.addEventListener('dragover', (e) => { if (hasFiles(e)) return; e.preventDefault(); zone.classList.add('is-over'); });
+    zone.addEventListener('dragleave', (e) => { if (!zone.contains(e.relatedTarget)) zone.classList.remove('is-over'); });
+    zone.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      zone.classList.remove('is-over');
+      this.dragging = false;
+      if (hasFiles(e)) return; // 交给外层处理文件导入
+      const path = e.dataTransfer && e.dataTransfer.getData('text/rw-path');
+      if (path) { await onDrop(path); this.render(); }
+    });
+  }
+  makeDraggable(card, path) {
+    if (IS_MOBILE) return;
+    card.setAttribute('draggable', 'true');
+    card.addEventListener('dragstart', (e) => {
+      this.dragging = true;
+      e.dataTransfer.setData('text/rw-path', path);
+      e.dataTransfer.effectAllowed = 'move';
+      card.classList.add('is-dragging');
+    });
+    card.addEventListener('dragend', () => { this.dragging = false; card.classList.remove('is-dragging'); });
+  }
+
+  projectCard(parent, p, large) {
+    const card = h(parent, 'div', { cls: 'rw-card rw-pcard' + (large ? ' is-large' : '') + (p.status === '已完成' ? ' is-done' : '') });
+    card.style.setProperty('--pc', projectColor(p.name));
+    const top = h(card, 'div', { cls: 'rw-card-top' });
+    h(top, 'span', { cls: 'rw-dot' });
+    h(top, 'span', { cls: 'rw-card-title', text: p.title });
+    if (p.priority) h(top, 'span', { cls: 'rw-prio prio-' + p.priority, text: p.priority });
+    this.trashBtn(top, '删除项目', () => this.plugin.deleteProject(p));
+
+    const chips = h(card, 'div', { cls: 'rw-chips' });
+    h(chips, 'span', { cls: 'rw-status st-' + p.status, text: p.status });
+    if (large) {
+      const kc = h(chips, 'span', { cls: 'rw-kind-chip', text: KINDS[p.pkind].label });
+      kc.style.setProperty('--kc', KINDS[p.pkind].color);
+      const sc = stageDefOf(p);
+      if (sc) {
+        const sChip = h(chips, 'span', { cls: 'rw-stage-chip', text: p.stage });
+        sChip.style.setProperty('--sc', sc.color);
+      }
+    }
+    if (p.deadline && parseDate(p.deadline)) h(chips, 'span', { cls: 'rw-deadline ' + deadlineCls(p.deadline), text: deadlineText(p.deadline) });
+
+    if (p.parentName) {
+      const pr = h(card, 'div', { cls: 'rw-parent', title: '所属研究方向' });
+      ic(pr, 'corner-down-right');
+      h(pr, 'span', { text: p.parentName });
+      pr.addEventListener('click', (e) => { e.stopPropagation(); this.openProject(p.parentName); });
+    }
+    if (p.children && p.children.length) {
+      const pr = h(card, 'div', { cls: 'rw-parent', title: '下属项目' });
+      ic(pr, 'git-branch');
+      h(pr, 'span', { text: p.children.length + ' 个下属项目' });
+    }
+    if (large && p.description) h(card, 'div', { cls: 'rw-card-desc', text: p.description });
+    if (p.next) {
+      const nx = h(card, 'div', { cls: 'rw-next' });
+      ic(nx, 'arrow-right-circle');
+      h(nx, 'span', { text: p.next });
+    }
+    if (large) this.stepper(card, p);
+    else if (stagesOf(p).length) {
+      const bar = h(card, 'div', { cls: 'rw-progress' });
+      const fill = h(bar, 'div', { cls: 'rw-progress-fill' });
+      fill.style.width = Math.round(((stageIdxOf(p) + 1) / stagesOf(p).length) * 100) + '%';
+    }
+
+    const meta = h(card, 'div', { cls: 'rw-card-meta' });
+    for (const k of ['literature', 'experiment', 'data', 'meeting']) {
+      const c = p.counts[k] || 0;
+      if (!c && !large) continue;
+      const m = h(meta, 'span', { cls: 'rw-meta', title: NOTE_TYPES[k].label });
+      ic(m, NOTE_TYPES[k].icon);
+      h(m, 'span', { text: c });
+      m.addEventListener('click', (e) => { e.stopPropagation(); this.switchTab(k, { project: p.name }); });
+    }
+    if (p.fileCount) {
+      const m = h(meta, 'span', { cls: 'rw-meta', title: '文件（PDF / PPT / 数据等）' });
+      ic(m, 'paperclip');
+      h(m, 'span', { text: p.fileCount });
+      m.addEventListener('click', (e) => { e.stopPropagation(); this.switchTab('files', { project: p.name }); });
+    }
+    if (p.openTasks) {
+      const m = h(meta, 'span', { cls: 'rw-meta', title: '未完成待办' });
+      ic(m, 'check-square');
+      h(m, 'span', { text: p.openTasks });
+    }
+    h(meta, 'span', { cls: 'rw-meta-time', text: relTime(p.lastActivity) });
+
+    card.addEventListener('click', () => this.openProject(p.name));
+    card.addEventListener('contextmenu', (e) => this.projectMenu(e, p));
+    this.makeDraggable(card, p.file.path);
+    // 外部文件拖到卡片上 → 放进这个项目
+    card.addEventListener('dragover', (e) => { if (hasFiles(e)) card.classList.add('is-file-target'); });
+    card.addEventListener('dragleave', (e) => { if (!card.contains(e.relatedTarget)) card.classList.remove('is-file-target'); });
+    card.addEventListener('drop', (e) => { card.classList.remove('is-file-target'); if (hasFiles(e)) e.rwContext = { project: p.name }; });
+    return card;
+  }
+
+  stepper(parent, p) {
+    const stages = stagesOf(p);
+    if (!stages.length) return;
+    const cur = stageIdxOf(p);
+    const s = h(parent, 'div', { cls: 'rw-stepper' });
+    stages.forEach((st, i) => {
+      const step = h(s, 'div', { cls: 'rw-step' + (i < cur ? ' is-done' : '') + (i === cur ? ' is-current' : ''), title: '设为「' + st.id + '」阶段' });
+      step.style.setProperty('--sc', st.color);
+      h(step, 'div', { cls: 'rw-step-dot' });
+      h(step, 'div', { cls: 'rw-step-label', text: st.id });
+      step.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (i === cur) return;
+        await this.plugin.setProjectStage(p, st.id);
+        this.render();
+      });
+    });
+  }
+
+  /* 矩阵：行 = 项目，列 = 阶段 */
+  renderMatrix(parent, projects, kind) {
+    const stages = stagesOfKind(kind || 'paper');
+    const wrap = h(parent, 'div', { cls: 'rw-matrix-wrap' });
+    const t = h(wrap, 'table', { cls: 'rw-matrix' });
+    const tr = h(h(t, 'thead'), 'tr');
+    h(tr, 'th', { text: '项目' });
+    for (const s of stages) {
+      const th = h(tr, 'th');
+      th.style.setProperty('--sc', s.color);
+      ic(th, s.icon);
+      h(th, 'span', { text: s.id });
+    }
+    h(tr, 'th', { text: '下一步' });
+    const tb = h(t, 'tbody');
+    for (const p of projects) {
+      const row = h(tb, 'tr');
+      const nameTd = h(row, 'td', { cls: 'rw-m-name' });
+      nameTd.style.setProperty('--pc', projectColor(p.name));
+      h(nameTd, 'span', { cls: 'rw-dot' });
+      h(nameTd, 'span', { text: p.title });
+      h(nameTd, 'span', { cls: 'rw-status st-' + p.status, text: p.status });
+      nameTd.addEventListener('click', () => this.openProject(p.name));
+      nameTd.addEventListener('contextmenu', (e) => this.projectMenu(e, p));
+      const cur = stageIdxOf(p);
+      stages.forEach((s, i) => {
+        const cnt = p.counts[s.noteType] || 0;
+        const td = h(row, 'td', { cls: 'rw-m-cell' + (i < cur ? ' is-done' : '') + (i === cur ? ' is-current' : '') });
+        td.style.setProperty('--sc', s.color);
+        const inner = h(td, 'div', { cls: 'rw-m-inner' });
+        if (i < cur) ic(inner, 'check');
+        if (i === cur) h(inner, 'span', { cls: 'rw-m-now', text: '进行中' });
+        if (cnt) h(inner, 'span', { cls: 'rw-m-count', text: cnt + ' 篇' });
+        td.title = p.title + ' · ' + s.id + '：' + cnt + ' 条笔记（点击查看）';
+        td.addEventListener('click', () => this.switchTab(s.noteType, { project: p.name }));
+      });
+      h(row, 'td', { cls: 'rw-m-next', text: p.next || '—' });
+    }
+  }
+
+  projectMenu(e, p) {
+    e.preventDefault();
+    const m = new Menu();
+    m.addItem((i) => i.setTitle('查看项目详情').setIcon('folder-open').onClick(() => this.openProject(p.name)));
+    m.addItem((i) => i.setTitle('打开项目主页笔记').setIcon('file-text').onClick(() => this.plugin.openFile(p.file)));
+    m.addItem((i) => i.setTitle('导入文件到此项目…').setIcon('upload').onClick(() => this.plugin.pickFiles({ project: p.name })));
+    m.addItem((i) => i.setTitle('从 Zotero 导入文献到此项目…').setIcon('library').onClick(() => this.plugin.zoteroImportModal({ project: p.name })));
+    m.addItem((i) => i.setTitle('在此项目下新建笔记…').setIcon('file-plus').onClick(() => this.plugin.newNoteModal({ project: p.name })));
+    m.addItem((i) => i.setTitle('修改下一步…').setIcon('arrow-right-circle').onClick(() => this.plugin.promptText('下一步要做什么？', p.next, (v) => this.plugin.setField(p.file, 'next', v))));
+    m.addItem((i) => i.setTitle('修改截止日期…').setIcon('alarm-clock').onClick(() => this.plugin.promptText('截止日期（YYYY-MM-DD）', p.deadline, (v) => this.plugin.setField(p.file, 'deadline', v))));
+    m.addSeparator();
+    for (const s of stagesOf(p)) {
+      m.addItem((i) => i.setTitle('阶段 → ' + s.id).setIcon(s.icon).setChecked(p.stage === s.id).onClick(async () => { await this.plugin.setProjectStage(p, s.id); this.render(); }));
+    }
+    m.addSeparator();
+    for (const k of KIND_ORDER) {
+      m.addItem((i) => i.setTitle('类型 → ' + KINDS[k].label).setIcon(KINDS[k].icon).setChecked(p.pkind === k).onClick(async () => { await this.plugin.setProjectKind(p, k); this.render(); }));
+    }
+    const dirs = this.index.projects.filter((x) => x.pkind === 'direction' && x.name !== p.name);
+    if (dirs.length && p.pkind !== 'direction') {
+      m.addSeparator();
+      m.addItem((i) => i.setTitle('所属方向 → 无').setChecked(!p.parentName).onClick(async () => { await this.plugin.setField(p.file, 'parent', ''); this.render(); }));
+      for (const d of dirs) m.addItem((i) => i.setTitle('所属方向 → ' + d.title).setIcon('compass').setChecked(p.parentName === d.name).onClick(async () => { await this.plugin.setField(p.file, 'parent', '[[' + d.name + ']]'); this.render(); }));
+    }
+    m.addSeparator();
+    for (const s of PROJECT_STATUSES) {
+      m.addItem((i) => i.setTitle('状态 → ' + s).setChecked(p.status === s).onClick(async () => { await this.plugin.setField(p.file, 'status', s); this.render(); }));
+    }
+    m.addSeparator();
+    m.addItem((i) => i.setTitle('重命名项目…').setIcon('pencil').onClick(() => this.plugin.renameProjectPrompt(p)));
+    addDeleteItem(m, '删除项目…', () => this.plugin.deleteProject(p));
+    m.showAtMouseEvent(e);
+  }
+
+  trashBtn(parent, title, fn) {
+    const b = h(parent, 'button', { cls: 'rw-iconbtn rw-del', title });
+    ic(b, 'trash-2');
+    b.addEventListener('click', (e) => { e.stopPropagation(); fn(); });
+    return b;
+  }
+
+  noteMenu(e, n) {
+    e.preventDefault();
+    if (n.pdfOnly) {
+      const m = new Menu();
+      m.addItem((i) => i.setTitle('阅读（PDF + AI 问答）').setIcon('book-open-text').onClick(() => this.plugin.openPaperReader(n.file)));
+      m.addItem((i) => i.setTitle('为这个 PDF 建文献笔记').setIcon('file-plus').onClick(async () => { await this.plugin.createLitNoteForPdf(n.file); this.render(); }));
+      m.addItem((i) => i.setTitle('从 PDF 识别标题').setIcon('scan-text').onClick(async () => { await this.plugin.fillLitMeta(null, n.file); this.render(); }));
+      if (n.explain) m.addItem((i) => i.setTitle('打开讲解稿').setIcon('file-text').onClick(() => this.plugin.openFile(n.explain)));
+      m.addItem((i) => i.setTitle('用 Obsidian 自带的 PDF 阅读器打开').setIcon('external-link').onClick(() => this.plugin.openFile(n.file)));
+      m.addSeparator();
+      this.plugin.ftMenuItems(m, n.file);
+      m.showAtMouseEvent(e);
+      return;
+    }
+    const m = new Menu();
+    const def = NOTE_TYPES[n.type];
+    m.addItem((i) => i.setTitle('打开').setIcon('file-text').onClick(() => this.plugin.openFile(n.file)));
+    if (n.type === 'literature') { const c = this.plugin.paperOf(n.file); if (c && c.pdf) { m.addItem((i) => i.setTitle('从 PDF 识别标题 / 作者 / 年份').setIcon('scan-text').onClick(async () => { await this.plugin.fillLitMeta(n.file, c.pdf, { force: !!str(n.fm.title) && looksLikeFileName(str(n.fm.title)) }); this.render(); })); m.addSeparator(); this.plugin.ftMenuItems(m, c.pdf); m.addSeparator(); } }
+    m.addItem((i) => i.setTitle('预览').setIcon('eye').onClick(() => this.plugin.previewNotes([n], n)));
+    if (n.type === 'idea') {
+      m.addItem((i) => i.setTitle('转为科研项目').setIcon('rocket').onClick(() => this.plugin.ideaToProject(n)));
+    }
+    if (n.fm.zotero) m.addItem((i) => i.setTitle('在 Zotero 中打开').setIcon('library').onClick(() => this.plugin.openLinkValue(n.fm.zotero, n.file)));
+    const pdf = this.plugin.pdfOf(n);
+    const PLBL = { vault: '打开 PDF（工作台库内）', zotero: '在 Zotero 中打开 PDF', path: '打开 PDF（电脑上的文件）', url: '打开在线 PDF' };
+    for (const x of this.plugin.pdfsOf(n)) m.addItem((i) => i.setTitle(PLBL[x.kind]).setIcon('file-text').onClick(() => this.plugin.openPdf(x)));
+    if (n.type === 'literature') {
+      m.addItem((i) => i.setTitle(pdf ? '更换关联的 PDF…' : '关联 PDF…').setIcon('link').onClick(() => this.plugin.pickPdfFor(n)));
+      if (pdf && pdf.kind === 'vault' && this.plugin.pdfsOf(n).some((x) => x.kind === 'zotero')) { /* 两种都有 */ }
+      if (pdf && n.fm.pdf) m.addItem((i) => i.setTitle('取消关联 PDF').setIcon('unlink').onClick(() => this.plugin.setField(n.file, 'pdf', '')));
+    }
+    if (n.fm.zotero_key) m.addItem((i) => i.setTitle('同步此文献的 Zotero 批注').setIcon('refresh-ccw').onClick(() => this.plugin.syncZoteroAnnotations([n])));
+    m.addSeparator();
+    for (const s of def.statuses) {
+      m.addItem((i) => i.setTitle('状态 → ' + s).setChecked(n.status === s).onClick(async () => { await this.plugin.setField(n.file, 'status', s); this.render(); }));
+    }
+    m.addSeparator();
+    m.addItem((i) => i.setTitle('归属项目 → 无').onClick(async () => { await this.plugin.setField(n.file, 'project', ''); this.render(); }));
+    for (const p of this.index.projects.filter((x) => x.status !== '已完成')) {
+      m.addItem((i) => i.setTitle('归属项目 → ' + p.title).setChecked(n.projectName === p.name).onClick(async () => { await this.plugin.setField(n.file, 'project', '[[' + p.name + ']]'); this.render(); }));
+    }
+    if (n.inferred) {
+      m.addSeparator();
+      m.addItem((i) => i.setTitle('补全属性（写入 type / status / date）').setIcon('wand').onClick(() => this.plugin.fillProps([n])));
+    }
+    m.addSeparator();
+    for (const k of Object.keys(NOTE_TYPES)) {
+      if (k === n.type) continue;
+      m.addItem((i) => i.setTitle('改为 → ' + NOTE_TYPES[k].label).setIcon(NOTE_TYPES[k].icon).onClick(() => this.plugin.convertMdToNote(n.file, k, n.projectName)));
+    }
+    addDeleteItem(m, '删除笔记…', () => this.plugin.deleteNote(n));
+    m.showAtMouseEvent(e);
+  }
+
+  /* ---------- 项目页 ---------- */
+  renderProjects(el) {
+    const { projects } = this.index;
+    const right = this.header(el, '全部项目', '点击卡片进入项目详情；点阶段圆点切换阶段；把文件拖到卡片上即可放进该项目；右键更多操作', 'folder-kanban');
+    this.btn(right, '新建项目', 'folder-plus', () => this.plugin.newProjectModal(), 'mod-cta');
+    const st = this.plugin.settings;
+    const bar = h(el, 'div', { cls: 'rw-filterbar' });
+    const opts = [['活跃', '活跃']].concat(PROJECT_STATUSES.map((s) => [s, s])).concat([['全部', '全部']]);
+    this.segmented(bar, opts, st.projectFilter, (v) => { st.projectFilter = v; this.plugin.saveSettingsSoon(); this.render(); });
+    const kindsPresent = KIND_ORDER.filter((k) => projects.some((p) => p.pkind === k));
+    if (kindsPresent.length > 1) {
+      if (st.projectKind && st.projectKind !== 'all' && !kindsPresent.includes(st.projectKind)) st.projectKind = 'all';
+      this.segmented(bar, [['all', '全部类型']].concat(kindsPresent.map((k) => [k, KINDS[k].label])), st.projectKind || 'all', (v) => { st.projectKind = v; this.plugin.saveSettingsSoon(); this.render(); });
+    }
+    let list = projects;
+    if (st.projectKind && st.projectKind !== 'all') list = list.filter((p) => p.pkind === st.projectKind);
+    if (st.projectFilter === '活跃') list = list.filter((p) => p.status !== '已完成');
+    else if (st.projectFilter !== '全部') list = list.filter((p) => p.status === st.projectFilter);
+    const prioRank = { 高: 0, 中: 1, 低: 2 };
+    list = list.slice().sort((a, b) => (prioRank[a.priority] ?? 3) - (prioRank[b.priority] ?? 3) || b.lastActivity - a.lastActivity);
+    const grid = h(el, 'div', { cls: 'rw-grid' });
+    for (const p of list) this.projectCard(grid, p, true);
+    if (!list.length) h(el, 'div', { cls: 'rw-empty', text: '没有符合条件的项目' });
+  }
+
+  /* ---------- 笔记类标签页（灵感/文献/实验/数据/写作/投稿/会议） ---------- */
+  renderNotesTab(el, type) {
+    const def = NOTE_TYPES[type];
+    const f = (this.filters[type] = this.filters[type] || {});
+    const st = this.plugin.settings;
+    const view = st.noteViews[type] || (type === 'meeting' ? 'list' : 'board');
+
+    const right = this.header(el, def.label, def.desc, def.icon);
+    const curProject = f.project && f.project !== '__none' ? f.project : '';
+    if (type === 'literature') {
+      this.btn(right, '从 Zotero 导入', 'library', () => this.plugin.zoteroImportModal({ project: curProject }));
+      this.btn(right, '同步批注', 'refresh-ccw', () => this.plugin.syncZoteroAnnotations());
+    }
+    if (TAB_TO_CAT[type] && type !== 'idea') this.btn(right, '导入文件', 'upload', () => this.plugin.pickFiles({ project: curProject, cat: TAB_TO_CAT[type] }));
+    if (type === 'idea') this.renderInspireBar(el);
+    if (type === 'literature') {
+      const mode = st.litMode || 'library';
+      const segBar = h(el, 'div', { cls: 'rw-lit-modes' });
+      for (const [id, label, icon, tip] of [['table', '我的文献', 'table-2', '表格：每篇文献一行，AI 读全文填写研究目的 / 方法 / 结论等列'], ['library', '文献资料库', 'library', '看板 / 列表：按阅读状态管理全部文献和 PDF'], ['notes', '笔记摘录', 'bookmark', '阅读时的划线、译文、AI 解释和我的笔记，跨文献汇总']]) {
+        const b = h(segBar, 'button', { cls: 'rw-lit-mode' + (mode === id ? ' is-active' : ''), title: tip });
+        ic(b, icon); h(b, 'span', { text: label });
+        b.addEventListener('click', () => { st.litMode = id; this.plugin.saveSettingsSoon(); this.render(); });
+      }
+      h(segBar, 'span', { cls: 'rw-tp-sp' });
+      const lt = h(segBar, 'div', { cls: 'rw-lit-click', title: '点击文献标题时打开什么' });
+      h(lt, 'span', { cls: 'rw-muted', text: '点标题打开' });
+      this.seg(lt, [['reader', '阅读'], ['note', '笔记']], st.litTitleClick === 'note' ? 'note' : 'reader', (v) => { st.litTitleClick = v; this.plugin.saveSettingsSoon(); this.render(); });
+      if (mode === 'table') { this.renderLitTable(el, f); return; }
+      if (mode === 'notes') { this.renderLitNotes(el, f); return; }
+      this.renderOrphanPdfs(el, f);
+    }
+    const inferredList = this.index.notes.filter((n) => n.type === type && n.inferred);
+    if (inferredList.length) this.btn(right, '补全属性（' + inferredList.length + '）', 'wand', () => this.plugin.fillProps(inferredList), 'rw-btn-warn');
+    this.btn(right, '新建' + def.label, 'plus', () => this.plugin.newNoteModal({ type, project: curProject }), 'mod-cta');
+
+    // 当前处于本阶段的项目
+    {
+      // 当前阶段正需要这类笔记的项目（各类型项目的阶段都会映射到某类笔记）
+      const inStage = this.index.projects.filter((p) => p.status !== '已完成' && stageDefOf(p) && stageDefOf(p).noteType === type);
+      const strip = h(el, 'div', { cls: 'rw-strip' });
+      const sc = def.stage ? STAGES[stageIndex(def.stage)] : { color: '#8b5cf6', icon: def.icon };
+      strip.style.setProperty('--sc', sc.color);
+      const lab = h(strip, 'span', { cls: 'rw-strip-label' });
+      ic(lab, def.icon);
+      h(lab, 'span', { text: '当前阶段正需要「' + def.label + '」的项目：' });
+      if (!inStage.length) h(strip, 'span', { cls: 'rw-muted', text: '暂无' });
+      for (const p of inStage) {
+        const c = this.projectChip(strip, p.title + ' · ' + p.stage);
+        c.classList.add('is-clickable');
+        c.title = (p.next ? '下一步：' + p.next : '') + '（点击筛选）';
+        c.addEventListener('click', () => { f.project = p.name; this.render(); });
+      }
+    }
+
+    // 筛选栏
+    const bar = h(el, 'div', { cls: 'rw-filterbar' });
+    const sel = h(bar, 'select', { cls: 'dropdown rw-select' });
+    const addOpt = (v, t) => { const o = h(sel, 'option', { text: t }); o.value = v; };
+    addOpt('', '全部项目');
+    addOpt('__none', '未归属项目');
+    for (const p of this.index.projects) addOpt(p.name, p.title);
+    sel.value = f.project || '';
+    sel.addEventListener('change', () => { f.project = sel.value; drawContent(); });
+    const fi = h(bar, 'input', { cls: 'rw-filter-input', attr: { type: 'text', placeholder: '筛选标题…' } });
+    fi.value = f.text || '';
+    fi.addEventListener('input', () => { f.text = fi.value; drawContent(); });
+    h(bar, 'div', { cls: 'rw-spacer' });
+    if (type === 'literature') {
+      const lg = h(bar, 'div', { cls: 'rw-pdf-legend', title: '文献标题旁的 PDF 标记表示原文在哪里' });
+      h(lg, 'span', { cls: 'rw-pdfchip is-vault', text: 'PDF · 库内' });
+      h(lg, 'span', { text: '在工作台里' });
+      h(lg, 'span', { cls: 'rw-pdfchip is-zotero', text: 'PDF · Zotero' });
+      h(lg, 'span', { text: '在 Zotero 里' });
+    }
+    this.segmented(bar, [['board', '看板'], ['list', '列表']], view, (v) => { st.noteViews[type] = v; this.plugin.saveSettingsSoon(); this.render(); });
+
+    if (type === 'literature') { this.litList(Object.assign({}, f, { cat: '' })); this.litCatChips(el, f); }
+    const content = h(el, 'div', { cls: 'rw-notes-content' });
+    const drawContent = () => {
+      clear(content);
+      let list = this.index.notes.filter((n) => n.type === type);
+      if (type === 'literature' && f.cat && f.cat !== 'all') list = list.filter((n) => this.litTags(n).has(f.cat));
+      if (f.project === '__none') list = list.filter((n) => !n.projectName);
+      else if (f.project) list = list.filter((n) => n.projectName === f.project);
+      if (f.text) { const s = f.text.toLowerCase(); list = list.filter((n) => n.title.toLowerCase().includes(s) || n.file.path.toLowerCase().includes(s)); }
+      list.sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.file.stat.mtime - a.file.stat.mtime);
+      if (view === 'list') this.renderNoteList(content, list, def);
+      else this.renderNoteBoard(content, list, def);
+      const cat = TAB_TO_CAT[type];
+      if (cat && type !== 'idea' && type !== 'submission') {
+        const titles = { literature: '文献原文（PDF 等）', data: '实验数据文件', writing: '文稿文件', meeting: '会议资料（录音 / 视频 / 材料）' };
+        let files = this.index.files.filter((x) => x.cat === cat || (type === 'experiment' && x.cat === 'image'));
+        if (f.project === '__none') files = files.filter((x) => !x.projectName);
+        else if (f.project) files = files.filter((x) => x.projectName === f.project);
+        const sec = this.section(content, titles[cat] || '相关文件', FILE_CATS[cat].icon);
+        sec.el.classList.add('rw-notes-files');
+        h(sec.right, 'span', { cls: 'rw-muted', text: '把文件拖进本页即可导入' });
+        this.renderFileTable(sec.body, files, { compact: true, limit: 5, moreLink: () => this.switchTab('files', { project: f.project && f.project !== '__none' ? f.project : '', cat }), empty: '还没有' + (titles[cat] || '文件') + '。把文件拖到这一页，会自动归到「' + FILE_CATS[cat].label + '」' });
+      }
+    };
+    drawContent();
+  }
+
+  renderNoteBoard(parent, list, def) {
+    const statuses = def.statuses.slice();
+    const other = list.filter((n) => !statuses.includes(n.status));
+    const board = h(parent, 'div', { cls: 'rw-board rw-nboard' });
+    const cols = statuses.map((s) => [s, list.filter((n) => n.status === s)]);
+    if (other.length) cols.unshift(['未设置状态', other]);
+    for (const [s, items] of cols) {
+      const col = h(board, 'div', { cls: 'rw-col' });
+      const hd = h(col, 'div', { cls: 'rw-col-head' });
+      h(hd, 'span', { cls: 'rw-col-name', text: s });
+      h(hd, 'span', { cls: 'rw-col-count', text: items.length });
+      const body = h(col, 'div', { cls: 'rw-col-body' });
+      for (const n of items) this.noteCard(body, n);
+      if (!items.length) h(body, 'div', { cls: 'rw-col-empty', text: TOUCH ? '长按卡片改状态' : '拖动卡片到这里' });
+      if (s !== '未设置状态') {
+        this.makeDropZone(col, async (path) => {
+          const n = this.index.notes.find((x) => x.file.path === path);
+          if (n && n.status !== s) await this.plugin.setField(n.file, 'status', s);
+        });
+      }
+    }
+  }
+
+  noteCard(parent, n) {
+    const card = h(parent, 'div', { cls: 'rw-card rw-ncard' });
+    const top = h(card, 'div', { cls: 'rw-card-top' });
+    const ttl = h(top, 'div', { cls: 'rw-card-title', text: n.title });
+    this.pdfChip(ttl, n);
+    const eye = h(top, 'button', { cls: 'rw-iconbtn rw-del rw-eye', title: '预览' });
+    ic(eye, 'eye');
+    eye.addEventListener('click', (e) => { e.stopPropagation(); const sibs = this.index.notes.filter((x) => x.type === n.type); this.plugin.previewNotes(sibs, n); });
+    this.trashBtn(top, '删除笔记', () => this.plugin.deleteNote(n));
+    if (n.inferred) this.inferredBadge(card, n);
+    const fm = n.fm;
+    let extra = '';
+    if (n.type === 'literature') extra = [str(fm.authors), str(fm.year), str(fm.journal)].filter(Boolean).join(' · ');
+    else if (n.type === 'submission') extra = [str(fm.journal), str(fm.decision)].filter(Boolean).join(' · ');
+    else if (n.type === 'meeting') extra = str(fm.attendees);
+    else if (n.type === 'experiment') extra = str(fm.conditions);
+    else if (n.type === 'draft') extra = [str(fm.section), str(fm.target)].filter(Boolean).join(' · ');
+    if (extra) h(card, 'div', { cls: 'rw-card-desc', text: extra });
+    const meta = h(card, 'div', { cls: 'rw-card-meta' });
+    if (n.projectName) this.projectChip(meta, n.projectName);
+    else h(meta, 'span', { cls: 'rw-muted', text: '未归属' });
+    if (n.openTasks) { const m = h(meta, 'span', { cls: 'rw-meta' }); ic(m, 'check-square'); h(m, 'span', { text: n.openTasks }); }
+    h(meta, 'span', { cls: 'rw-meta-time', text: n.date || relTime(n.file.stat.mtime) });
+    this.attachButtons(card, n);
+    card.addEventListener('click', () => this.openNoteTitle(n));
+    card.addEventListener('contextmenu', (e) => this.noteMenu(e, n));
+    this.makeDraggable(card, n.file.path);
+  }
+
+  inferredBadge(parent, n) {
+    const b = h(parent, 'span', { cls: 'rw-badge rw-badge-warn', text: '未加属性', title: '这条笔记没有 type / status 等属性，是按所在文件夹「' + (n.file.parent ? n.file.parent.name : '') + '」识别的。点击一键补全。' });
+    b.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.fillProps([n]); });
+    return b;
+  }
+
+  /* 笔记卡片上的快捷按钮：Zotero / PDF / 录音 / 文件 */
+  /* 文献标题旁的 PDF 标记：找得到 PDF 才显示 */
+  pdfChip(parent, n) {
+    if (n.type !== 'literature') return null;
+    const all = this.plugin.pdfsOf(n);
+    if (!all.length) return null;
+    const TXT = { vault: 'PDF · 库内', zotero: 'PDF · Zotero', path: 'PDF · 电脑', url: 'PDF · 网络' };
+    let first = null;
+    for (const pdf of all) {
+      const c = h(parent, 'span', { cls: 'rw-pdfchip is-' + pdf.kind, text: TXT[pdf.kind], title: pdf.label });
+      c.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.openPdf(pdf); });
+      c.addEventListener('dblclick', (e) => e.stopPropagation());
+      first = first || c;
+    }
+    return first;
+  }
+  /* 点击文献标题：按设置打开笔记或 PDF */
+  openNoteTitle(n) {
+    if (n.type === 'literature' && this.plugin.settings.litTitleClick !== 'note') return this.plugin.openPaperReader(n.file);
+    return this.plugin.openFile(n.file);
+  }
+  attachButtons(parent, n) {
+    const fm = n.fm || {};
+    const acts = [];
+    if (fm.zotero) acts.push(['Zotero', 'library', fm.zotero]);
+    if (fm.pdf && n.type !== 'literature' && this.plugin.pdfOf(n)) acts.push(['PDF', 'file-text', fm.pdf]);
+    if (fm.audio) acts.push(['录音', 'mic', fm.audio]);
+    if (fm.file) acts.push(['文件', 'paperclip', fm.file]);
+    if (fm.slides) acts.push(['PPT', 'presentation', fm.slides]);
+    if (!acts.length) return;
+    const row = h(parent, 'div', { cls: 'rw-attach' });
+    for (const [label, iconName, val] of acts) {
+      const b = h(row, 'button', { cls: 'rw-attach-btn', title: '打开' + label });
+      ic(b, iconName);
+      h(b, 'span', { text: label });
+      b.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.openLinkValue(val, n.file); });
+    }
+  }
+
+  renderNoteList(parent, list, def) {
+    if (!list.length) { h(parent, 'div', { cls: 'rw-empty', text: '暂无' + def.label + '笔记' }); return; }
+    const t = h(parent, 'table', { cls: 'rw-table' });
+    const tr = h(h(t, 'thead'), 'tr');
+    for (const c of ['标题', '项目', '状态', '日期', '更新', '']) h(tr, 'th', { text: c });
+    const tb = h(t, 'tbody');
+    for (const n of list) {
+      const r = h(tb, 'tr');
+      const t1 = h(r, 'td', { cls: 'rw-t-title', text: n.title });
+      this.pdfChip(t1, n);
+      if (n.inferred) this.inferredBadge(t1, n);
+      t1.addEventListener('click', () => this.openNoteTitle(n));
+      const t2 = h(r, 'td');
+      if (n.projectName) this.projectChip(t2, n.projectName);
+      const t3 = h(r, 'td');
+      const sel = h(t3, 'select', { cls: 'dropdown rw-select rw-select-sm' });
+      const statuses = def.statuses.includes(n.status) || !n.status ? def.statuses : [n.status].concat(def.statuses);
+      if (!n.status) { const o0 = h(sel, 'option', { text: '—' }); o0.value = ''; }
+      for (const s of statuses) { const o = h(sel, 'option', { text: s }); o.value = s; }
+      sel.value = n.status || '';
+      sel.addEventListener('change', () => this.plugin.setField(n.file, 'status', sel.value));
+      h(r, 'td', { cls: 'rw-muted', text: n.date || '' });
+      h(r, 'td', { cls: 'rw-muted', text: relTime(n.file.stat.mtime) });
+      this.trashBtn(h(r, 'td', { cls: 'rw-factions' }), '删除笔记', () => this.plugin.deleteNote(n));
+      r.addEventListener('contextmenu', (e) => this.noteMenu(e, n));
+    }
+  }
+
+  /* ---------- 文件页 ---------- */
+  dropArea(parent, text, ctxFn) {
+    const d = h(parent, 'div', { cls: 'rw-dropzone' });
+    ic(d, 'upload-cloud', 'rw-dropzone-icon');
+    const t = h(d, 'div', { cls: 'rw-dropzone-text' });
+    h(t, 'div', { text: IS_MOBILE ? '点这里选择文件导入，会按类型自动归档到项目文件夹' : text });
+    h(t, 'div', { cls: 'rw-muted', text: (IS_MOBILE ? '' : '或点击这里选择文件 · ') + ' · PDF / PPT / Excel / 数据 / 录音 / 图片 / 代码…任意格式' });
+    d.addEventListener('click', () => this.plugin.pickFiles(ctxFn ? ctxFn() : this.dropContext()));
+    return d;
+  }
+
+  renderFiles(el) {
+    const f = (this.filters.files = this.filters.files || {});
+    if (!f.cat) f.cat = 'all';
+    const right = this.header(el, '文件', 'PDF 和图片在 Obsidian 里打开；PPT、Excel、Word、数据文件等用电脑上的默认程序打开', 'paperclip');
+    this.btn(right, '从 Zotero 导入', 'library', () => this.plugin.zoteroImportModal({ project: this.dropContext().project }));
+    this.btn(right, '选择文件导入', 'upload', () => this.plugin.pickFiles(this.dropContext()), 'mod-cta');
+    this.dropArea(el, '把文件从电脑拖到这里（可一次拖多个），会按类型自动归档到项目文件夹');
+
+    const bar = h(el, 'div', { cls: 'rw-filterbar' });
+    const sel = h(bar, 'select', { cls: 'dropdown rw-select' });
+    const addOpt = (v, t) => { const o = h(sel, 'option', { text: t }); o.value = v; };
+    addOpt('', '全部项目');
+    addOpt('__none', '未归属项目');
+    for (const p of this.index.projects) addOpt(p.name, p.title);
+    sel.value = f.project || '';
+    const fi = h(bar, 'input', { cls: 'rw-filter-input', attr: { type: 'text', placeholder: '筛选文件名…' } });
+    fi.value = f.text || '';
+    const catBar = h(el, 'div', { cls: 'rw-catbar' });
+    const content = h(el, 'div');
+
+    const base = () => {
+      let list = this.index.files;
+      if (f.project === '__none') list = list.filter((x) => !x.projectName);
+      else if (f.project) list = list.filter((x) => x.projectName === f.project);
+      if (f.text) { const s = f.text.toLowerCase(); list = list.filter((x) => x.name.toLowerCase().includes(s)); }
+      return list;
+    };
+    const draw = () => {
+      const list = base();
+      clear(catBar);
+      const counts = {};
+      for (const x of list) counts[x.cat] = (counts[x.cat] || 0) + 1;
+      const chip = (key, label, iconName, n) => {
+        const c = h(catBar, 'button', { cls: 'rw-catchip' + (f.cat === key ? ' is-active' : '') });
+        if (iconName) ic(c, iconName);
+        h(c, 'span', { text: label });
+        h(c, 'span', { cls: 'rw-tab-count', text: n });
+        c.addEventListener('click', () => { f.cat = key; draw(); });
+      };
+      chip('all', '全部', 'layers', list.length);
+      for (const k of Object.keys(FILE_CATS)) if (counts[k] || f.cat === k) chip(k, FILE_CATS[k].label, FILE_CATS[k].icon, counts[k] || 0);
+      clear(content);
+      const shown = f.cat === 'all' ? list : list.filter((x) => x.cat === f.cat);
+      this.renderFileTable(content, shown, { empty: '还没有文件。把文件拖进来试试。' });
+    };
+    sel.addEventListener('change', () => { f.project = sel.value; draw(); });
+    fi.addEventListener('input', () => { f.text = fi.value; draw(); });
+    draw();
+  }
+
+  renderFileTable(parent, list, opts) {
+    opts = opts || {};
+    if (!list.length) { h(parent, 'div', { cls: 'rw-empty-sm', text: opts.empty || '暂无文件' }); return; }
+    list = list.slice().sort((a, b) => b.mtime - a.mtime);
+    const all = list;
+    const limit = opts.limit || 15;
+    const shownN = Math.min(all.length, opts.shown || limit);
+    list = all.slice(0, shownN);
+    const t = h(parent, 'table', { cls: 'rw-table rw-ftable' });
+    const tr = h(h(t, 'thead'), 'tr');
+    const cols = ['名称'].concat(opts.noProject ? [] : ['项目']).concat(['分类', '大小', '修改', '']);
+    for (const c of cols) h(tr, 'th', { text: c });
+    const tb = h(t, 'tbody');
+    for (const x of list) {
+      const r = h(tb, 'tr', { cls: 'rw-frow' });
+      const nameTd = h(h(r, 'td'), 'div', { cls: 'rw-fname' });
+      const iw = h(nameTd, 'span', { cls: 'rw-ficon cat-' + x.cat });
+      ic(iw, fileIcon(x.ext));
+      h(nameTd, 'span', { cls: 'rw-fname-text', text: x.name, title: x.kind === 'link' ? x.extPath : x.file.path });
+      if (x.kind === 'link') h(nameTd, 'span', { cls: 'rw-badge', text: '链接', title: '文件保存在库外：' + x.extPath });
+      if (!opts.noProject) {
+        const pt = h(r, 'td');
+        if (x.projectName) this.projectChip(pt, x.projectName);
+        else h(pt, 'span', { cls: 'rw-muted', text: '—' });
+      }
+      h(r, 'td', { cls: 'rw-muted', text: FILE_CATS[x.cat].label });
+      h(r, 'td', { cls: 'rw-muted rw-num', text: fmtSize(x.size) });
+      h(r, 'td', { cls: 'rw-muted', text: relTime(x.mtime) });
+      const act = h(r, 'td', { cls: 'rw-factions' });
+      const b0 = h(act, 'button', { cls: 'rw-iconbtn', title: '预览（不打开文件）' });
+      ic(b0, 'eye');
+      b0.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.previewEntries(all, all.indexOf(x)); });
+      const b1 = h(act, 'button', { cls: 'rw-iconbtn', title: OBSIDIAN_EXTS.includes(x.ext) && x.kind === 'file' ? '在 Obsidian 中打开' : '用默认程序打开' });
+      ic(b1, 'external-link');
+      b1.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.openEntry(x); });
+      const b2 = h(act, 'button', { cls: 'rw-iconbtn', title: '在文件夹中显示' });
+      ic(b2, 'folder-open');
+      b2.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.revealEntry(x); });
+      const b3 = h(act, 'button', { cls: 'rw-iconbtn', title: '更多' });
+      ic(b3, 'more-horizontal');
+      b3.addEventListener('click', (e) => { e.stopPropagation(); this.fileMenu(e, x); });
+      this.trashBtn(act, x.kind === 'link' ? '删除链接记录' : '删除文件', () => this.plugin.deleteEntry(x));
+      // 单击 = 预览；双击 = 打开
+      r.addEventListener('click', () => this.plugin.previewEntries(all, all.indexOf(x)));
+      r.addEventListener('dblclick', () => this.plugin.openEntry(x));
+      r.addEventListener('contextmenu', (e) => this.fileMenu(e, x));
+    }
+    if (all.length > shownN) {
+      const more = h(parent, 'div', { cls: 'rw-more' });
+      const b = h(more, 'button', { cls: 'rw-btn rw-btn-sm' });
+      ic(b, 'chevrons-down');
+      h(b, 'span', { text: '再显示 ' + Math.min(30, all.length - shownN) + ' 个（还有 ' + (all.length - shownN) + ' 个）' });
+      b.addEventListener('click', () => { clear(parent); this.renderFileTable(parent, all, Object.assign({}, opts, { shown: shownN + 30 })); });
+      if (opts.moreLink) { const l = h(more, 'button', { cls: 'rw-linkbtn', text: '去「文件」页筛选 →' }); l.addEventListener('click', opts.moreLink); }
+    }
+    h(parent, 'div', { cls: 'rw-muted rw-hint', text: '单击预览 · 双击打开 · ←/→ 在预览中切换' });
+  }
+
+  fileMenu(e, x) {
+    e.preventDefault();
+    const m = new Menu();
+    const pl = this.plugin;
+    m.addItem((i) => i.setTitle('预览').setIcon('eye').onClick(() => pl.previewEntries([x], 0)));
+    m.addItem((i) => i.setTitle('打开').setIcon('external-link').onClick(() => pl.openEntry(x)));
+    if (x.kind === 'file' && x.ext === 'pdf' && x.file) { m.addSeparator(); pl.ftMenuItems(m, x.file); m.addSeparator(); }
+    if (x.kind === 'file' && OBSIDIAN_EXTS.includes(x.ext)) m.addItem((i) => i.setTitle('用系统默认程序打开').setIcon('app-window').onClick(() => pl.openWithDefault(x.file)));
+    m.addItem((i) => i.setTitle('在文件夹中显示').setIcon('folder-open').onClick(() => pl.revealEntry(x)));
+    m.addItem((i) => i.setTitle('复制完整路径').setIcon('copy').onClick(() => pl.copyEntryPath(x)));
+    if (x.kind === 'file') m.addItem((i) => i.setTitle('复制 [[链接]]（粘贴到笔记里引用）').setIcon('link').onClick(() => pl.copyText('[[' + x.file.path + ']]')));
+    if (x.kind === 'link') m.addItem((i) => i.setTitle('打开链接笔记').setIcon('file-text').onClick(() => pl.openFile(x.file)));
+    m.addSeparator();
+    const noteType = x.cat === 'literature' ? 'literature' : x.cat === 'meeting' ? 'meeting' : x.cat === 'data' ? 'data' : x.cat === 'writing' ? 'draft' : null;
+    if (noteType) m.addItem((i) => i.setTitle('为它创建' + NOTE_TYPES[noteType].label + '笔记').setIcon(NOTE_TYPES[noteType].icon).onClick(() => pl.createNoteForEntry(x, noteType, true)));
+    if (x.kind === 'file' && x.projectName) m.addItem((i) => i.setTitle('移动到项目里的文件夹…').setIcon('folder-input').onClick(() => pl.pickFolder(x.projectName, { title: '把「' + x.name + '」移动到…' }, (dest) => pl.moveFileTo(x.file, dest))));
+    m.addSeparator();
+    m.addItem((i) => i.setTitle('移到 → 未归属项目').setChecked(!x.projectName).onClick(() => pl.moveEntry(x, '', x.cat)));
+    for (const p of this.index.projects.filter((pp) => pp.status !== '已完成' || pp.name === x.projectName)) {
+      m.addItem((i) => i.setTitle('移到 → ' + p.title).setChecked(x.projectName === p.name).onClick(() => pl.moveEntry(x, p.name, x.cat)));
+    }
+    m.addSeparator();
+    for (const k of Object.keys(FILE_CATS)) {
+      m.addItem((i) => i.setTitle('分类 → ' + FILE_CATS[k].label).setIcon(FILE_CATS[k].icon).setChecked(x.cat === k).onClick(() => pl.moveEntry(x, x.projectName, k)));
+    }
+    if (x.looseMd) {
+      m.addSeparator();
+      for (const k of Object.keys(NOTE_TYPES)) {
+        m.addItem((i) => i.setTitle('转为笔记 → ' + NOTE_TYPES[k].label).setIcon(NOTE_TYPES[k].icon).onClick(() => pl.convertMdToNote(x.file, k, x.projectName)));
+      }
+    }
+    addDeleteItem(m, x.kind === 'link' ? '删除链接记录…' : '删除文件…', () => pl.deleteEntry(x));
+    m.showAtMouseEvent(e);
+  }
+
+  /* 小的分段按钮 */
+  seg(parent, opts, cur, onChange) {
+    const g = h(parent, 'div', { cls: 'rw-seg' });
+    for (const [v, label] of opts) {
+      const b = h(g, 'button', { cls: 'rw-seg-btn' + (v === cur ? ' is-active' : ''), text: label });
+      b.addEventListener('click', () => { if (v !== cur) onChange(v); });
+    }
+    return g;
+  }
+
+  /* ---------- 项目文件夹浏览器 ---------- */
+  renderFolderBrowser(parent, p) {
+    const pl = this.plugin;
+    const base = pl.projectDir(p.name);
+    const st = (this.filters.dir = this.filters.dir || {});
+    let rel = st[p.name] || '';
+    if (rel && !(this.app.vault.getAbstractFileByPath(base + '/' + rel))) rel = st[p.name] = '';
+    const cur = rel ? base + '/' + rel : base;
+    const go = (r) => { st[p.name] = r; this.render(); };
+    const box = h(parent, 'div', { cls: 'rw-fb' });
+
+    // 路径 + 操作
+    const bar = h(box, 'div', { cls: 'rw-fb-bar' });
+    const crumbs = h(bar, 'div', { cls: 'rw-fb-crumbs' });
+    const parts = rel ? rel.split('/') : [];
+    const crumb = (label, r, icon) => {
+      const c = h(crumbs, 'button', { cls: 'rw-fb-crumb' + (r === rel ? ' is-cur' : ''), title: r ? r : '项目根目录' });
+      if (icon) ic(c, icon);
+      h(c, 'span', { text: label });
+      c.addEventListener('click', () => go(r));
+      this.folderDropTarget(c, p, r ? base + '/' + r : base);
+    };
+    crumb(p.title, '', 'folder-open');
+    parts.forEach((x, i) => { h(crumbs, 'span', { cls: 'rw-fb-sep', text: '›' }); crumb(x, parts.slice(0, i + 1).join('/')); });
+    const acts = h(bar, 'div', { cls: 'rw-fb-acts' });
+    const nb = h(acts, 'button', { cls: 'rw-btn rw-btn-sm', title: '在当前位置新建文件夹' });
+    ic(nb, 'folder-plus'); h(nb, 'span', { text: '新建文件夹' });
+    nb.addEventListener('click', () => pl.promptText('新文件夹名称（建在「' + (rel || p.title) + '」里）', '', async (v) => { const np = await pl.createFolderIn(cur, v); if (np) st[p.name] = np.slice(base.length + 1); }));
+    const ub = h(acts, 'button', { cls: 'rw-iconbtn', title: '导入文件到这个文件夹' });
+    ic(ub, 'upload');
+    ub.addEventListener('click', () => pl.pickFiles({ project: p.name, folder: cur }));
+
+    // 拖进浏览器空白处 = 放进当前文件夹
+    box.addEventListener('dragover', (e) => { if (hasFiles(e)) box.classList.add('is-file-target'); });
+    box.addEventListener('dragleave', (e) => { if (!box.contains(e.relatedTarget)) box.classList.remove('is-file-target'); });
+    box.addEventListener('drop', (e) => { box.classList.remove('is-file-target'); if (hasFiles(e) && !e.rwContext) e.rwContext = { project: p.name, folder: cur }; });
+
+    const { folders, files } = pl.listDir(cur);
+    const list = h(box, 'div', { cls: 'rw-fb-list' });
+    if (rel) {
+      const up = h(list, 'div', { cls: 'rw-row rw-fb-up' });
+      ic(up, 'corner-left-up', 'rw-row-icon');
+      h(up, 'div', { cls: 'rw-row-mid', text: '返回上一级' });
+      up.addEventListener('click', () => go(parts.slice(0, -1).join('/')));
+      this.folderDropTarget(up, p, parts.length > 1 ? base + '/' + parts.slice(0, -1).join('/') : base);
+    }
+    for (const f of folders) {
+      const r = h(list, 'div', { cls: 'rw-row rw-fb-dir' });
+      const iw = h(r, 'span', { cls: 'rw-fb-dicon' });
+      ic(iw, 'folder');
+      const mid = h(r, 'div', { cls: 'rw-row-mid' });
+      const t = h(mid, 'div', { cls: 'rw-row-title', text: f.name });
+      const n = pl.countFiles(f.path);
+      const auto = !rel && pl.isAutoFolder(f.name);
+      h(mid, 'div', { cls: 'rw-row-sub', text: (n ? n + ' 个文件' : '空文件夹') + (auto ? ' · 工作台自动归档' : '') });
+      if (auto) h(t, 'span', { cls: 'rw-fb-auto', text: '自动' });
+      ic(r, 'chevron-right', 'rw-fb-chev');
+      const r2 = rel ? rel + '/' + f.name : f.name;
+      r.addEventListener('click', () => go(r2));
+      r.addEventListener('contextmenu', (e) => this.folderMenu(e, p, f, r2));
+      this.folderDropTarget(r, p, f.path);
+    }
+    const shown = files.filter((f) => !(f.path === p.file.path));
+    if (!rel && shown.length && folders.length) h(list, 'div', { cls: 'rw-fb-label', text: '自由空间 · 直接放在项目里的文件' });
+    const LIM = 40;
+    const showAll = st['__all_' + cur];
+    for (const f of showAll ? shown : shown.slice(0, LIM)) this.dirFileRow(list, f, p, shown);
+    if (shown.length > LIM && !showAll) {
+      const more = h(list, 'button', { cls: 'rw-linkbtn rw-fgroup-more', text: '还有 ' + (shown.length - LIM) + ' 个，全部显示 →' });
+      more.addEventListener('click', () => { st['__all_' + cur] = true; this.render(); });
+    }
+    if (!folders.length && !shown.length) {
+      h(list, 'div', { cls: 'rw-empty-sm', text: rel ? '空文件夹。把文件拖到这里，或点右上角「导入」。' : '项目里还没有文件。可以先「新建文件夹」分好类，再把文件拖进对应文件夹。' });
+    }
+  }
+  dirFileRow(list, f, p, siblings) {
+    const pl = this.plugin;
+    const ext = (f.extension || '').toLowerCase();
+    const r = h(list, 'div', { cls: 'rw-row rw-frow' });
+    const entry = this.index.files.find((x) => x.file && x.file.path === f.path);
+    const cat = entry ? entry.cat : ext === 'md' ? 'note' : catOfExt(ext);
+    const iw = h(r, 'span', { cls: 'rw-ficon cat-' + cat });
+    ic(iw, ext === 'md' ? 'file-text' : fileIcon(ext));
+    const mid = h(r, 'div', { cls: 'rw-row-mid' });
+    h(mid, 'div', { cls: 'rw-row-title', text: ext === 'md' ? f.basename : f.name, title: f.path });
+    h(mid, 'div', { cls: 'rw-row-sub', text: [ext === 'md' ? '笔记' : fmtSize(f.stat.size), relTime(f.stat.mtime)].join(' · ') });
+    this.trashBtn(r, '删除', () => pl.deleteFileWithConfirm(f));
+    r.addEventListener('click', () => {
+      if (ext === 'md') return pl.openFile(f);
+      const ents = siblings.map((x) => this.index.files.find((y) => y.file && y.file.path === x.path)).filter(Boolean);
+      if (entry) return pl.previewEntries(ents, ents.indexOf(entry));
+      return pl.openAny(f);
+    });
+    r.addEventListener('dblclick', () => (entry ? pl.openEntry(entry) : pl.openAny(f)));
+    r.addEventListener('contextmenu', (e) => this.dirFileMenu(e, f, p, entry));
+    this.makeDraggable(r, f.path);
+  }
+  /* 文件夹可以接收：从电脑拖进来的文件（→ 导入弹窗预选此文件夹）和工作台里拖来的文件（→ 直接移动） */
+  folderDropTarget(el, p, folderPath) {
+    el.addEventListener('dragover', (e) => { e.preventDefault(); el.classList.add('is-over'); });
+    el.addEventListener('dragleave', (e) => { if (!el.contains(e.relatedTarget)) el.classList.remove('is-over'); });
+    el.addEventListener('drop', async (e) => {
+      el.classList.remove('is-over');
+      if (hasFiles(e)) { e.rwContext = { project: p.name, folder: folderPath }; return; }
+      const path = e.dataTransfer && e.dataTransfer.getData('text/rw-path');
+      if (!path) return;
+      e.preventDefault(); e.stopPropagation();
+      this.dragging = false;
+      const f = this.app.vault.getAbstractFileByPath(path);
+      if (f) await this.plugin.moveFileTo(f, folderPath);
+    });
+  }
+  folderMenu(e, p, f, r2) {
+    e.preventDefault();
+    const pl = this.plugin;
+    const m = new Menu();
+    m.addItem((i) => i.setTitle('打开文件夹').setIcon('folder-open').onClick(() => { this.filters.dir[p.name] = r2; this.render(); }));
+    m.addItem((i) => i.setTitle('导入文件到这里…').setIcon('upload').onClick(() => pl.pickFiles({ project: p.name, folder: f.path })));
+    m.addItem((i) => i.setTitle('在里面新建子文件夹…').setIcon('folder-plus').onClick(() => pl.promptText('子文件夹名称', '', (v) => pl.createFolderIn(f.path, v))));
+    m.addItem((i) => i.setTitle('重命名…').setIcon('pencil').onClick(() => pl.promptText('重命名文件夹', f.name, (v) => pl.renameFolder(f, v))));
+    if (!IS_MOBILE) m.addItem((i) => i.setTitle('在系统文件夹中显示').setIcon('folder-open').onClick(() => (this.app.showInFolder ? this.app.showInFolder(f.path) : showFsPath(pl.fullPath(f)))));
+    addDeleteItem(m, '删除文件夹…', () => pl.deleteFolder(f));
+    m.showAtMouseEvent(e);
+  }
+  dirFileMenu(e, f, p, entry) {
+    e.preventDefault();
+    const pl = this.plugin;
+    const m = new Menu();
+    const isMd = (f.extension || '').toLowerCase() === 'md';
+    m.addItem((i) => i.setTitle('打开').setIcon('external-link').onClick(() => (entry ? pl.openEntry(entry) : pl.openAny(f))));
+    if (entry) m.addItem((i) => i.setTitle('预览').setIcon('eye').onClick(() => pl.previewEntries([entry], 0)));
+    const note = isMd && this.index.notes.find((n) => n.file.path === f.path);
+    if (note) m.addItem((i) => i.setTitle('预览').setIcon('eye').onClick(() => pl.previewNotes([note], note)));
+    m.addItem((i) => i.setTitle('移动到文件夹…').setIcon('folder-input').onClick(() => pl.pickFolder(p.name, { title: '把「' + f.name + '」移动到…' }, (dest) => pl.moveFileTo(f, dest))));
+    m.addItem((i) => i.setTitle('重命名…').setIcon('pencil').onClick(() => pl.promptText('新文件名', isMd ? f.basename : f.name, (v) => pl.renameFileTo(f, v))));
+    m.addItem((i) => i.setTitle('复制 [[链接]]').setIcon('link').onClick(() => pl.copyText('[[' + f.path + ']]')));
+    if (!IS_MOBILE) m.addItem((i) => i.setTitle('在系统文件夹中显示').setIcon('folder-open').onClick(() => (this.app.showInFolder ? this.app.showInFolder(f.path) : showFsPath(pl.fullPath(f)))));
+    addDeleteItem(m, '删除…', () => pl.deleteFileWithConfirm(f));
+    m.showAtMouseEvent(e);
+  }
+
+  /* ---------- 文献页：资料库 / 我的文献（表格）/ 笔记摘录 ---------- */
+  litFilterBar(el, f, opts) {
+    const bar = h(el, 'div', { cls: 'rw-filterbar' });
+    const sel = h(bar, 'select', { cls: 'dropdown rw-select' });
+    const addOpt = (v, t) => { const o = h(sel, 'option', { text: t }); o.value = v; };
+    addOpt('', '全部项目'); addOpt('__none', '未归属项目');
+    for (const p of this.index.projects) addOpt(p.name, p.title);
+    sel.value = f.project || '';
+    sel.addEventListener('change', () => { f.project = sel.value; opts.redraw(); });
+    const fi = h(bar, 'input', { cls: 'rw-filter-input', attr: { type: 'text', placeholder: opts.placeholder || '搜索标题…' } });
+    fi.value = f.text || '';
+    fi.addEventListener('input', () => { f.text = fi.value; clearTimeout(this._fiT); this._fiT = setTimeout(() => opts.redraw(true), 200); });
+    h(bar, 'div', { cls: 'rw-spacer' });
+    return bar;
+  }
+  litList(f, notesOnly) {
+    let list = this.index.notes.filter((n) => n.type === 'literature');
+    if (!notesOnly && this.plugin.settings.litShowPdfOnly !== false) list = list.concat(this.plugin.orphanPdfEntries(this.index));
+    if (f.project === '__none') list = list.filter((n) => !n.projectName);
+    else if (f.project) list = list.filter((n) => n.projectName === f.project);
+    if (f.text) { const s = f.text.toLowerCase(); list = list.filter((n) => (n.title + ' ' + str(n.fm.authors) + ' ' + str(n.fm.journal) + ' ' + str(n.fm.title_zh)).toLowerCase().includes(s)); }
+    this._litAll = list;
+    if (f.cat && f.cat !== 'all') list = list.filter((n) => this.litTags(n).has(f.cat));
+    return list;
+  }
+  /* 文献分类：有没有笔记 / PDF / 转换后的 Markdown、译文、HTML / 讲解稿 */
+  litTags(n) {
+    const key = n.file.path + '|' + n.file.stat.mtime;
+    this._litTagC = this._litTagC || new Map();
+    if (this._litTagC.has(key) && this._litTagC.get(key).at > Date.now() - 4000) return this._litTagC.get(key).t;
+    const t = new Set();
+    t.add(n.pdfOnly ? 'nonote' : 'note');
+    const pdfs = this.plugin.pdfsOf(n);
+    const vp = pdfs.find((x) => x.kind === 'vault');
+    t.add(pdfs.length ? 'pdf' : 'nopdf');
+    const fi = vp && vp.file ? this.plugin.ftInfo(vp.file) : null;
+    if (fi && fi.md) t.add('md'); else if (vp) t.add('nomd');
+    if (fi && fi.zh) t.add('zh');
+    if (fi && fi.html) t.add('html');
+    if (n.explain) t.add('explain');
+    this._litTagC.set(key, { t, at: Date.now() });
+    return t;
+  }
+  litCatChips(el, f) {
+    const all = this._litAll || [];
+    const CATS = [['all', '全部'], ['note', '有笔记'], ['nonote', '还没笔记'], ['md', '已转 Markdown'], ['nomd', '还没转换'], ['zh', '有全文译文'], ['html', '有 HTML'], ['explain', '有讲解稿'], ['nopdf', '没有 PDF']];
+    const row = h(el, 'div', { cls: 'rw-litcats' });
+    ic(h(row, 'span', { cls: 'rw-litcats-ic', title: '按文献状态分类' }), 'filter');
+    for (const [k, label] of CATS) {
+      const n = k === 'all' ? all.length : all.filter((x) => this.litTags(x).has(k)).length;
+      if (!n && k !== 'all' && (f.cat || 'all') !== k) continue;
+      const c = h(row, 'button', { cls: 'rw-catchip' + ((f.cat || 'all') === k ? ' is-active' : '') });
+      h(c, 'span', { text: label });
+      h(c, 'span', { cls: 'rw-litcats-n', text: String(n) });
+      c.addEventListener('click', () => { f.cat = k; this.render(); });
+    }
+  }
+  /* 文献资料库：还没有文献笔记的 PDF（项目里的「原文PDF」等） */
+  renderOrphanPdfs(el, f) {
+    const pl = this.plugin;
+    let list = pl.orphanPdfEntries(this.index);
+    if (f.cat && f.cat !== 'all') list = list.filter((n) => this.litTags(n).has(f.cat));
+    if (f.project === '__none') list = list.filter((n) => !n.projectName);
+    else if (f.project) list = list.filter((n) => n.projectName === f.project);
+    if (!list.length) return;
+    const box = h(el, 'details', { cls: 'rw-orphan' });
+    if (this._orphanOpen) box.open = true;
+    box.addEventListener('toggle', () => (this._orphanOpen = box.open));
+    const sm = h(box, 'summary');
+    ic(sm, 'file-question');
+    h(sm, 'span', { text: '还没有文献笔记的 PDF（' + list.length + '）' });
+    const all = h(sm, 'button', { cls: 'rw-btn rw-btn-sm', text: '全部建笔记' });
+    all.addEventListener('click', async (e) => {
+      e.preventDefault(); e.stopPropagation();
+      if (!(await pl.confirmDelete({ title: '批量建文献笔记', lines: ['给这 ' + list.length + ' 个 PDF 各建一条文献笔记？笔记会放在 PDF 所在项目的「文献」文件夹里，并链接到 PDF。'], confirmText: '建笔记' }))) return;
+      for (const n of list) await pl.createLitNoteForPdf(n.file);
+      new Notice('✅ 已建 ' + list.length + ' 条文献笔记');
+      this.render();
+    });
+    const ul = h(box, 'div', { cls: 'rw-orphan-list' });
+    for (const n of list) {
+      const r = h(ul, 'div', { cls: 'rw-orphan-row' });
+      const t = h(r, 'span', { cls: 'rw-orphan-title', text: n.title, title: n.file.path });
+      t.addEventListener('click', () => pl.openPaperReader(n.file));
+      if (n.projectName) this.projectChip(r, n.projectName);
+      h(r, 'span', { cls: 'rw-muted', text: n.file.path.split('/').slice(-2, -1)[0] || '' });
+      if (n.explain) { const ex = h(r, 'span', { cls: 'rw-ft-chip', text: '讲解稿' }); ex.addEventListener('click', () => pl.openFile(n.explain)); }
+      h(r, 'span', { cls: 'rw-tp-sp' });
+      const b = h(r, 'button', { cls: 'rw-btn rw-btn-sm', text: '建笔记' });
+      b.addEventListener('click', async () => { await pl.createLitNoteForPdf(n.file); this.render(); });
+      r.addEventListener('contextmenu', (e) => this.noteMenu(e, n));
+    }
+  }
+  paperCellInfo(td, n) {
+    const t = h(td, 'div', { cls: 'rw-pgt-title', text: n.title, title: '打开阅读' });
+    t.addEventListener('click', () => this.plugin.openPaperReader(n.file));
+    this.pdfChip(t, n);
+    if (str(n.fm.title_zh)) h(td, 'div', { cls: 'rw-pgt-zh', text: str(n.fm.title_zh) });
+    const meta = [str(n.fm.authors).split(/;|,(?=\s*[A-Z一-龥][^,]*,)/)[0], str(n.fm.year), str(n.fm.journal)].filter(Boolean).join(' · ');
+    if (meta) h(td, 'div', { cls: 'rw-pgt-meta', text: meta });
+    const row = h(td, 'div', { cls: 'rw-pgt-chips' });
+    if (n.projectName) this.projectChip(row, n.projectName);
+    if (n.pdfOnly) {
+      const nb = h(row, 'span', { cls: 'rw-status rw-nonote is-clickable', text: '还没有笔记 · 建一个', title: '这个 PDF 还没有文献笔记，点一下就建（属性、摘录、AI 分析结果都会挂到笔记上）' });
+      nb.addEventListener('click', async (e) => { e.stopPropagation(); await this.plugin.createLitNoteForPdf(n.file); this.render(); });
+      if (n.explain) { const ex = h(row, 'span', { cls: 'rw-ft-chip', text: '讲解稿', title: n.explain.path }); ex.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.openFile(n.explain); }); }
+    } else h(row, 'span', { cls: 'rw-status st-' + n.status, text: n.status || '待读' });
+    // 已有全文（Markdown / 译文 / HTML）时显示小标签，点了直接打开
+    const c = this.plugin.paperOf(n.file);
+    const fi = c && c.pdf ? this.plugin.ftInfo(c.pdf) : null;
+    if (fi && fi.md) {
+      const chip = h(row, 'span', { cls: 'rw-ft-chip', text: fi.zh ? '全文 · 有译文' : '全文 MD', title: '点击打开' + (fi.html ? ' HTML 阅读页' : ' Markdown') + '；右键更多' });
+      chip.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.ftOpen(fi.html || fi.md); });
+      chip.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); const m = new Menu(); this.plugin.ftMenuItems(m, c.pdf); m.showAtMouseEvent(e); });
+    }
+  }
+
+  async renderLitTable(el, f) {
+    const pl = this.plugin;
+    await pl.pgLoad();
+    const cols = pl.pgColumns();
+    this.pgSel = this.pgSel || new Set();
+    this.pgOpen = this.pgOpen || new Set();
+    const wrap = h(el, 'div', { cls: 'rw-pgt-wrap' });
+    const redraw = () => this.render();
+    const bar = this.litFilterBar(wrap, f, { redraw });
+    const sortSel = h(bar, 'select', { cls: 'dropdown rw-select rw-select-sm', title: '排序' });
+    for (const [v, t] of [['', '默认顺序'], ['title', '按标题'], ['year', '按年份'], ['recent', '最近更新']]) { const o = h(sortSel, 'option', { text: t }); o.value = v; }
+    sortSel.value = pl.settings.pgSort || '';
+    sortSel.addEventListener('change', () => { pl.settings.pgSort = sortSel.value; pl.saveSettingsSoon(); this.render(); });
+    let list = this.litList(f);
+    this.litCatChips(wrap, f);
+    const so = pl.settings.pgSort;
+    if (so === 'title') list.sort((a, b) => a.title.localeCompare(b.title));
+    else if (so === 'year') list.sort((a, b) => (Number(str(b.fm.year)) || 0) - (Number(str(a.fm.year)) || 0));
+    else if (so === 'recent') list.sort((a, b) => b.file.stat.mtime - a.file.stat.mtime);
+    else list.sort((a, b) => (b.date || '').localeCompare(a.date || '') || a.title.localeCompare(b.title));
+    for (const p of [...this.pgSel]) if (!list.some((n) => n.file.path === p)) this.pgSel.delete(p);
+    const selN = list.filter((n) => this.pgSel.has(n.file.path));
+    const runB = this.btn(bar, selN.length ? '分析选中的 ' + selN.length + ' 篇' : '分析全部空白格', 'sparkles', () => {
+      const target = selN.length ? selN : list;
+      const jobs = [];
+      for (const n of target) for (const c of cols) { const x = pl.pgCell(n.file.path, c.id); if (!x || x.status === 'error' || (selN.length && x.status !== 'done')) jobs.push({ n, col: c }); }
+      if (!jobs.length) return new Notice('没有需要分析的空白格');
+      if (!pl.directAiReady()) return new Notice('先在 设置 → 科研工作台 → AI 填接口地址和密钥');
+      pl.pgEnqueue(jobs);
+      new Notice('开始分析 ' + jobs.length + ' 个格子（同时 2 个）');
+    }, 'mod-cta rw-btn-sm');
+    runB.title = '让 AI 读每篇论文全文，填写每一列';
+    this.btn(bar, '添加列', 'columns-3', () => new PgColumnModal(this.app, pl, null, () => this.render()).open(), 'rw-btn-sm');
+    this.btn(bar, '导出', 'file-down', () => pl.pgExportMarkdown(list), 'rw-btn-sm');
+    {
+      const noTitle = list.filter((n) => !str(n.fm.title) && (looksLikeFileName(n.title) || n.title === n.file.basename || litH1Title(n.file, this.app.metadataCache.getFileCache(n.file)) === '') && !(n.pdfOnly && (pl.settings.pdfMeta || {})[n.file.path]));
+      const tb = this.btn(bar, noTitle.length ? '识别标题（' + noTitle.length + '）' : '识别标题', 'scan-text', (e) => {
+        const m = new Menu();
+        const target = selN.length ? selN : noTitle;
+        m.addItem((i) => i.setTitle((selN.length ? '选中的 ' : '标题像文件名的 ') + target.length + ' 篇：识别标题 / 作者 / 年份').setIcon('scan-text').onClick(() => pl.fillLitMetaBatch(target, false)));
+        if (selN.length) m.addItem((i) => i.setTitle('选中的 ' + selN.length + ' 篇：重新识别（覆盖已有标题）').setIcon('refresh-cw').onClick(() => pl.fillLitMetaBatch(selN, true)));
+        m.showAtMouseEvent(e);
+      }, 'rw-btn-sm');
+      tb.title = '从 PDF 里认出论文的真实标题（PDF 元数据 / 第一页排版' + (pl.directAiReady() && pl.settings.litMetaAi !== false ? ' + AI 校对' : '') + '），写进笔记的 title、作者、年份等属性（只填空着的）';
+    }
+    this.btn(bar, '全文', 'file-text', (e) => {
+      const target = (selN.length ? selN : []).map((n) => pl.paperOf(n.file)).filter((c) => c && c.pdf).map((c) => c.pdf);
+      const m = new Menu();
+      if (!target.length) { m.addItem((i) => i.setTitle('先勾选要处理的文献（有 PDF 的）').setDisabled ? i.setTitle('先勾选要处理的文献（有 PDF 的）').setDisabled(true) : i.setTitle('先勾选要处理的文献（有 PDF 的）')); m.showAtMouseEvent(e); return; }
+      const run = async (fn) => { for (const pdf of target) await fn(pdf); new Notice('✅ ' + target.length + ' 篇处理完'); this.render(); };
+      m.addItem((i) => i.setTitle('选中的 ' + target.length + ' 篇：PDF 转 Markdown').setIcon('file-down').onClick(() => run((pdf) => pl.ftConvert(pdf, null, true))));
+      m.addItem((i) => i.setTitle('选中的 ' + target.length + ' 篇：一键全文翻译（AI）').setIcon('languages').onClick(() => run((pdf) => pl.ftTranslate(pdf, 'ai'))));
+      m.addItem((i) => i.setTitle('选中的 ' + target.length + ' 篇：一键全文翻译（机器翻译）').setIcon('languages').onClick(() => run((pdf) => pl.ftTranslate(pdf, 'machine'))));
+      m.showAtMouseEvent(e);
+    }, 'rw-btn-sm').title = '勾选文献后：批量转 Markdown / 全文翻译';
+    const run = Object.values(pl._pg || {}).reduce((a, r) => a + Object.values(r).filter((x) => x.status === 'running' || x.status === 'queued').length, 0);
+    h(wrap, 'div', { cls: 'rw-muted rw-pgt-sum', text: list.length + ' 篇文献 · ' + cols.length + ' 个 AI 分析列' + (run ? ' · 正在分析 ' + run + ' 个格子…' : '') + ' · 点标题进入阅读（PDF + AI 问答）' });
+    if (!list.length) { h(wrap, 'div', { cls: 'rw-empty', text: '没有文献。从 Zotero 导入，或把 PDF 拖进来。' }); return; }
+    if (this.contentEl.classList.contains('rw-narrow')) {
+      const cards = h(wrap, 'div', { cls: 'rw-pgc-list' });
+      for (const n of list) {
+        const card = h(cards, 'div', { cls: 'rw-pgc' });
+        const top = h(card, 'div', { cls: 'rw-pgc-top' });
+        const ck = h(top, 'input', { attr: { type: 'checkbox' } });
+        ck.checked = this.pgSel.has(n.file.path);
+        ck.addEventListener('change', () => { if (ck.checked) this.pgSel.add(n.file.path); else this.pgSel.delete(n.file.path); this.render(); });
+        this.paperCellInfo(h(top, 'div', { cls: 'rw-pgc-info' }), n);
+        for (const c of cols) {
+          const sec = h(card, 'div', { cls: 'rw-pgc-col' });
+          h(sec, 'div', { cls: 'rw-pgc-label', text: c.name });
+          this.pgCellTd(sec, n, c);
+        }
+      }
+      return;
+    }
+    const sc = h(wrap, 'div', { cls: 'rw-pgt-scroll' });
+    const t = h(sc, 'table', { cls: 'rw-pgt' });
+    const hr = h(h(t, 'thead'), 'tr');
+    const th0 = h(hr, 'th', { cls: 'rw-pgt-ck' });
+    const all = h(th0, 'input', { attr: { type: 'checkbox' } });
+    all.checked = selN.length === list.length && list.length > 0;
+    all.addEventListener('change', () => { if (all.checked) list.forEach((n) => this.pgSel.add(n.file.path)); else this.pgSel.clear(); this.render(); });
+    h(hr, 'th', { cls: 'rw-pgt-paper', text: '文献' });
+    cols.forEach((c, ci) => {
+      const th = h(hr, 'th', { cls: 'rw-pgt-col', title: c.prompt });
+      const hd = h(th, 'div', { cls: 'rw-pgt-colhead' });
+      ic(hd, 'sparkles');
+      h(hd, 'span', { text: c.name });
+      const mb = h(hd, 'button', { cls: 'rw-tp-btn', title: '这一列…' }); ic(mb, 'more-horizontal');
+      mb.addEventListener('click', (e) => {
+        const m = new Menu();
+        m.addItem((i) => i.setTitle('分析这一列的空白格').setIcon('sparkles').onClick(() => pl.pgEnqueue(list.filter((n) => { const x = pl.pgCell(n.file.path, c.id); return !x || x.status === 'error'; }).map((n) => ({ n, col: c })))));
+        m.addItem((i) => i.setTitle('整列重新分析').setIcon('refresh-cw').onClick(() => pl.pgEnqueue(list.map((n) => ({ n, col: c })))));
+        m.addSeparator();
+        m.addItem((i) => i.setTitle('编辑列').setIcon('pencil').onClick(() => new PgColumnModal(this.app, pl, c, () => this.render()).open()));
+        if (ci > 0) m.addItem((i) => i.setTitle('左移').setIcon('arrow-left').onClick(() => { cols.splice(ci - 1, 0, cols.splice(ci, 1)[0]); pl.saveSettings(); this.render(); }));
+        if (ci < cols.length - 1) m.addItem((i) => i.setTitle('右移').setIcon('arrow-right').onClick(() => { cols.splice(ci + 1, 0, cols.splice(ci, 1)[0]); pl.saveSettings(); this.render(); }));
+        addDeleteItem(m, '删除列', async () => { if (await pl.confirmDelete({ title: '删除列', lines: ['删除「' + c.name + '」这一列？已生成的内容也会一起清掉。'] })) { cols.splice(ci, 1); for (const r of Object.values(pl._pg || {})) delete r[c.id]; pl.pgSaveSoon(); await pl.saveSettings(); this.render(); } });
+        m.showAtMouseEvent(e);
+      });
+    });
+    const addTh = h(hr, 'th', { cls: 'rw-pgt-add' });
+    const ab = h(addTh, 'button', { cls: 'rw-tp-btn', title: '添加 AI 列' }); ic(ab, 'plus');
+    ab.addEventListener('click', () => new PgColumnModal(this.app, pl, null, () => this.render()).open());
+    const tb = h(t, 'tbody');
+    for (const n of list) {
+      const tr = h(tb, 'tr');
+      const ck = h(h(tr, 'td', { cls: 'rw-pgt-ck' }), 'input', { attr: { type: 'checkbox' } });
+      ck.checked = this.pgSel.has(n.file.path);
+      ck.addEventListener('change', () => { if (ck.checked) this.pgSel.add(n.file.path); else this.pgSel.delete(n.file.path); this.render(); });
+      const td = h(tr, 'td', { cls: 'rw-pgt-paper' });
+      this.paperCellInfo(td, n);
+      td.addEventListener('contextmenu', (e) => this.noteMenu(e, n));
+      for (const c of cols) this.pgCellTd(h(tr, 'td', { cls: 'rw-pgt-cell' }), n, c);
+      h(tr, 'td');
+    }
+  }
+  pgCellTd(td, n, c) {
+    const pl = this.plugin;
+    const x = pl.pgCell(n.file.path, c.id);
+    const key = n.file.path + '|' + c.id;
+    const st = x ? x.status : 'idle';
+    if (st === 'queued' || st === 'running') {
+      const b = h(td, 'div', { cls: 'rw-pgt-run', text: st === 'queued' ? '排队中…' : '正在阅读论文…' });
+      if (st === 'running') b.classList.add('is-running');
+      return;
+    }
+    if (!x || (st !== 'done' && st !== 'error')) {
+      const b = h(td, 'button', { cls: 'rw-pgt-gen', text: '生成' });
+      ic(b, 'sparkles');
+      b.addEventListener('click', () => { if (!pl.directAiReady()) return new Notice('先在 设置 → 科研工作台 → AI 填接口地址和密钥'); pl.pgEnqueue([{ n, col: c }]); });
+      return;
+    }
+    if (st === 'error') {
+      h(td, 'div', { cls: 'rw-pgt-err', text: x.error || '失败' });
+      const b = h(td, 'button', { cls: 'rw-linkbtn', text: '重试' });
+      b.addEventListener('click', () => pl.pgEnqueue([{ n, col: c }]));
+      if (!x.answer) return;
+    }
+    const open = this.pgOpen.has(key);
+    const ans = h(td, 'div', { cls: 'rw-pgt-ans' + (open ? ' is-open' : ''), text: x.answer });
+    ans.addEventListener('click', () => { if (open) this.pgOpen.delete(key); else this.pgOpen.add(key); this.render(); });
+    const foot = h(td, 'div', { cls: 'rw-pgt-foot' });
+    if (x.evidence && x.evidence.length) {
+      const ev = h(foot, 'button', { cls: 'rw-linkbtn', text: x.evidence.length + ' 条证据' });
+      ev.addEventListener('click', () => { if (open) this.pgOpen.delete(key); else this.pgOpen.add(key); this.render(); });
+    }
+    h(foot, 'span', { cls: 'rw-tp-sp' });
+    const tool = (icon, title, fn) => { const b = h(foot, 'button', { cls: 'rw-tp-btn', title }); ic(b, icon); b.addEventListener('click', (e) => { e.stopPropagation(); fn(); }); };
+    tool('copy', '复制', () => pl.copyText(x.answer));
+    tool('pencil', '编辑内容', () => new EditTextModal(this.app, n.title + ' · ' + c.name, x.answer, (v) => pl.pgSetCell(n.file.path, c.id, Object.assign({}, x, { answer: v, edited: true }))).open());
+    tool('refresh-cw', '重新生成', () => pl.pgEnqueue([{ n, col: c }]));
+    if (open && x.evidence && x.evidence.length) {
+      const evs = h(td, 'div', { cls: 'rw-pgt-evs' });
+      for (const e of x.evidence) {
+        const r = h(evs, 'div', { cls: 'rw-pgt-ev' });
+        const pm = String(e.section || '').match(/(\d+)\s*页|p\.?\s*(\d+)/i);
+        const sec = h(r, 'span', { cls: 'rw-pgt-ev-sec', text: e.section || '原文', title: pm ? '在阅读视图里打开这一页' : '' });
+        if (pm) { sec.classList.add('is-link'); sec.addEventListener('click', () => pl.openPaperReader(n.file, Number(pm[1] || pm[2]))); }
+        h(r, 'span', { text: '“' + e.quote + '”' });
+      }
+    }
+  }
+
+  async renderLitNotes(el, f) {
+    const pl = this.plugin;
+    const wrap = h(el, 'div', { cls: 'rw-exn' });
+    const bar = this.litFilterBar(wrap, f, { redraw: () => this.render(), placeholder: '搜索摘录、译文、笔记…' });
+    this.btn(bar, '手动记一条', 'plus', () => {
+      const list = this.litList(f, true);
+      if (!list.length) return new Notice('还没有文献');
+      new ManualExcerptModal(this.app, pl, list, f.project ? list[0] : null, () => this.render()).open();
+    }, 'rw-btn-sm');
+    const body = h(wrap, 'div', { cls: 'rw-exn-body', text: '读取摘录中…' });
+    let all = await pl.allExcerpts();
+    clear(body);
+    const papers = new Set(this.litList(Object.assign({}, f, { text: '', cat: '' })).map((n) => n.file.path));
+    all = all.filter((x) => papers.has(x.n.file.path));
+    // 来源筛选
+    const counts = new Map();
+    for (const x of all) counts.set(x.source, (counts.get(x.source) || 0) + 1);
+    const srcBar = h(body, 'div', { cls: 'rw-exn-src' });
+    const cur = f.source || '';
+    const chip = (v, label, n) => { const b = h(srcBar, 'button', { cls: 'rw-catchip' + (cur === v ? ' is-active' : ''), text: label + (n != null ? ' ' + n : '') }); b.addEventListener('click', () => { f.source = v; this.render(); }); };
+    chip('', '全部', all.length);
+    for (const [k, v] of counts) chip(k, k, v);
+    let list = cur ? all.filter((x) => x.source === cur) : all;
+    if (f.text) { const s = f.text.toLowerCase(); list = list.filter((x) => [x.text, x.translation, x.note, ...(x.ai || []).map((a) => a.content), x.n.title].join(' ').toLowerCase().includes(s)); }
+    if (!list.length) { h(body, 'div', { cls: 'rw-empty', text: all.length ? '没有符合条件的摘录' : '还没有摘录。阅读 PDF 时选中文字，点小窗里的「摘录」或「❝」；AI 回答里划线也能「存为摘录」。' }); return; }
+    // 按文献分组
+    const groups = new Map();
+    for (const x of list) { const k = x.n.file.path; if (!groups.has(k)) groups.set(k, { n: x.n, items: [] }); groups.get(k).items.push(x); }
+    h(body, 'div', { cls: 'rw-muted rw-pgt-sum', text: list.length + ' 条摘录 · ' + groups.size + ' 篇文献' });
+    for (const { n, items } of groups.values()) {
+      const g = h(body, 'div', { cls: 'rw-exn-group' });
+      const gh = h(g, 'div', { cls: 'rw-exn-ghead' });
+      const tt = h(gh, 'div', { cls: 'rw-pgt-title', text: n.title, title: '打开阅读' });
+      tt.addEventListener('click', () => pl.openPaperReader(n.file));
+      if (n.projectName) this.projectChip(gh, n.projectName);
+      h(gh, 'span', { cls: 'rw-tab-count', text: items.length });
+      h(gh, 'span', { cls: 'rw-tp-sp' });
+      const ob = h(gh, 'button', { cls: 'rw-linkbtn', text: '打开笔记' }); ob.addEventListener('click', () => pl.openFile(n.file));
+      const grid = h(g, 'div', { cls: 'rw-exn-grid' });
+      for (const x of items) this.excerptCard(grid, n, x);
+    }
+  }
+  excerptCard(parent, n, x) {
+    const pl = this.plugin;
+    const card = h(parent, 'div', { cls: 'rw-exn-card' });
+    const hd = h(card, 'div', { cls: 'rw-exn-head' });
+    const ss = h(hd, 'select', { cls: 'dropdown rw-select rw-select-sm rw-exn-tag', title: '摘录标签' });
+    const opts = [...new Set(EXCERPT_SOURCES.concat([x.source]))];
+    for (const o of opts) { const op = h(ss, 'option', { text: o }); op.value = o; }
+    const nw = h(ss, 'option', { text: '＋ 自定义标签…' }); nw.value = '__new';
+    ss.value = x.source;
+    ss.addEventListener('change', () => {
+      if (ss.value === '__new') { ss.value = x.source; pl.promptText('自定义标签', '', (v) => v && pl.updateExcerpt(n.file, x, { source: v.trim().slice(0, 12) })); return; }
+      pl.updateExcerpt(n.file, x, { source: ss.value });
+    });
+    if (x.page) { const pg = h(hd, 'button', { cls: 'rw-linkbtn', text: 'p.' + x.page, title: '定位原文' }); pg.addEventListener('click', () => pl.openPaperReader(n.file, Number(x.page))); }
+    h(hd, 'span', { cls: 'rw-muted', text: x.date });
+    h(hd, 'span', { cls: 'rw-tp-sp' });
+    const tool = (icon, title, fn) => { const b = h(hd, 'button', { cls: 'rw-tp-btn', title }); ic(b, icon); b.addEventListener('click', fn); };
+    tool('copy', '复制', () => pl.copyText([x.text, x.translation, ...(x.ai || []).map((a) => a.content), x.note].filter(Boolean).join('\n\n')));
+    tool('message-circle', '问 AI', () => pl.askAboutQuote({ text: x.text, page: x.page, pdf: pl.paperOf(n.file) && pl.paperOf(n.file).pdf, note: n.file, noteObj: n }));
+    tool('trash-2', '删除这条摘录', async () => { if (await pl.confirmDelete({ title: '删除摘录', lines: ['删除这条摘录？', trunc(x.text, 80)] })) pl.deleteExcerpt(n.file, x); });
+    if (x.text) {
+      const qd = h(card, 'div', { cls: 'rw-exn-quote' });
+      if (/\$/.test(x.text)) setMathText(qd, x.text); else qd.textContent = x.text;
+    }
+    if (x.translation) h(card, 'div', { cls: 'rw-exn-tr', text: x.translation });
+    for (const a of x.ai || []) {
+      const ab = h(card, 'details', { cls: 'rw-exn-ai' });
+      h(ab, 'summary', { text: a.label + '（' + a.content.length + ' 字）' });
+      const bd = h(ab, 'div', { cls: 'rw-rd-ai' });
+      ab.addEventListener('toggle', () => { if (ab.open && !bd.childNodes.length) renderAiMarkdown(this.app, a.content, bd, this.plugin.mdComp()); }, { once: false });
+    }
+    const nt = h(card, 'div', { cls: 'rw-exn-note' + (x.note ? '' : ' is-empty'), text: x.note || '写下你的想法…', title: '点击编辑我的笔记' });
+    nt.addEventListener('click', () => new EditTextModal(this.app, '我的笔记', x.note || '', (v) => pl.updateExcerpt(n.file, x, { note: v.trim() })).open());
+  }
+
+  /* ---------- 项目详情页 ---------- */
+  renderDetail(el, p) {
+    const right = this.header(el, p.title, p.description || '项目详情：笔记、文件、文献、待办都在这里', 'folder-open');
+    this.btn(right, '删除项目', 'trash-2', () => this.plugin.deleteProject(p), 'rw-btn-danger');
+    this.btn(right, '重命名', 'pencil', () => this.plugin.renameProjectPrompt(p));
+    this.btn(right, '项目主页笔记', 'file-text', () => this.plugin.openFile(p.file));
+    this.btn(right, 'Zotero 导入', 'library', () => this.plugin.zoteroImportModal({ project: p.name }));
+    this.btn(right, '导入文件', 'upload', () => this.plugin.pickFiles({ project: p.name }));
+    this.btn(right, '新建笔记', 'file-plus', (e) => this.newNoteMenu(e, p.name), 'mod-cta');
+
+    // 概况卡
+    const top = h(el, 'div', { cls: 'rw-detail-top' });
+    top.style.setProperty('--pc', projectColor(p.name));
+    const chips = h(top, 'div', { cls: 'rw-chips' });
+    const kc = h(chips, 'span', { cls: 'rw-kind-chip is-clickable', text: KINDS[p.pkind].label, title: '点击修改项目类型' });
+    kc.style.setProperty('--kc', KINDS[p.pkind].color);
+    kc.addEventListener('click', (e) => {
+      const m = new Menu();
+      for (const k of KIND_ORDER) m.addItem((i) => i.setTitle(KINDS[k].label).setIcon(KINDS[k].icon).setChecked(p.pkind === k).onClick(async () => { await this.plugin.setProjectKind(p, k); this.render(); }));
+      m.showAtMouseEvent(e);
+    });
+    h(chips, 'span', { cls: 'rw-status st-' + p.status, text: p.status });
+    if (p.priority) h(chips, 'span', { cls: 'rw-prio prio-' + p.priority, text: '优先级 ' + p.priority });
+    if (p.parentName) {
+      const pc = this.projectChip(chips, '↳ 方向：' + p.parentName);
+      pc.classList.add('is-clickable');
+      pc.addEventListener('click', () => this.openProject(p.parentName));
+    }
+    if (p.deadline && parseDate(p.deadline)) h(chips, 'span', { cls: 'rw-deadline ' + deadlineCls(p.deadline), text: '截止 ' + p.deadline + ' · ' + deadlineText(p.deadline) });
+    h(chips, 'span', { cls: 'rw-muted', text: '最近活动 ' + relTime(p.lastActivity) });
+    this.stepper(top, p);
+    const nx = h(top, 'div', { cls: 'rw-next rw-next-lg is-clickable', title: '点击修改下一步' });
+    ic(nx, 'arrow-right-circle');
+    h(nx, 'span', { text: p.next ? '下一步：' + p.next : '点击设置下一步要做什么…' });
+    nx.addEventListener('click', () => this.plugin.promptText('下一步要做什么？', p.next, (v) => this.plugin.setField(p.file, 'next', v)));
+
+    this.dropArea(el, '把这个项目的任何文件拖到这里：数据、PPT、PDF、录音、文稿…', () => ({ project: p.name }));
+
+    if (p.pkind === 'direction' || (p.children && p.children.length)) {
+      const cs = this.section(el, '下属项目 · ' + p.children.length, 'git-branch');
+      const add = h(cs.right, 'button', { cls: 'rw-btn rw-btn-sm' });
+      ic(add, 'plus');
+      h(add, 'span', { text: '在此方向下新建论文项目' });
+      add.addEventListener('click', () => this.plugin.newProjectModal({ kind: 'paper', parent: p.name }));
+      if (!p.children.length) h(cs.body, 'div', { cls: 'rw-empty-sm', text: '还没有下属项目。从这个方向产出的论文、复现等项目，可以在新建时选择「所属研究方向」，或在项目右键菜单里设置。' });
+      else {
+        const g = h(cs.body, 'div', { cls: 'rw-grid' });
+        for (const c of p.children) this.projectCard(g, c, false);
+      }
+    }
+
+    const grid = h(el, 'div', { cls: 'rw-detail-grid' });
+    const left = h(grid, 'div');
+    const rightCol = h(grid, 'div');
+
+    // 笔记（按流程）
+    const notes = this.index.notes.filter((n) => n.projectName === p.name);
+    const empties = [];
+    for (const type of Object.keys(NOTE_TYPES)) {
+      const def = NOTE_TYPES[type];
+      const list = notes.filter((n) => n.type === type).sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.file.stat.mtime - a.file.stat.mtime);
+      if (!list.length) { empties.push(type); continue; }
+      const sec = this.section(left, def.label + ' · ' + list.length, def.icon);
+      sec.el.classList.add('rw-dsec');
+      const add = h(sec.right, 'button', { cls: 'rw-iconbtn', title: '新建' + def.label });
+      ic(add, 'plus');
+      add.addEventListener('click', () => this.plugin.newNoteModal({ type, project: p.name }));
+      if (list.length > 6) {
+        const more = h(sec.right, 'button', { cls: 'rw-linkbtn', text: '全部 →' });
+        more.addEventListener('click', () => this.switchTab(type, { project: p.name }));
+      }
+      for (const n of list.slice(0, 6)) {
+        const r = h(sec.body, 'div', { cls: 'rw-row' });
+        ic(r, def.icon, 'rw-row-icon');
+        const mid = h(r, 'div', { cls: 'rw-row-mid' });
+        const rt = h(mid, 'div', { cls: 'rw-row-title rw-row-title-pdf' });
+        h(rt, 'span', { cls: 'rw-row-title-text', text: n.title });
+        this.pdfChip(rt, n);
+        const sub = h(mid, 'div', { cls: 'rw-row-sub' });
+        h(sub, 'span', { text: [n.status, n.date].filter(Boolean).join(' · ') });
+        this.attachButtons(r, n);
+        this.trashBtn(r, '删除笔记', () => this.plugin.deleteNote(n));
+        r.addEventListener('click', () => this.openNoteTitle(n));
+        r.addEventListener('contextmenu', (e) => this.noteMenu(e, n));
+      }
+    }
+    if (empties.length) {
+      const q2 = h(left, 'div', { cls: 'rw-quickadd' });
+      h(q2, 'span', { cls: 'rw-muted', text: '新建：' });
+      for (const type of empties) {
+        const b = h(q2, 'button', { cls: 'rw-catchip' });
+        ic(b, NOTE_TYPES[type].icon);
+        h(b, 'span', { text: NOTE_TYPES[type].label });
+        b.addEventListener('click', () => this.plugin.newNoteModal({ type, project: p.name }));
+      }
+    }
+
+    // 文件：按文件夹（默认）/ 按分类
+    const files = this.index.files.filter((x) => x.projectName === p.name);
+    const fview = this.plugin.settings.detailFileView || 'folder';
+    const fsec = this.section(rightCol, fview === 'folder' ? '项目文件夹' : '文件 · ' + files.length, fview === 'folder' ? 'folder-tree' : 'paperclip');
+    fsec.el.classList.add('rw-dsec');
+    this.seg(fsec.right, [['folder', '文件夹'], ['cat', '分类']], fview, (v) => { this.plugin.settings.detailFileView = v; this.plugin.saveSettingsSoon(); this.render(); });
+    if (fview === 'folder') this.renderFolderBrowser(fsec.body, p);
+    else if (!files.length) h(fsec.body, 'div', { cls: 'rw-empty-sm', text: '还没有文件。把实验数据、PPT、PDF 等拖到本页任意位置即可。' });
+    for (const k of fview === 'folder' ? [] : Object.keys(FILE_CATS)) {
+      const fl = files.filter((x) => x.cat === k).sort((a, b) => b.mtime - a.mtime);
+      if (!fl.length) continue;
+      const g = h(fsec.body, 'div', { cls: 'rw-fgroup' });
+      const gh = h(g, 'div', { cls: 'rw-fgroup-head' });
+      ic(gh, FILE_CATS[k].icon);
+      h(gh, 'span', { text: FILE_CATS[k].label });
+      h(gh, 'span', { cls: 'rw-tab-count', text: fl.length });
+      for (const x of fl.slice(0, 4)) {
+        const r = h(g, 'div', { cls: 'rw-row rw-frow' });
+        const iw = h(r, 'span', { cls: 'rw-ficon cat-' + x.cat });
+        ic(iw, fileIcon(x.ext));
+        const mid = h(r, 'div', { cls: 'rw-row-mid' });
+        h(mid, 'div', { cls: 'rw-row-title', text: x.name, title: x.kind === 'link' ? x.extPath : x.file.path });
+        h(mid, 'div', { cls: 'rw-row-sub', text: [fmtSize(x.size), relTime(x.mtime), x.kind === 'link' ? '库外链接' : ''].filter(Boolean).join(' · ') });
+        const b = h(r, 'button', { cls: 'rw-iconbtn', title: '在文件夹中显示' });
+        ic(b, 'folder-open');
+        b.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.revealEntry(x); });
+        this.trashBtn(r, x.kind === 'link' ? '删除链接记录' : '删除文件', () => this.plugin.deleteEntry(x));
+        r.addEventListener('click', () => this.plugin.previewEntries(fl, fl.indexOf(x)));
+        r.addEventListener('dblclick', () => this.plugin.openEntry(x));
+        r.addEventListener('contextmenu', (e) => this.fileMenu(e, x));
+      }
+      if (fl.length > 4) {
+        const more = h(g, 'button', { cls: 'rw-linkbtn rw-fgroup-more', text: '还有 ' + (fl.length - 4) + ' 个，查看全部 →' });
+        more.addEventListener('click', () => this.switchTab('files', { project: p.name, cat: k }));
+      }
+    }
+
+    // 待办
+    const tsec = this.section(rightCol, '待办', 'check-square');
+    tsec.el.classList.add('rw-dsec');
+    const sub = { projects: [p], notes, byName: this.index.byName };
+    this.plugin.collectTasks(sub).then((tasks) => {
+      if (!tasks.length) { h(tsec.body, 'div', { cls: 'rw-empty-sm', text: '没有未完成的待办' }); return; }
+      tasks.sort((a, b) => (a.due || '9999').localeCompare(b.due || '9999'));
+      for (const t of tasks) this.taskRow(tsec.body, t);
+    });
+  }
+
+  taskRow(parent, t) {
+    const r = h(parent, 'div', { cls: 'rw-task' });
+    const cb = h(r, 'input', { attr: { type: 'checkbox' } });
+    cb.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      r.classList.add('is-done');
+      await this.plugin.completeTask(t);
+    });
+    h(r, 'span', { cls: 'rw-task-text', text: t.text });
+    if (t.due) h(r, 'span', { cls: 'rw-deadline ' + deadlineCls(t.due), text: t.due.slice(5) + (t.time ? ' ' + t.time : '') + ' · ' + deadlineText(t.due) });
+    h(r, 'span', { cls: 'rw-task-src', text: t.file.basename });
+    r.addEventListener('click', () => this.plugin.openFile(t.file, t.line));
+  }
+
+  /* ---------- 计划页 ---------- */
+  renderPlan(el) {
+    const right = this.header(el, '计划与待办', '汇总所有项目和科研笔记中的 - [ ] 待办；勾选会直接修改原笔记。待办写「📅 日期 ⏰ 时间」就会出现在日历上', 'calendar-check');
+    const clock = h(right, 'div', { cls: 'rw-clock' });
+    const tickClock = () => { const n = new Date(); clock.textContent = pad(n.getHours()) + ':' + pad(n.getMinutes()) + ' · ' + (n.getMonth() + 1) + '月' + n.getDate() + '日 星期' + '日一二三四五六'[n.getDay()]; };
+    tickClock();
+    clearInterval(this._clockT);
+    this._clockT = setInterval(() => { if (!clock.isConnected) return clearInterval(this._clockT); tickClock(); }, 30000);
+    this.btn(right, '添加待办', 'plus', () => this.plugin.addTaskModal({ date: today() }), 'mod-cta');
+    const cs = this.section(el, '日历', 'calendar-days');
+    this.renderCalendar(cs.body, true);
+    const two = h(el, 'div', { cls: 'rw-two rw-two-wide' });
+    const left = this.section(two, '未完成待办', 'check-square');
+    const loading = h(left.body, 'div', { cls: 'rw-empty-sm', text: '加载中…' });
+    this.plugin.collectTasks(this.index).then((tasks) => {
+      loading.remove();
+      if (!tasks.length) { h(left.body, 'div', { cls: 'rw-empty-sm', text: '🎉 没有未完成的待办' }); return; }
+      const groups = new Map();
+      for (const t of tasks) {
+        const k = t.projectName || '（未归属项目）';
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k).push(t);
+      }
+      for (const [k, items] of groups) {
+        const g = h(left.body, 'div', { cls: 'rw-task-group' });
+        const gh = h(g, 'div', { cls: 'rw-task-group-head' });
+        if (k.startsWith('（')) h(gh, 'span', { cls: 'rw-muted', text: k });
+        else this.projectChip(gh, k);
+        h(gh, 'span', { cls: 'rw-col-count', text: items.length });
+        items.sort((a, b) => (a.due || '9999').localeCompare(b.due || '9999'));
+        for (const t of items) this.taskRow(g, t);
+      }
+    });
+
+    const dsec = this.section(two, '截止日期', 'alarm-clock');
+    const dls = this.collectDeadlines();
+    if (!dls.length) h(dsec.body, 'div', { cls: 'rw-empty-sm', text: '在项目主页或笔记中设置 deadline: YYYY-MM-DD' });
+    for (const x of dls) this.rowItem(dsec.body, x.item, x.date + ' · ' + deadlineText(x.date), deadlineCls(x.date));
+
+    const mt = this.section(el, '近期会议', 'users');
+    const meetings = this.index.notes.filter((n) => n.type === 'meeting').sort((a, b) => (b.date || '').localeCompare(a.date || '')).slice(0, 6);
+    if (!meetings.length) h(mt.body, 'div', { cls: 'rw-empty-sm', text: '暂无会议纪要' });
+    for (const n of meetings) this.rowItem(mt.body, n, n.date || '');
+  }
+
+  /* ---------- AI 助手页 ---------- */
+  renderAssistant(el) {
+    const right = this.header(el, 'AI 助手', '常用提示词随手存、一键复制；在仓库根目录运行 Claude Code / Codex 时，按 CLAUDE.md 生成的笔记会自动出现在工作台', 'bot');
+    this.btn(right, '生成 / 更新 CLAUDE.md', 'file-cog', () => this.plugin.writeAgentGuide());
+    this.btn(right, '新建提示词', 'plus', () => this.plugin.editPrompt(null), 'mod-cta');
+
+    // 我的提示词
+    const st = this.plugin.settings;
+    const f = (this.filters.prompts = this.filters.prompts || { tag: '', text: '' });
+    const sec = this.section(el, '我的提示词 · ' + st.prompts.length, 'bookmark');
+    const bar = h(sec.el, 'div', { cls: 'rw-filterbar' });
+    sec.el.insertBefore(bar, sec.body);
+    const fi = h(bar, 'input', { cls: 'rw-filter-input', attr: { type: 'text', placeholder: '搜索提示词…' } });
+    fi.value = f.text;
+    const tagBar = h(bar, 'div', { cls: 'rw-catbar rw-catbar-inline' });
+    const grid = h(sec.body, 'div', { cls: 'rw-grid rw-prompts' });
+    const draw = () => {
+      const tags = [...new Set(st.prompts.flatMap((p) => p.tags || []))];
+      clear(tagBar);
+      if (tags.length) {
+        const mk = (v, label) => { const b = h(tagBar, 'button', { cls: 'rw-catchip' + (f.tag === v ? ' is-active' : ''), text: label }); b.addEventListener('click', () => { f.tag = v; draw(); }); };
+        mk('', '全部');
+        tags.forEach((t) => mk(t, '#' + t));
+      }
+      clear(grid);
+      let list = st.prompts.slice().sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || (b.used || 0) - (a.used || 0) || (b.updated || 0) - (a.updated || 0));
+      if (f.tag) list = list.filter((p) => (p.tags || []).includes(f.tag));
+      if (f.text) { const q2 = f.text.toLowerCase(); list = list.filter((p) => (p.title + ' ' + p.text + ' ' + (p.tags || []).join(' ')).toLowerCase().includes(q2)); }
+      if (!list.length) {
+        const em = h(grid, 'div', { cls: 'rw-empty' });
+        h(em, 'div', { text: st.prompts.length ? '没有匹配的提示词' : '还没有保存提示词。把经常问 AI 的话存起来，下次一键复制。' });
+        if (!st.prompts.length) this.btn(em, '新建提示词', 'plus', () => this.plugin.editPrompt(null), 'mod-cta');
+      }
+      for (const p of list) this.promptCard(grid, p, false);
+    };
+    fi.addEventListener('input', () => { f.text = fi.value; draw(); });
+    draw();
+
+    // 内置：工作台指令
+    const sec2 = this.section(el, '工作台内置指令（配合 Claude Code / Codex 使用）', 'sparkles');
+    const grid2 = h(sec2.body, 'div', { cls: 'rw-grid rw-prompts' });
+    for (const p of PROMPTS) this.promptCard(grid2, p, true);
+  }
+
+  promptCard(parent, p, builtin) {
+    const c = h(parent, 'div', { cls: 'rw-card rw-prompt' + (p.pinned ? ' is-pinned' : '') });
+    const top = h(c, 'div', { cls: 'rw-card-top' });
+    ic(top, builtin ? p.icon : p.pinned ? 'pin' : 'message-square-text', 'rw-prompt-icon');
+    h(top, 'span', { cls: 'rw-card-title', text: p.title });
+    if (!builtin) {
+      const eb = h(top, 'button', { cls: 'rw-iconbtn', title: '编辑' }); ic(eb, 'pencil');
+      eb.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.editPrompt(p); });
+      const pb = h(top, 'button', { cls: 'rw-iconbtn', title: p.pinned ? '取消置顶' : '置顶' }); ic(pb, p.pinned ? 'pin-off' : 'pin');
+      pb.addEventListener('click', async (e) => { e.stopPropagation(); p.pinned = !p.pinned; await this.plugin.saveSettings(); this.render(); });
+      this.trashBtn(top, '删除提示词', () => this.plugin.deletePrompt(p));
+    }
+    if (builtin && p.desc) h(c, 'div', { cls: 'rw-card-desc', text: p.desc });
+    if (!builtin && p.tags && p.tags.length) {
+      const tg = h(c, 'div', { cls: 'rw-chips' });
+      p.tags.forEach((t) => h(tg, 'span', { cls: 'rw-tagchip', text: '#' + t }));
+    }
+    h(c, 'pre', { cls: 'rw-prompt-text', text: p.text });
+    const row = h(c, 'div', { cls: 'rw-prompt-actions' });
+    const vars = promptVars(p.text);
+    const b = this.btn(row, vars.length ? '填写并复制' : '复制', 'copy', (e) => { e.stopPropagation(); this.plugin.usePrompt(p, builtin); });
+    b.classList.add('rw-btn-sm');
+    if (builtin) {
+      const sv = this.btn(row, '存到我的提示词', 'bookmark-plus', (e) => { e.stopPropagation(); this.plugin.editPrompt({ title: p.title, text: p.text, tags: ['工作台'] }, true); });
+      sv.classList.add('rw-btn-sm');
+    } else {
+      if (vars.length) h(row, 'span', { cls: 'rw-muted', text: '变量：' + vars.join('、') });
+      if (p.used) h(row, 'span', { cls: 'rw-muted rw-prompt-used', text: '用过 ' + p.used + ' 次' });
+    }
+  }
+
+  /* ═════════ 时间维度：热力图 / 日历 / 时间轴 / 月度统计 ═════════ */
+
+  tip(e, lines) {
+    if (!this.tipEl) this.tipEl = h(this.contentEl.ownerDocument.body, 'div', { cls: 'rw-tip' });
+    const t = this.tipEl;
+    clear(t);
+    (Array.isArray(lines) ? lines : [lines]).forEach((l, i) => h(t, 'div', { cls: i === 0 ? 'rw-tip-title' : '', text: l }));
+    t.style.display = 'block';
+    const W = window.innerWidth;
+    const r = t.getBoundingClientRect();
+    let x = e.clientX + 14;
+    if (x + r.width > W - 8) x = e.clientX - r.width - 14;
+    t.style.left = Math.max(8, x) + 'px';
+    t.style.top = Math.max(8, e.clientY - r.height - 10) + 'px';
+  }
+  untip() { if (this.tipEl) this.tipEl.style.display = 'none'; }
+  bindTip(el, fn) {
+    el.addEventListener('mousemove', (e) => this.tip(e, fn()));
+    el.addEventListener('mouseleave', () => this.untip());
+  }
+
+  /* 可折叠的分区（折叠状态记在设置里） */
+  foldSection(el, key, title, iconName) {
+    const sec = this.section(el, title, iconName);
+    const st = this.plugin.settings;
+    const t = sec.el.querySelector('.rw-section-title');
+    t.classList.add('is-clickable');
+    const chev = ic(t, st.collapsed[key] ? 'chevron-right' : 'chevron-down', 'rw-icon rw-fold');
+    t.addEventListener('click', () => { st.collapsed[key] = !st.collapsed[key]; this.plugin.saveSettingsSoon(); this.render(); });
+    if (st.collapsed[key]) { sec.body.style.display = 'none'; sec.right.style.display = 'none'; }
+    sec.collapsed = !!st.collapsed[key];
+    return sec;
+  }
+
+  renderTimeSection(el) {
+    const idx = this.index;
+    // 1. 活跃度热力图
+    const hs = this.foldSection(el, 'heatmap', '科研活跃度', 'flame');
+    if (!hs.collapsed) this.renderHeatmap(hs);
+    // 2. 日历 + 项目时间轴
+    const two = h(el, 'div', { cls: 'rw-two rw-two-cal' });
+    const cs = this.foldSection(two, 'homecal', '日历', 'calendar-days');
+    if (!cs.collapsed) this.renderCalendar(cs.body, false);
+    const gs = this.foldSection(two, 'gantt', '项目时间轴', 'gantt-chart');
+    if (!gs.collapsed) this.renderGantt(gs, idx.projects);
+    // 3. 月度产出
+    const ms = this.foldSection(el, 'monthly', '每月新增笔记', 'bar-chart-3');
+    if (!ms.collapsed) this.renderMonthly(ms);
+  }
+
+  /* ---- 热力图：最近 53 周，每格 = 当天新建或修改过的笔记 / 文件数 ---- */
+  renderHeatmap(sec) {
+    const act = this.plugin.activityByDay(this.index);
+    const end = startOfDay(new Date());
+    const start = addDays(mondayOf(end), -52 * 7);
+    const vals = [];
+    for (let d = new Date(start); d <= end; d = addDays(d, 1)) vals.push((act.get(fmtDate(d)) || []).length);
+    const nz = vals.filter((v) => v > 0);
+    const vmax = Math.max(1, ...nz);
+    // 对数刻度：1 次就有颜色，最活跃的一天最深
+    const level = (v) => (v <= 0 ? 0 : vmax <= 1 ? 2 : Math.min(4, 1 + Math.floor((3 * Math.log(v)) / Math.log(vmax) + 1e-9)));
+    const total = vals.reduce((a, b) => a + b, 0);
+    const activeDays = nz.length;
+    // 连续天数
+    let streak = 0;
+    for (let d = new Date(end); (act.get(fmtDate(d)) || []).length; d = addDays(d, -1)) streak++;
+    h(sec.right, 'span', { cls: 'rw-muted', text: '近一年 ' + activeDays + ' 天有记录 · 共 ' + total + ' 次 · 连续 ' + streak + ' 天' });
+
+    const wrap = h(sec.body, 'div', { cls: 'rw-heat-wrap' });
+    // 根据可用宽度自动缩放格子，一屏放下整年
+    const avail = (sec.body.clientWidth || 900) - 70;
+    wrap.style.setProperty('--hc', Math.max(8, Math.min(13, Math.floor(avail / 53) - 3)) + 'px');
+    const grid = h(wrap, 'div', { cls: 'rw-heat' });
+    const months = h(grid, 'div', { cls: 'rw-heat-months' });
+    const dayLabels = h(grid, 'div', { cls: 'rw-heat-days' });
+    ['一', '', '三', '', '五', '', '日'].forEach((t) => h(dayLabels, 'span', { text: t }));
+    const cells = h(grid, 'div', { cls: 'rw-heat-cells' });
+    let lastMonth = -1;
+    let col = 0;
+    for (let w = new Date(start); w <= end; w = addDays(w, 7), col++) {
+      if (w.getMonth() !== lastMonth) {
+        const m = h(months, 'span', { text: (w.getMonth() + 1) + '月' });
+        m.style.gridColumnStart = String(col + 1);
+        lastMonth = w.getMonth();
+      }
+      for (let i = 0; i < 7; i++) {
+        const d = addDays(w, i);
+        const key = fmtDate(d);
+        const c = h(cells, 'div', { cls: 'rw-heat-cell' });
+        c.style.gridColumnStart = String(col + 1);
+        c.style.gridRowStart = String(i + 1);
+        if (d > end) { c.classList.add('is-future'); continue; }
+        const items = act.get(key) || [];
+        c.classList.add('lv' + level(items.length));
+        if (key === today()) c.classList.add('is-today');
+        if (this.heatSel === key) c.classList.add('is-sel');
+        this.bindTip(c, () => [key + ' 星期' + '日一二三四五六'[d.getDay()], items.length ? items.length + ' 个笔记 / 文件有改动' : '没有记录']);
+        c.addEventListener('click', () => { this.heatSel = this.heatSel === key ? null : key; this.render(); });
+      }
+    }
+    const legend = h(wrap, 'div', { cls: 'rw-heat-legend' });
+    h(legend, 'span', { cls: 'rw-muted', text: '少' });
+    for (let i = 0; i <= 4; i++) h(legend, 'span', { cls: 'rw-heat-cell lv' + i });
+    h(legend, 'span', { cls: 'rw-muted', text: '多' });
+    if (this.heatSel) {
+      const items = act.get(this.heatSel) || [];
+      const box = h(sec.body, 'div', { cls: 'rw-heat-detail' });
+      const hd = h(box, 'div', { cls: 'rw-heat-detail-head' });
+      h(hd, 'span', { text: this.heatSel + ' 的记录（' + items.length + '）' });
+      const x = h(hd, 'button', { cls: 'rw-iconbtn', title: '收起' }); ic(x, 'x');
+      x.addEventListener('click', () => { this.heatSel = null; this.render(); });
+      if (!items.length) h(box, 'div', { cls: 'rw-empty-sm', text: '这一天没有新建或修改的笔记 / 文件' });
+      for (const it of items.slice(0, 30)) {
+        const r = h(box, 'div', { cls: 'rw-row' });
+        ic(r, it.icon, 'rw-row-icon');
+        const mid = h(r, 'div', { cls: 'rw-row-mid' });
+        h(mid, 'div', { cls: 'rw-row-title', text: it.title });
+        const sub = h(mid, 'div', { cls: 'rw-row-sub' });
+        h(sub, 'span', { text: it.what });
+        if (it.project) this.projectChip(sub, it.project);
+        r.addEventListener('click', () => (it.entry ? this.plugin.previewEntries([it.entry], 0) : this.plugin.openFile(it.file)));
+      }
+    }
+  }
+
+  /* ---- 日历：月视图（首页 / 计划）+ 周视图（计划，带时间） ---- */
+  renderCalendar(parent, big) {
+    const now = new Date();
+    const cs = this.calState || (this.calState = { month: new Date(now.getFullYear(), now.getMonth(), 1), week: mondayOf(now), sel: today() });
+    const mode = big ? this.plugin.settings.calMode || 'month' : 'month';
+    const wrap = h(parent, 'div', { cls: 'rw-cal' + (big ? ' is-big' : ' is-compact') });
+    const bar = h(wrap, 'div', { cls: 'rw-cal-bar' });
+    const prev = h(bar, 'button', { cls: 'rw-iconbtn', title: '上一' + (mode === 'week' ? '周' : '月') }); ic(prev, 'chevron-left');
+    const title = h(bar, 'div', { cls: 'rw-cal-title' });
+    const next = h(bar, 'button', { cls: 'rw-iconbtn', title: '下一' + (mode === 'week' ? '周' : '月') }); ic(next, 'chevron-right');
+    const tb = h(bar, 'button', { cls: 'rw-btn rw-btn-sm', text: '今天' });
+    h(bar, 'div', { cls: 'rw-spacer' });
+    if (big) {
+      this.segmented(bar, [['month', '月'], ['week', '周']], mode, (v) => { this.plugin.settings.calMode = v; this.plugin.saveSettingsSoon(); this.render(); });
+      const add = h(bar, 'button', { cls: 'rw-btn rw-btn-sm mod-cta' }); ic(add, 'plus'); h(add, 'span', { text: '添加待办' });
+      add.addEventListener('click', () => this.plugin.addTaskModal({ date: cs.sel || today() }));
+    }
+    if (mode === 'week') title.textContent = fmtDate(cs.week).slice(0, 7).replace('-', ' 年 ') + ' 月 · 第 ' + isoWeek(cs.week) + ' 周';
+    else title.textContent = cs.month.getFullYear() + ' 年 ' + (cs.month.getMonth() + 1) + ' 月';
+    prev.addEventListener('click', () => { if (mode === 'week') cs.week = addDays(cs.week, -7); else cs.month = new Date(cs.month.getFullYear(), cs.month.getMonth() - 1, 1); this.render(); });
+    next.addEventListener('click', () => { if (mode === 'week') cs.week = addDays(cs.week, 7); else cs.month = new Date(cs.month.getFullYear(), cs.month.getMonth() + 1, 1); this.render(); });
+    tb.addEventListener('click', () => { const n = new Date(); cs.month = new Date(n.getFullYear(), n.getMonth(), 1); cs.week = mondayOf(n); cs.sel = today(); this.render(); });
+    const legend = h(wrap, 'div', { cls: 'rw-cal-legend' });
+    for (const k of ['deadline', 'task', 'meeting', 'note']) { const l = h(legend, 'span', { cls: 'rw-ev-key ev-' + k }); h(l, 'i'); h(l, 'span', { text: EVENT_LABEL[k] }); }
+    const body = h(wrap, 'div', { cls: 'rw-cal-body' });
+    h(body, 'div', { cls: 'rw-empty-sm', text: '加载中…' });
+    const dayBox = h(wrap, 'div', { cls: 'rw-cal-daybox' });
+    this.plugin.collectEvents(this.index).then((events) => {
+      const byDay = new Map();
+      for (const ev of events) { if (!byDay.has(ev.date)) byDay.set(ev.date, []); byDay.get(ev.date).push(ev); }
+      for (const list of byDay.values()) list.sort((a, b) => (a.time || '99').localeCompare(b.time || '99') || EVENT_ORDER[a.kind] - EVENT_ORDER[b.kind]);
+      clear(body);
+      const drawDay = () => this.renderDayBox(dayBox, cs.sel, byDay.get(cs.sel) || [], big);
+      const selectDay = (key) => { cs.sel = key; body.querySelectorAll('.is-sel').forEach((x) => x.classList.remove('is-sel')); body.querySelectorAll('[data-day="' + key + '"]').forEach((x) => x.classList.add('is-sel')); drawDay(); };
+      if (mode === 'week') this.renderWeek(body, cs.week, byDay, selectDay, cs.sel);
+      else this.renderMonthGrid(body, cs.month, byDay, selectDay, cs.sel, big);
+      drawDay();
+    });
+  }
+
+  renderMonthGrid(body, month, byDay, selectDay, sel, big) {
+    const grid = h(body, 'div', { cls: 'rw-month' });
+    '一二三四五六日'.split('').forEach((d) => h(grid, 'div', { cls: 'rw-month-wd', text: d }));
+    const start = mondayOf(month);
+    const tKey = today();
+    for (let i = 0; i < 42; i++) {
+      const d = addDays(start, i);
+      if (i >= 35 && d.getMonth() !== month.getMonth()) break;
+      const key = fmtDate(d);
+      const evs = byDay.get(key) || [];
+      const cell = h(grid, 'div', { cls: 'rw-month-cell' + (d.getMonth() !== month.getMonth() ? ' is-other' : '') + (key === tKey ? ' is-today' : '') + (key === sel ? ' is-sel' : ''), attr: { 'data-day': key } });
+      const top = h(cell, 'div', { cls: 'rw-month-num' });
+      h(top, 'span', { text: d.getDate() });
+      if (big) {
+        const shown = evs.filter((e) => e.kind !== 'note');
+        for (const ev of shown.slice(0, 3)) {
+          const chip = h(cell, 'div', { cls: 'rw-ev ev-' + ev.kind + (ev.done ? ' is-done' : '') });
+          h(chip, 'i');
+          h(chip, 'span', { text: (ev.time ? ev.time + ' ' : '') + ev.title });
+        }
+        const rest = shown.length - 3 + (evs.length - shown.length ? 0 : 0);
+        if (rest > 0) h(cell, 'div', { cls: 'rw-ev-more', text: '+' + rest });
+        const notes = evs.filter((e) => e.kind === 'note').length;
+        if (notes) h(top, 'span', { cls: 'rw-month-notes', text: notes + ' 篇' });
+      } else if (evs.length) {
+        const dots = h(cell, 'div', { cls: 'rw-dots' });
+        const kinds = [...new Set(evs.map((e) => e.kind))].sort((a, b) => EVENT_ORDER[a] - EVENT_ORDER[b]);
+        kinds.forEach((k) => h(dots, 'i', { cls: 'ev-' + k }));
+      }
+      if (evs.length) this.bindTip(cell, () => [key].concat(evs.slice(0, 8).map((e) => EVENT_LABEL[e.kind] + '：' + (e.time ? e.time + ' ' : '') + e.title)).concat(evs.length > 8 ? ['…还有 ' + (evs.length - 8) + ' 项'] : []));
+      cell.addEventListener('click', () => selectDay(key));
+      cell.addEventListener('dblclick', () => this.plugin.addTaskModal({ date: key }));
+    }
+  }
+
+  renderWeek(body, monday, byDay, selectDay, sel) {
+    const H0 = 7, H1 = 23, PX = 44;
+    const tKey = today();
+    const wk = h(body, 'div', { cls: 'rw-week' });
+    const head = h(wk, 'div', { cls: 'rw-week-head' });
+    h(head, 'div', { cls: 'rw-week-gutter' });
+    const allday = h(wk, 'div', { cls: 'rw-week-allday' });
+    h(allday, 'div', { cls: 'rw-week-gutter rw-muted', text: '全天' });
+    const grid = h(wk, 'div', { cls: 'rw-week-grid' });
+    const gutter = h(grid, 'div', { cls: 'rw-week-gutter rw-week-hours' });
+    for (let hr = H0; hr <= H1; hr++) { const l = h(gutter, 'div', { cls: 'rw-week-hour', text: pad(hr) + ':00' }); l.style.height = PX + 'px'; }
+    for (let i = 0; i < 7; i++) {
+      const d = addDays(monday, i);
+      const key = fmtDate(d);
+      const evs = byDay.get(key) || [];
+      const hc = h(head, 'div', { cls: 'rw-week-day' + (key === tKey ? ' is-today' : '') + (key === sel ? ' is-sel' : ''), attr: { 'data-day': key } });
+      h(hc, 'span', { cls: 'rw-muted', text: '周' + '一二三四五六日'[i] });
+      h(hc, 'b', { text: d.getDate() });
+      hc.addEventListener('click', () => selectDay(key));
+      const ad = h(allday, 'div', { cls: 'rw-week-adcell' + (key === tKey ? ' is-today' : '') });
+      for (const ev of evs.filter((e) => !e.time && e.kind !== 'note')) {
+        const chip = h(ad, 'div', { cls: 'rw-ev ev-' + ev.kind + (ev.done ? ' is-done' : '') });
+        h(chip, 'i'); h(chip, 'span', { text: ev.title });
+        this.bindTip(chip, () => [EVENT_LABEL[ev.kind], ev.title, ev.project ? '项目：' + ev.project : '']);
+        chip.addEventListener('click', () => this.openEvent(ev));
+      }
+      const col = h(grid, 'div', { cls: 'rw-week-col' + (key === tKey ? ' is-today' : '') });
+      col.style.height = (H1 - H0 + 1) * PX + 'px';
+      for (let hr = H0; hr <= H1; hr++) h(col, 'div', { cls: 'rw-week-slot' }).style.height = PX + 'px';
+      col.addEventListener('dblclick', (e) => {
+        const y = e.clientY - col.getBoundingClientRect().top;
+        const mins = Math.max(0, Math.round((y / PX) * 2) * 30);
+        const hh = H0 + Math.floor(mins / 60);
+        this.plugin.addTaskModal({ date: key, time: pad(Math.min(23, hh)) + ':' + pad(mins % 60) });
+      });
+      for (const ev of evs.filter((e) => e.time)) {
+        const [hh, mm] = ev.time.split(':').map(Number);
+        const top = Math.max(0, (hh - H0 + mm / 60) * PX);
+        const b = h(col, 'div', { cls: 'rw-week-ev ev-' + ev.kind + (ev.done ? ' is-done' : '') });
+        b.style.top = top + 'px';
+        h(b, 'b', { text: ev.time });
+        h(b, 'span', { text: ' ' + ev.title });
+        this.bindTip(b, () => [ev.time + ' ' + ev.title, EVENT_LABEL[ev.kind] + (ev.project ? ' · ' + ev.project : '')]);
+        b.addEventListener('click', () => this.openEvent(ev));
+      }
+      if (key === tKey) {
+        const n = new Date();
+        const y = (n.getHours() - H0 + n.getMinutes() / 60) * PX;
+        if (y >= 0 && y <= (H1 - H0 + 1) * PX) { const line = h(col, 'div', { cls: 'rw-now' }); line.style.top = y + 'px'; }
+      }
+    }
+    h(body, 'div', { cls: 'rw-muted rw-hint', text: '双击某个时间格可添加待办 · 待办里写「⏰ 14:00」就会出现在对应时间' });
+    // 滚到当前时间附近（或 8 点）
+    const n0 = new Date();
+    setTimeout(() => { grid.scrollTop = Math.max(0, (Math.min(Math.max(n0.getHours(), 8), 20) - H0 - 1) * PX); }, 0);
+  }
+
+  renderDayBox(box, key, evs, big) {
+    clear(box);
+    const d = parseDate(key);
+    const hd = h(box, 'div', { cls: 'rw-daybox-head' });
+    h(hd, 'b', { text: key.slice(5).replace('-', ' 月 ') + ' 日 · 星期' + '日一二三四五六'[d.getDay()] });
+    const dd = daysUntil(key);
+    h(hd, 'span', { cls: 'rw-muted', text: dd === 0 ? '今天' : dd > 0 ? dd + ' 天后' : -dd + ' 天前' });
+    h(hd, 'div', { cls: 'rw-spacer' });
+    const add = h(hd, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(add, 'plus'); h(add, 'span', { text: '这天加待办' });
+    add.addEventListener('click', () => this.plugin.addTaskModal({ date: key }));
+    if (!evs.length) { h(box, 'div', { cls: 'rw-empty-sm', text: '这一天没有安排' }); return; }
+    for (const ev of evs.slice(0, big ? 40 : 8)) {
+      const r = h(box, 'div', { cls: 'rw-dayrow ev-' + ev.kind + (ev.done ? ' is-done' : '') });
+      if (ev.kind === 'task' && !ev.done) {
+        const cb = h(r, 'input', { attr: { type: 'checkbox' } });
+        cb.addEventListener('click', async (e) => { e.stopPropagation(); r.classList.add('is-done'); await this.plugin.completeTask(ev.task); });
+      } else h(r, 'i', { cls: 'rw-dayrow-dot' });
+      h(r, 'span', { cls: 'rw-dayrow-time', text: ev.time || '' });
+      h(r, 'span', { cls: 'rw-dayrow-text', text: ev.title });
+      h(r, 'span', { cls: 'rw-muted', text: EVENT_LABEL[ev.kind] });
+      if (ev.project) this.projectChip(r, ev.project);
+      r.addEventListener('click', () => this.openEvent(ev));
+    }
+    if (evs.length > (big ? 40 : 8)) h(box, 'div', { cls: 'rw-muted', text: '…还有 ' + (evs.length - (big ? 40 : 8)) + ' 项' });
+  }
+
+  openEvent(ev) {
+    if (ev.task) return this.plugin.openFile(ev.file, ev.task.line);
+    if (ev.kind === 'deadline' && ev.isProject) return this.openProject(ev.projectKey);
+    if (ev.file) return this.plugin.openFile(ev.file);
+  }
+
+  /* ---- 项目时间轴（甘特图）：开始 → 截止，今天竖线 ---- */
+  renderGantt(sec, projects) {
+    const st = this.plugin.settings;
+    const showDone = !!st.ganttDone;
+    const cbl = h(sec.right, 'label', { cls: 'rw-check' });
+    const cb = h(cbl, 'input', { attr: { type: 'checkbox' } });
+    cb.checked = showDone;
+    h(cbl, 'span', { text: '含已完成' });
+    cb.addEventListener('change', () => { st.ganttDone = cb.checked; this.plugin.saveSettingsSoon(); this.render(); });
+    const list = projects.filter((p) => showDone || p.status !== '已完成').map((p) => {
+      const s = parseDate(p.fm.created) || startOfDay(new Date(p.file.stat.ctime));
+      const e = parseDate(p.deadline);
+      return { p, s, e };
+    }).sort((a, b) => a.s - b.s);
+    if (!list.length) { h(sec.body, 'div', { cls: 'rw-empty-sm', text: '暂无项目' }); return; }
+    const tdy = startOfDay(new Date());
+    let min = new Date(Math.min(...list.map((x) => x.s.getTime()), tdy.getTime() - 30 * 864e5));
+    let max = new Date(Math.max(...list.map((x) => (x.e || tdy).getTime()), tdy.getTime() + 30 * 864e5));
+    if (max - min > 730 * 864e5) min = new Date(max.getTime() - 730 * 864e5);
+    min = new Date(min.getFullYear(), min.getMonth(), 1);
+    max = new Date(max.getFullYear(), max.getMonth() + 1, 1);
+    const span = max - min;
+    const pct = (d) => Math.max(0, Math.min(100, ((d - min) / span) * 100));
+    const g = h(sec.body, 'div', { cls: 'rw-gantt' });
+    const axis = h(g, 'div', { cls: 'rw-gantt-row rw-gantt-axis' });
+    h(axis, 'div', { cls: 'rw-gantt-label' });
+    const at = h(axis, 'div', { cls: 'rw-gantt-track' });
+    const months = Math.round(span / (30.44 * 864e5));
+    const stepM = months > 14 ? 3 : months > 7 ? 2 : 1;
+    for (let d = new Date(min); d < max; d = new Date(d.getFullYear(), d.getMonth() + stepM, 1)) {
+      const t = h(at, 'span', { cls: 'rw-gantt-tick', text: (d.getMonth() === 0 || d.getTime() === min.getTime() ? d.getFullYear() + '.' : '') + (d.getMonth() + 1) + '月' });
+      t.style.left = pct(d) + '%';
+    }
+    for (const { p, s, e } of list) {
+      const row = h(g, 'div', { cls: 'rw-gantt-row' });
+      const lab = h(row, 'div', { cls: 'rw-gantt-label', title: p.title });
+      h(lab, 'span', { cls: 'rw-gantt-kind s' + KINDS[p.pkind].slot });
+      h(lab, 'span', { cls: 'rw-gantt-name', text: p.title });
+      lab.addEventListener('click', () => this.openProject(p.name));
+      const tr = h(row, 'div', { cls: 'rw-gantt-track' });
+      const doneEnd = e && e < tdy ? e : tdy;
+      const bar = h(tr, 'div', { cls: 'rw-gantt-bar s' + KINDS[p.pkind].slot + (p.status === '已完成' ? ' is-done' : '') });
+      bar.style.left = pct(s) + '%';
+      bar.style.width = Math.max(0.8, pct(doneEnd) - pct(s)) + '%';
+      if (e && e > tdy) {
+        const plan = h(tr, 'div', { cls: 'rw-gantt-plan s' + KINDS[p.pkind].slot });
+        plan.style.left = pct(tdy) + '%';
+        plan.style.width = Math.max(0.5, pct(e) - pct(tdy)) + '%';
+      }
+      if (e) {
+        const mk = h(tr, 'div', { cls: 'rw-gantt-dl' + (e < tdy && p.status !== '已完成' ? ' is-overdue' : '') });
+        mk.style.left = pct(e) + '%';
+      }
+      const stageTxt = p.stage ? KINDS[p.pkind].label + ' · ' + p.stage : KINDS[p.pkind].label;
+      this.bindTip(tr, () => [p.title, stageTxt + ' · ' + p.status, '开始 ' + fmtDate(s) + (e ? ' → 截止 ' + fmtDate(e) + '（' + deadlineText(fmtDate(e)) + '）' : ' · 未设截止日期')]);
+      tr.addEventListener('click', () => this.openProject(p.name));
+    }
+    const nowL = h(g, 'div', { cls: 'rw-gantt-today' });
+    nowL.style.setProperty('--x', pct(tdy) / 100);
+    h(nowL, 'span', { text: '今天' });
+    const legend = h(sec.body, 'div', { cls: 'rw-chart-legend' });
+    for (const k of KIND_ORDER) if (list.some((x) => x.p.pkind === k)) { const l = h(legend, 'span'); h(l, 'i', { cls: 's' + KINDS[k].slot }); h(l, 'span', { text: KINDS[k].label }); }
+    const l2 = h(legend, 'span'); h(l2, 'i', { cls: 'rw-legend-plan' }); h(l2, 'span', { text: '今天之后的计划' });
+    const l3 = h(legend, 'span'); h(l3, 'i', { cls: 'rw-legend-dl' }); h(l3, 'span', { text: '截止日' });
+  }
+
+  /* ---- 每月新增笔记（按类型堆叠） ---- */
+  renderMonthly(sec) {
+    const nowD = new Date();
+    const months = [];
+    for (let i = 11; i >= 0; i--) { const d = new Date(nowD.getFullYear(), nowD.getMonth() - i, 1); months.push({ key: fmtDate(d).slice(0, 7), label: (d.getMonth() + 1) + '月', year: d.getFullYear(), counts: {}, total: 0 }); }
+    const byKey = new Map(months.map((m) => [m.key, m]));
+    const types = Object.keys(NOTE_TYPES);
+    for (const n of this.index.notes) {
+      const m = byKey.get((n.date || '').slice(0, 7));
+      if (!m) continue;
+      m.counts[n.type] = (m.counts[n.type] || 0) + 1;
+      m.total++;
+    }
+    const maxV = Math.max(1, ...months.map((m) => m.total));
+    const total = months.reduce((a, m) => a + m.total, 0);
+    h(sec.right, 'span', { cls: 'rw-muted', text: '近 12 个月共 ' + total + ' 条' });
+    const legend = h(sec.body, 'div', { cls: 'rw-chart-legend' });
+    types.forEach((t, i) => { if (months.some((m) => m.counts[t])) { const l = h(legend, 'span'); h(l, 'i', { cls: 's' + (i + 1) }); h(l, 'span', { text: NOTE_TYPES[t].label }); } });
+    const chart = h(sec.body, 'div', { cls: 'rw-bars' });
+    const yax = h(chart, 'div', { cls: 'rw-bars-y' });
+    h(yax, 'span', { text: maxV });
+    h(yax, 'span', { text: Math.round(maxV / 2) });
+    h(yax, 'span', { text: 0 });
+    const plot = h(chart, 'div', { cls: 'rw-bars-plot' });
+    h(plot, 'div', { cls: 'rw-bars-grid' });
+    for (const m of months) {
+      const col = h(plot, 'div', { cls: 'rw-bars-col' });
+      const stack = h(col, 'div', { cls: 'rw-bars-stack' });
+      stack.style.height = (m.total / maxV) * 100 + '%';
+      types.forEach((t, i) => {
+        const v = m.counts[t];
+        if (!v) return;
+        const seg = h(stack, 'div', { cls: 'rw-bars-seg s' + (i + 1) });
+        seg.style.flexGrow = String(v);
+        this.bindTip(seg, () => [m.year + ' 年 ' + m.label, NOTE_TYPES[t].label + '：' + v + ' 条', '当月合计：' + m.total + ' 条']);
+      });
+      h(col, 'div', { cls: 'rw-bars-x', text: m.label });
+      if (!m.total) this.bindTip(col, () => [m.year + ' 年 ' + m.label, '没有新增笔记']);
+    }
+  }
+
+
+  /* ═════════ 全局记录（自动）界面 ═════════ */
+  onActivity() {
+    if (this.tab === 'activity' || (this.tab === 'home' && this.plugin.settings.homeLogMode === 'act')) this.requestRefresh();
+  }
+  renderActivityPage(el) {
+    const right = this.header(el, '全局记录', '工作台自动记下的每一次操作：新建、导入、加入灵感、移动、改名、删除、编辑、改状态。和手写的「科研日志」分开', 'activity');
+    this.btn(right, '打开记录文件', 'file-text', () => { const f = this.app.vault.getAbstractFileByPath(this.plugin.actPath(new Date())); if (f) this.plugin.openFile(f); else new Notice('这个月还没有记录'); }, 'rw-btn-sm');
+    this.renderActivity(el, {});
+  }
+  renderActivity(el, o) {
+    const pl = this.plugin;
+    o = o || {};
+    const F = this.actF || (this.actF = { days: 7, cat: 'all', project: '', q: '', edits: true });
+    const box = h(el, 'div', { cls: 'rw-act' + (o.compact ? ' is-compact' : '') });
+    if (pl.settings.activityOn === false) { h(box, 'div', { cls: 'rw-empty-sm', text: '全局记录已关闭（设置 → 科研工作台 → 全局记录）' }); return; }
+    const CATS = [['all', '全部'], ['create', '新建'], ['import', '导入'], ['idea', '灵感'], ['move', '移动 / 改名'], ['delete', '删除'], ['prop', '状态'], ['edit', '编辑'], ['mindflow', 'Mindflow']];
+    if (!o.compact) {
+      const bar = h(box, 'div', { cls: 'rw-act-bar' });
+      this.segmented(bar, [['1', '今天'], ['7', '7 天'], ['30', '30 天'], ['0', '全部']], String(F.days), (v) => { F.days = Number(v); this.render(); });
+      const chips = h(bar, 'div', { cls: 'rw-act-chips' });
+      for (const [k, t] of CATS) {
+        const c = h(chips, 'button', { cls: 'rw-catchip' + (F.cat === k ? ' is-active' : ''), text: t });
+        c.addEventListener('click', () => { F.cat = k; this.render(); });
+      }
+      const bar2 = h(box, 'div', { cls: 'rw-act-bar' });
+      const ps = h(bar2, 'select', { cls: 'dropdown rw-select rw-select-sm' });
+      const o0 = h(ps, 'option', { text: '全部项目' }); o0.value = '';
+      for (const p of this.index.projects) { const op = h(ps, 'option', { text: p.title }); op.value = p.name; }
+      ps.value = F.project || '';
+      ps.addEventListener('change', () => { F.project = ps.value; this.render(); });
+      const q = h(bar2, 'input', { cls: 'rw-input rw-act-q', attr: { type: 'search', placeholder: '搜索文件名、路径…' } });
+      q.value = F.q || '';
+      q.addEventListener('keydown', (e) => { if (e.key === 'Enter') { F.q = q.value.trim(); this.render(); } });
+      q.addEventListener('search', () => { F.q = q.value.trim(); this.render(); });
+      const lab = h(bar2, 'label', { cls: 'rw-check', title: '编辑记录比较多，可以隐藏' });
+      const cb = h(lab, 'input', { attr: { type: 'checkbox' } });
+      cb.checked = F.edits !== false;
+      h(lab, 'span', { text: '显示编辑' });
+      cb.addEventListener('change', () => { F.edits = cb.checked; this.render(); });
+    }
+    const list = h(box, 'div', { cls: 'rw-act-list' });
+    h(list, 'div', { cls: 'rw-empty-sm', text: '加载中…' });
+    (async () => {
+      let all = await pl.readActivity(o.compact ? 7 : F.days);
+      clear(list);
+      if (o.compact) all = all.filter((e) => e.a !== 'edit');
+      else {
+        if (F.cat !== 'all') all = all.filter((e) => pl.actCat(e) === F.cat);
+        if (F.edits === false && F.cat !== 'edit') all = all.filter((e) => e.a !== 'edit');
+        if (F.project) all = all.filter((e) => e.pr === F.project);
+        if (F.q) { const qq = F.q.toLowerCase(); all = all.filter((e) => ((e.n || '') + ' ' + e.p + ' ' + (e.o || '')).toLowerCase().includes(qq)); }
+      }
+      if (o.compact) all = all.slice(0, 40);
+      if (!all.length) { h(list, 'div', { cls: 'rw-empty-sm', text: o.compact ? '最近 7 天还没有自动记录。新建、导入、移动、改名、删除文件都会自动记在这里。' : '没有符合条件的记录' }); return; }
+      let day = '';
+      let ul = null;
+      const ICON = { create: 'file-plus', import: 'download', folder: 'folder-plus', mindflow: 'git-fork', move: 'folder-input', rename: 'pencil', delete: 'trash-2', edit: 'file-pen-line', prop: 'tag' };
+      for (const e of all) {
+        const d = new Date(e.t2 || e.t);
+        const k = fmtDate(d);
+        if (k !== day) {
+          day = k;
+          const dh = h(list, 'div', { cls: 'rw-tl-day' });
+          h(dh, 'b', { text: k === today() ? '今天' : k.slice(5) });
+          h(dh, 'span', { cls: 'rw-muted', text: '星期' + '日一二三四五六'[d.getDay()] });
+          ul = h(list, 'div', { cls: 'rw-act-day' });
+        }
+        const cat = pl.actCat(e);
+        const it = h(ul, 'div', { cls: 'rw-act-item is-' + cat });
+        h(it, 'div', { cls: 'rw-act-time', text: pad(new Date(e.t).getHours()) + ':' + pad(new Date(e.t).getMinutes()) + (e.t2 && fmtDate(new Date(e.t2)) === fmtDate(new Date(e.t)) && e.t2 - e.t > 60000 ? '–' + pad(new Date(e.t2).getHours()) + ':' + pad(new Date(e.t2).getMinutes()) : '') });
+        const icn = h(it, 'div', { cls: 'rw-act-ic' }); ic(icn, cat === 'idea' ? 'lightbulb' : ICON[e.a] || 'dot');
+        const main = h(it, 'div', { cls: 'rw-act-main' });
+        const line = h(main, 'div', { cls: 'rw-act-line' });
+        h(line, 'span', { cls: 'rw-act-verb', text: pl.actVerb(e) });
+        const f = e.a === 'delete' ? null : this.app.vault.getAbstractFileByPath(e.p);
+        const name = h(line, 'span', { cls: 'rw-act-name' + (f ? ' is-link' : ' is-gone'), text: e.n || e.p, title: e.p });
+        if (f) name.addEventListener('click', () => { if (f instanceof TFile) { if (/^Mindflow\/对话数据\//.test(f.path)) { const sid = f.basename; pl.openMindflow({ sid }); } else pl.openAny ? pl.openAny(f) : pl.openFile(f); } });
+        if (e.a === 'edit' && e.c > 1) h(line, 'span', { cls: 'rw-act-count', text: '×' + e.c });
+        const meta = h(main, 'div', { cls: 'rw-act-meta' });
+        if (e.a === 'move' || e.a === 'rename') h(meta, 'span', { text: (e.o || '') + ' → ' + e.p });
+        else if (e.a === 'prop') { h(meta, 'span', { cls: 'rw-act-from', text: e.from || '空' }); h(meta, 'span', { text: ' → ' }); h(meta, 'span', { cls: 'rw-act-to', text: e.to || '空' }); }
+        else if (!o.compact) h(meta, 'span', { text: e.p.split('/').slice(0, -1).join('/') || '库根目录' });
+        if (e.pr) { const pc = h(meta, 'span', { cls: 'rw-act-proj', text: e.pr }); pc.style.setProperty('--pc', projectColor(e.pr)); pc.addEventListener('click', () => this.plugin.openWorkbenchProject ? this.plugin.openWorkbenchProject(e.pr) : null); }
+        if (e.s === '外部') h(meta, 'span', { cls: 'rw-act-ext', text: '外部', title: '不是在工作台里做的（比如直接在 Obsidian 文件列表里、或其他程序改的）' });
+      }
+      if (o.compact) {
+        const more = h(list, 'button', { cls: 'rw-linkbtn rw-act-more', text: '查看全部记录 →' });
+        more.addEventListener('click', () => this.switchTab('activity'));
+      }
+    })();
+  }
+  /* ---- 科研日志：一键记录「刚刚做了什么」，按时间线展示 ---- */
+  renderWorklog(sec, dash) {
+    const st = this.plugin.settings;
+    const box = h(sec.body, 'div', { cls: 'rw-log' });
+    const form = h(box, 'div', { cls: 'rw-log-form' });
+    const row1 = h(form, 'div', { cls: 'rw-log-row' });
+    const clock = h(row1, 'div', { cls: 'rw-log-clock' });
+    const tick = () => { const n = new Date(); clock.textContent = pad(n.getHours()) + ':' + pad(n.getMinutes()); };
+    tick();
+    clearInterval(this._logT);
+    this._logT = setInterval(() => { if (!clock.isConnected) return clearInterval(this._logT); tick(); }, 15000);
+    const ta = h(row1, 'textarea', { cls: 'rw-log-input', attr: { rows: '1', placeholder: '刚刚做了什么？例如：给导师发邮件确认 CA1 时间 / 学习了 MUSIC 算法推导' + (IS_MOBILE ? '' : '（Ctrl+Enter 记录）') } });
+    ta.value = this.logDraft || '';
+    const grow = () => { ta.style.height = 'auto'; ta.style.height = Math.min(160, ta.scrollHeight) + 'px'; };
+    ta.addEventListener('input', () => { this.logDraft = ta.value; grow(); });
+    setTimeout(grow, 0);
+    const btnCol = h(row1, 'div', { cls: 'rw-log-btncol' });
+    const btn = h(btnCol, 'button', { cls: 'rw-btn mod-cta rw-log-btn' });
+    ic(btn, 'stamp');
+    h(btn, 'span', { text: '记录' });
+    const ib = h(btnCol, 'button', { cls: 'rw-btn rw-btn-sm rw-log-idea', title: '不记日志，而是把这句话存进灵感池' });
+    ic(ib, 'lightbulb');
+    h(ib, 'span', { text: '存为灵感' });
+    ib.addEventListener('click', async () => {
+      const text = ta.value.trim();
+      if (!text) { ta.focus(); return; }
+      await this.plugin.createNote({ type: 'idea', title: text.length > 40 ? text.slice(0, 40) : text, content: text, project: ps.value, open: false, silent: true });
+      this.logDraft = '';
+      new Notice('💡 已存入灵感池');
+    });
+    const row2 = h(form, 'div', { cls: 'rw-log-row2' });
+    const sel = this.logSel || (this.logSel = new Set());
+    const tagBox = h(row2, 'div', { cls: 'rw-log-tags' });
+    for (const t of st.logTags) {
+      const c = h(tagBox, 'button', { cls: 'rw-catchip rw-log-tag' + (sel.has(t) ? ' is-active' : ''), text: '#' + t });
+      c.addEventListener('click', () => { if (sel.has(t)) sel.delete(t); else sel.add(t); c.classList.toggle('is-active'); });
+    }
+    h(row2, 'div', { cls: 'rw-spacer' });
+    const ps = h(row2, 'select', { cls: 'dropdown rw-select rw-select-sm' });
+    const o0 = h(ps, 'option', { text: '不关联项目' }); o0.value = '';
+    for (const p of this.index.projects.filter((x) => x.status !== '已完成')) { const o = h(ps, 'option', { text: p.title }); o.value = p.name; }
+    ps.value = this.logProject || '';
+    ps.addEventListener('change', () => (this.logProject = ps.value));
+    const tIn = h(row2, 'input', { cls: 'rw-log-time', attr: { type: 'time', title: '留空 = 现在；也可以补记之前的时间' } });
+    tIn.value = this.logTime || '';
+    tIn.addEventListener('change', () => (this.logTime = tIn.value));
+    const submit = async () => {
+      const text = ta.value.trim();
+      if (!text) { ta.focus(); return; }
+      let when = new Date();
+      if (tIn.value) { const [hh, mm] = tIn.value.split(':').map(Number); when.setHours(hh, mm, 0, 0); }
+      btn.disabled = true;
+      try {
+        await this.plugin.addLog({ text, tags: [...sel], project: ps.value, when });
+        this.logDraft = ''; this.logTime = ''; sel.clear();
+        new Notice('🕒 已记录 ' + pad(when.getHours()) + ':' + pad(when.getMinutes()));
+      } finally { btn.disabled = false; }
+    };
+    btn.addEventListener('click', submit);
+    ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); submit(); } });
+
+    // 时间线
+    const days = this.logDays || 7;
+    if (dash) box.classList.add('is-dash');
+    const tl = h(box, 'div', { cls: 'rw-tl' });
+    h(tl, 'div', { cls: 'rw-empty-sm', text: '加载中…' });
+    this.plugin.readLogs(days - 1).then((logs) => {
+      clear(tl);
+      const todayN = logs.filter((x) => x.date === today()).length;
+      clear(sec.right);
+      h(sec.right, 'span', { cls: 'rw-muted', text: '今天 ' + todayN + ' 条 · 近 ' + days + ' 天 ' + logs.length + ' 条' });
+      const ob = h(sec.right, 'button', { cls: 'rw-linkbtn', text: '打开日志文件' });
+      ob.addEventListener('click', () => { const f = this.app.vault.getAbstractFileByPath(this.plugin.logFilePath(new Date())); if (f) this.plugin.openFile(f); else new Notice('本月还没有日志'); });
+      if (!logs.length) { h(tl, 'div', { cls: 'rw-empty-sm', text: '还没有记录。做完一件事，写一句话点「记录」，这里就会按时间排成一条时间线。' }); return; }
+      let curDay = '';
+      let dayList = null;
+      for (const e of logs) {
+        if (e.date !== curDay) {
+          curDay = e.date;
+          const d = parseDate(e.date);
+          const dd = daysUntil(e.date);
+          const hd = h(tl, 'div', { cls: 'rw-tl-day' });
+          h(hd, 'b', { text: dd === 0 ? '今天' : dd === -1 ? '昨天' : (d.getMonth() + 1) + '月' + d.getDate() + '日' });
+          h(hd, 'span', { cls: 'rw-muted', text: '星期' + '日一二三四五六'[d.getDay()] + ' · ' + logs.filter((x) => x.date === e.date).length + ' 条' });
+          dayList = h(tl, 'div', { cls: 'rw-tl-list' });
+        }
+        const it = h(dayList, 'div', { cls: 'rw-tl-item' });
+        h(it, 'div', { cls: 'rw-tl-time', text: e.time });
+        h(it, 'div', { cls: 'rw-tl-dot' });
+        const body = h(it, 'div', { cls: 'rw-tl-body' });
+        h(body, 'span', { cls: 'rw-tl-text', text: e.text });
+        for (const t of e.tags) h(body, 'span', { cls: 'rw-tagchip', text: '#' + t });
+        if (e.project) { const c = this.projectChip(body, e.project); c.classList.add('is-clickable'); c.addEventListener('click', () => this.index.byName.has(e.project) && this.openProject(e.project)); }
+        const acts = h(it, 'div', { cls: 'rw-tl-acts' });
+        const eb = h(acts, 'button', { cls: 'rw-iconbtn', title: '修改' }); ic(eb, 'pencil');
+        eb.addEventListener('click', () => this.plugin.promptText('修改记录（' + e.date + ' ' + e.time + '）', e.raw.replace(/^\s*[-*] \d{1,2}:\d{2}\s+/, ''), (v) => (v ? this.plugin.editLog(e, '- ' + e.time + ' ' + v) : null)));
+        this.trashBtn(acts, '删除这条记录', async () => { const ok = await this.plugin.confirmDelete({ title: '删除记录', lines: [e.date + ' ' + e.time + '　' + e.text], noTrashNote: true }); if (ok) this.plugin.editLog(e, null); });
+      }
+      const more = h(tl, 'div', { cls: 'rw-more' });
+      const mb = h(more, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(mb, 'chevrons-down'); h(mb, 'span', { text: '查看更早（再往前 7 天）' });
+      mb.addEventListener('click', () => { this.logDays = days + 7; this.render(); });
+      if (days > 7) { const lb = h(more, 'button', { cls: 'rw-linkbtn', text: '收起' }); lb.addEventListener('click', () => { this.logDays = 7; this.render(); }); }
+    });
+  }
+
+  /* ---- 灵感页：常用链接按钮 ---- */
+  renderInspireBar(el) {
+    const st = this.plugin.settings;
+    const box = h(el, 'div', { cls: 'rw-inspire' });
+    const top = h(box, 'div', { cls: 'rw-inspire-top' });
+    ic(top, 'sparkles', 'rw-icon rw-inspire-icon');
+    const qi = h(top, 'input', { cls: 'rw-inspire-input', attr: { type: 'text', placeholder: '输入关键词，再点下面的网站去找灵感（不输入则打开网站首页）' } });
+    qi.value = this.inspireQ || '';
+    qi.addEventListener('input', () => (this.inspireQ = qi.value));
+    const mg = h(top, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(mg, 'settings-2'); h(mg, 'span', { text: '管理链接' });
+    mg.addEventListener('click', () => this.plugin.manageLinksModal());
+    const btns = h(box, 'div', { cls: 'rw-inspire-btns' });
+    const go = (lk) => this.plugin.openInspireLink(lk, qi.value.trim());
+    st.inspireLinks.forEach((lk) => {
+      const b = h(btns, 'button', { cls: 'rw-linkchip', title: lk.url });
+      const av = h(b, 'span', { cls: 'rw-linkchip-av', text: (lk.name || '?').trim().slice(0, 1).toUpperCase() });
+      av.style.setProperty('--lc', 'hsl(' + hue(lk.name || '') + ', 55%, 50%)');
+      h(b, 'span', { text: lk.name });
+      if (/\{q\}/.test(lk.url)) { const s2 = h(b, 'span', { cls: 'rw-linkchip-q', title: '支持关键词搜索' }); ic(s2, 'search'); }
+      b.addEventListener('click', () => go(lk));
+    });
+    const add = h(btns, 'button', { cls: 'rw-linkchip rw-linkchip-add', title: '添加常用链接' });
+    ic(add, 'plus'); h(add, 'span', { text: '添加' });
+    add.addEventListener('click', () => this.plugin.manageLinksModal(true));
+    qi.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing && st.inspireLinks[0]) go(st.inspireLinks.find((x) => /\{q\}/.test(x.url)) || st.inspireLinks[0]); });
+  }
+
+  /* ---------- 搜索 ---------- */
+  runSearch(full) {
+    const qv = this.searchInput.value.trim();
+    const drop = this.searchDrop;
+    clear(drop);
+    this.searchSel = -1;
+    if (!qv) { this.hideSearch(); return; }
+    drop.classList.add('is-open');
+    const ql = qv.toLowerCase();
+    const idx = this.plugin.buildIndex();
+    const meta = new Map();
+    for (const p of idx.projects) meta.set(p.file.path, p);
+    for (const n of idx.notes) meta.set(n.file.path, n);
+    const scored = [];
+    const dataPre = this.plugin.dataDir() + '/';
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if (f.path.startsWith(dataPre)) continue;
+      const m = meta.get(f.path);
+      let s = 0;
+      const bn = f.basename.toLowerCase();
+      if (bn === ql) s += 10;
+      if (bn.includes(ql)) s += 5;
+      if (f.path.toLowerCase().includes(ql)) s += 1;
+      if (m) {
+        const fm = m.fm || {};
+        const hay = [m.title, m.projectName, str(fm.tags), str(fm.authors), str(fm.journal), str(fm.description), str(fm.next)].join(' ').toLowerCase();
+        if (hay.includes(ql)) s += 3;
+        if (s) s += 1;
+      }
+      if (s) scored.push({ f, m, s });
+    }
+    scored.sort((a, b) => b.s - a.s || b.f.stat.mtime - a.f.stat.mtime);
+    const items = scored.slice(0, 20);
+    for (const it of items) this.searchItem(drop, it.f, it.m, null);
+    if (!items.length && !full) h(drop, 'div', { cls: 'rw-search-empty', text: '标题中没有匹配，按 Enter 搜索全文' });
+    if (full) this.fullTextSearch(drop, ql, new Set(items.map((x) => x.f.path)));
+    else h(drop, 'div', { cls: 'rw-search-foot', text: '↑↓ 选择 · Enter 打开 / 搜全文 · Esc 关闭' });
+  }
+
+  async fullTextSearch(drop, ql, seen) {
+    const head = h(drop, 'div', { cls: 'rw-search-sec', text: '全文匹配（搜索中…）' });
+    const idx = this.index || this.plugin.buildIndex();
+    const meta = new Map();
+    for (const p of idx.projects) meta.set(p.file.path, p);
+    for (const n of idx.notes) meta.set(n.file.path, n);
+    let found = 0;
+    const dataPre2 = this.plugin.dataDir() + '/';
+    const files = this.app.vault.getMarkdownFiles().filter((f) => !f.path.startsWith(dataPre2)).sort((a, b) => b.stat.mtime - a.stat.mtime).slice(0, 3000);
+    for (const f of files) {
+      if (seen.has(f.path)) continue;
+      const txt = await this.app.vault.cachedRead(f);
+      const i = txt.toLowerCase().indexOf(ql);
+      if (i < 0) continue;
+      const snip = (i > 30 ? '…' : '') + txt.slice(Math.max(0, i - 30), i + ql.length + 50).replace(/\s+/g, ' ');
+      this.searchItem(drop, f, meta.get(f.path), snip);
+      if (++found >= 30) break;
+    }
+    head.textContent = '全文匹配（' + found + (found >= 30 ? '+' : '') + '）';
+  }
+
+  searchItem(drop, f, m, snippet) {
+    const r = h(drop, 'div', { cls: 'rw-search-item' });
+    let iconName = 'file-text';
+    let label = '笔记';
+    if (m && m.kind === 'project') { iconName = 'folder-kanban'; label = '项目'; }
+    else if (m) { iconName = NOTE_TYPES[m.type].icon; label = NOTE_TYPES[m.type].label; }
+    ic(r, iconName, 'rw-row-icon');
+    const mid = h(r, 'div', { cls: 'rw-row-mid' });
+    h(mid, 'div', { cls: 'rw-row-title', text: (m && m.title) || f.basename });
+    h(mid, 'div', { cls: 'rw-row-sub', text: snippet || f.parent && f.parent.path || '' });
+    h(r, 'span', { cls: 'rw-type-chip', text: label });
+    r.addEventListener('click', () => { this.hideSearch(); this.plugin.openFile(f); });
+  }
+
+  onSearchKey(e) {
+    const items = Array.from(this.searchDrop.querySelectorAll('.rw-search-item'));
+    if (e.key === 'Escape') { this.hideSearch(); this.searchInput.blur(); return; }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!items.length) return;
+      this.searchSel = (this.searchSel + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+      items.forEach((x, i) => x.classList.toggle('is-selected', i === this.searchSel));
+      items[this.searchSel].scrollIntoView({ block: 'nearest' });
+      return;
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (this.searchSel >= 0 && items[this.searchSel]) items[this.searchSel].click();
+      else this.runSearch(true);
+    }
+  }
+  hideSearch() { if (this.searchDrop) { this.searchDrop.classList.remove('is-open'); clear(this.searchDrop); } }
+}
+
+/* ───────────────────────── 弹窗 ───────────────────────── */
+
+class NewProjectModal extends Modal {
+  constructor(app, plugin, preset) {
+    super(app);
+    this.plugin = plugin;
+    this.v = Object.assign({ name: '', kind: 'paper', stage: '', priority: '中', deadline: '', description: '', parent: '' }, preset || {});
+    if (!KINDS[this.v.kind]) this.v.kind = 'paper';
+  }
+  onOpen() {
+    const { contentEl } = this;
+    this.modalEl.classList.add('rw-newproj-modal');
+    this.titleEl.setText('新建项目');
+    contentEl.classList.add('rw-modal');
+    // 1) 选项目类型
+    h(contentEl, 'div', { cls: 'rw-field-label', text: '项目类型' });
+    const kinds = h(contentEl, 'div', { cls: 'rw-kind-grid' });
+    this.kindEls = {};
+    for (const k of KIND_ORDER) {
+      const d = KINDS[k];
+      const c = h(kinds, 'div', { cls: 'rw-kind-card' });
+      c.style.setProperty('--kc', d.color);
+      const top = h(c, 'div', { cls: 'rw-kind-card-top' });
+      ic(top, d.icon);
+      h(top, 'span', { text: d.label });
+      h(c, 'div', { cls: 'rw-kind-card-desc', text: d.desc });
+      h(c, 'div', { cls: 'rw-kind-card-flow', text: d.stages.length ? d.stages.map((x) => x.id).join(' → ') : '无流程 · 只存文件' });
+      c.addEventListener('click', () => this.setKind(k));
+      this.kindEls[k] = c;
+    }
+    // 2) 基本信息
+    new Setting(contentEl).setName('项目名称').addText((t) => { t.setPlaceholder('例如：DOA 对抗攻击论文 / 某团队 SIM 工作研读').setValue(this.v.name).onChange((x) => (this.v.name = x)); setTimeout(() => t.inputEl.focus(), 30); });
+    new Setting(contentEl).setName('一句话描述').addText((t) => t.setValue(this.v.description).onChange((x) => (this.v.description = x)));
+    this.stageSet = new Setting(contentEl).setName('当前阶段');
+    this.stageSet.addDropdown((d) => { this.stageDd = d; d.onChange((x) => (this.v.stage = x)); });
+    this.parentSet = new Setting(contentEl).setName('所属研究方向').setDesc('可选：把这个项目挂到某个「研究方向」下面');
+    const dirs = this.plugin.buildIndex().projects.filter((p) => p.pkind === 'direction');
+    this.parentSet.addDropdown((d) => { d.addOption('', '（无）'); dirs.forEach((p) => d.addOption(p.name, p.title)); d.setValue(this.v.parent || '').onChange((x) => (this.v.parent = x)); });
+    this.hasDirs = dirs.length > 0;
+    new Setting(contentEl).setName('优先级').addDropdown((d) => { PRIORITIES.forEach((x) => d.addOption(x, x)); d.setValue(this.v.priority).onChange((x) => (this.v.priority = x)); });
+    new Setting(contentEl).setName('截止日期').setDesc('可选，例如投稿、汇报或申报截止日期').addText((t) => { t.inputEl.type = 'date'; t.setValue(this.v.deadline).onChange((x) => (this.v.deadline = x)); });
+    new Setting(contentEl).addButton((b) => b.setButtonText('创建项目').setCta().onClick(() => this.submit()));
+    contentEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing && e.target.tagName === 'INPUT') this.submit(); });
+    this.setKind(this.v.kind, true);
+  }
+  setKind(k, initial) {
+    this.v.kind = k;
+    for (const key of Object.keys(this.kindEls)) this.kindEls[key].classList.toggle('is-active', key === k);
+    const stages = stagesOfKind(k);
+    const sel = this.stageDd.selectEl;
+    clear(sel);
+    for (const st of stages) this.stageDd.addOption(st.id, st.id);
+    if (!(initial && stages.some((x) => x.id === this.v.stage))) this.v.stage = stages[0] ? stages[0].id : '';
+    if (stages.length) this.stageDd.setValue(this.v.stage);
+    this.stageSet.settingEl.style.display = stages.length ? '' : 'none';
+    this.parentSet.settingEl.style.display = this.hasDirs && k !== 'direction' ? '' : 'none';
+    if (k === 'direction') this.v.parent = '';
+  }
+  async submit() {
+    if (this.busy) return;
+    const name = sanitize(this.v.name || '');
+    if (!name) { new Notice('请输入项目名称'); return; }
+    this.busy = true;
+    try {
+      const file = await this.plugin.createProject(Object.assign({}, this.v, { name }));
+      if (file) { this.close(); if (this.v.onDone) this.v.onDone(file); }
+    } finally { this.busy = false; }
+  }
+  onClose() { this.contentEl.empty ? this.contentEl.empty() : clear(this.contentEl); }
+}
+
+class NewNoteModal extends Modal {
+  constructor(app, plugin, preset) {
+    super(app);
+    this.plugin = plugin;
+    this.v = Object.assign({ type: 'idea', title: '', project: '', open: true }, preset || {});
+  }
+  onOpen() {
+    const { contentEl } = this;
+    this.titleEl.setText('新建科研笔记');
+    contentEl.classList.add('rw-modal');
+    new Setting(contentEl).setName('类型').addDropdown((d) => { Object.keys(NOTE_TYPES).forEach((k) => d.addOption(k, NOTE_TYPES[k].label)); d.setValue(this.v.type).onChange((x) => (this.v.type = x)); });
+    new Setting(contentEl).setName('标题').addText((t) => { t.setPlaceholder('例如：2026-10 组会 / Smith 2024 综述').setValue(this.v.title).onChange((x) => (this.v.title = x)); setTimeout(() => t.inputEl.focus(), 30); });
+    const projects = this.plugin.buildIndex().projects.filter((p) => p.status !== '已完成' || p.name === this.v.project);
+    new Setting(contentEl).setName('所属项目').addDropdown((d) => { d.addOption('', '（不归属项目）'); projects.forEach((p) => d.addOption(p.name, p.title)); d.setValue(this.v.project || '').onChange((x) => (this.v.project = x)); });
+    new Setting(contentEl).setName('创建后打开').addToggle((t) => t.setValue(this.v.open).onChange((x) => (this.v.open = x)));
+    new Setting(contentEl).addButton((b) => b.setButtonText('创建').setCta().onClick(() => this.submit()));
+    contentEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) this.submit(); });
+  }
+  async submit() {
+    if (this.busy) return;
+    if (!this.v.title.trim()) { new Notice('请输入标题'); return; }
+    this.busy = true;
+    try {
+      const f = await this.plugin.createNote(this.v);
+      if (f) this.close();
+    } finally { this.busy = false; }
+  }
+  onClose() { this.contentEl.empty ? this.contentEl.empty() : clear(this.contentEl); }
+}
+
+class PromptEditModal extends Modal {
+  constructor(app, plugin, p, isNew) { super(app); this.plugin = plugin; this.orig = p && !isNew ? p : null; this.v = { title: (p && p.title) || '', text: (p && p.text) || '', tags: ((p && p.tags) || []).join(', ') }; }
+  onOpen() {
+    const c = this.contentEl;
+    this.modalEl.classList.add('rw-prompt-modal');
+    c.classList.add('rw-modal');
+    this.titleEl.setText(this.orig ? '编辑提示词' : '新建提示词');
+    new Setting(c).setName('标题').addText((t) => { t.setPlaceholder('例如：润色英文摘要').setValue(this.v.title).onChange((x) => (this.v.title = x)); setTimeout(() => t.inputEl.focus(), 30); });
+    new Setting(c).setName('标签').setDesc('用逗号分隔，便于筛选，如：写作, 读文献').addText((t) => t.setValue(this.v.tags).onChange((x) => (this.v.tags = x)));
+    h(c, 'div', { cls: 'rw-field-label', text: '提示词内容' });
+    const ta = h(c, 'textarea', { cls: 'rw-prompt-ta', attr: { rows: '12', placeholder: '把常问 AI 的话写在这里。需要每次替换的部分写成 {{变量名}}，例如 {{段落}}、{{项目}}；复制时会弹窗让你填写。' } });
+    ta.value = this.v.text;
+    ta.addEventListener('input', () => (this.v.text = ta.value));
+    h(c, 'div', { cls: 'rw-muted', text: '小技巧：变量 {{项目}} 会提供项目下拉选择；{{今天}} 会自动填今天的日期。' });
+    new Setting(c).addButton((b) => b.setButtonText('取消').onClick(() => this.close())).addButton((b) => b.setButtonText('保存').setCta().onClick(() => this.save()));
+  }
+  async save() {
+    const title = this.v.title.trim() || this.v.text.trim().slice(0, 20);
+    if (!this.v.text.trim()) { new Notice('请填写提示词内容'); return; }
+    const tags = this.v.tags.split(/[,，\s]+/).map((x) => x.replace(/^#/, '').trim()).filter(Boolean);
+    const st = this.plugin.settings;
+    if (this.orig) Object.assign(this.orig, { title, text: this.v.text, tags, updated: Date.now() });
+    else st.prompts.push({ id: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title, text: this.v.text, tags, created: Date.now(), updated: Date.now(), used: 0 });
+    await this.plugin.saveSettings();
+    new Notice('已保存提示词：' + title);
+    this.close();
+    this.plugin.refreshViews();
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+class PromptFillModal extends Modal {
+  constructor(app, plugin, p, vars, onDone) { super(app); this.plugin = plugin; this.p = p; this.vars = vars; this.vals = {}; this.onDone = onDone; }
+  onOpen() {
+    const c = this.contentEl;
+    this.modalEl.classList.add('rw-prompt-modal');
+    c.classList.add('rw-modal');
+    this.titleEl.setText('填写：' + this.p.title);
+    const projects = this.plugin.buildIndex().projects;
+    let first = true;
+    for (const v of this.vars) {
+      if (/^今天|日期$/.test(v)) { this.vals[v] = today(); continue; }
+      const st = new Setting(c).setName(v);
+      if (/项目/.test(v) && projects.length) {
+        st.addDropdown((d) => { d.addOption('', '（选择项目）'); projects.forEach((p) => d.addOption(p.name, p.title)); d.onChange((x) => (this.vals[v] = x)); });
+      } else {
+        st.settingEl.classList.add('rw-setting-block');
+        const ta = h(st.settingEl, 'textarea', { cls: 'rw-prompt-ta rw-prompt-ta-sm', attr: { rows: '3', placeholder: '填写「' + v + '」，留空则保留原样' } });
+        ta.addEventListener('input', () => (this.vals[v] = ta.value));
+        if (first) { setTimeout(() => ta.focus(), 30); first = false; }
+      }
+    }
+    new Setting(c).addButton((b) => b.setButtonText('复制原文（不填）').onClick(() => this.finish(false))).addButton((b) => b.setButtonText('复制').setCta().onClick(() => this.finish(true)));
+  }
+  finish(fill) { this.close(); this.onDone(fill ? fillPrompt(this.p.text, this.vals) : this.p.text); }
+  onClose() { clear(this.contentEl); }
+}
+
+class ThemeModal extends Modal {
+  constructor(app, plugin) { super(app); this.plugin = plugin; }
+  onOpen() {
+    this.modalEl.classList.add('rw-theme-modal');
+    this.titleEl.setText('工作台主题');
+    this.draw();
+  }
+  draw() {
+    const c = this.contentEl;
+    clear(c);
+    c.classList.add('rw-modal');
+    const st = this.plugin.settings;
+    const pick = async (key) => { st.theme = key; await this.plugin.saveSettings(); this.plugin.applyThemeAll(); this.draw(); };
+    h(c, 'div', { cls: 'rw-field-label', text: '背景配色（只影响科研工作台页面）' });
+    const grid = h(c, 'div', { cls: 'rw-theme-grid' });
+    for (const k of THEME_ORDER) {
+      const t = THEMES[k];
+      const card = h(grid, 'div', { cls: 'rw-theme-card' + ((st.theme || 'obsidian') === k ? ' is-active' : '') });
+      const sw = h(card, 'div', { cls: 'rw-theme-sw' });
+      if (t.bg) {
+        sw.style.background = t.bg;
+        const s1 = h(sw, 'i'); s1.style.background = t.surface; s1.style.borderColor = t.border;
+        const s2 = h(sw, 'b'); s2.style.background = t.accent;
+        const s3 = h(sw, 'u'); s3.style.background = t.text;
+      } else { sw.classList.add('is-follow'); ic(sw, 'monitor'); }
+      h(card, 'div', { cls: 'rw-theme-name', text: t.label });
+      card.addEventListener('click', () => pick(k));
+    }
+    // 自定义
+    const cus = h(c, 'div', { cls: 'rw-theme-custom' + (st.theme === 'custom' ? ' is-active' : '') });
+    h(cus, 'b', { text: '自定义' });
+    const mkColor = (label, key, def) => {
+      const l = h(cus, 'label', { cls: 'rw-theme-color' });
+      h(l, 'span', { text: label });
+      const inp = h(l, 'input', { attr: { type: 'color' } });
+      inp.value = st[key] || def;
+      inp.addEventListener('input', async () => { st[key] = inp.value; st.theme = 'custom'; this.plugin.applyThemeAll(); this.plugin.saveSettingsSoon(); cus.classList.add('is-active'); grid.querySelectorAll('.is-active').forEach((x) => x.classList.remove('is-active')); });
+    };
+    mkColor('背景色', 'customBg', '#1e2430');
+    mkColor('强调色', 'customAccent', '#d4f27a');
+    h(cus, 'span', { cls: 'rw-muted', text: '其余颜色（卡片、边框、文字）会根据背景深浅自动搭配' });
+    // 分区着色
+    new Setting(c).setName('分区着色').setDesc('首页的科研日志、流程看板、图表、日历、列表各用一种淡淡的底色，更容易区分')
+      .addToggle((t) => t.setValue(!!st.panelTint).onChange(async (v) => { st.panelTint = v; await this.plugin.saveSettings(); this.plugin.applyThemeAll(); }));
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+class AddTaskModal extends Modal {
+  constructor(app, plugin, preset) { super(app); this.plugin = plugin; this.v = Object.assign({ text: '', date: today(), time: '', project: '' }, preset || {}); }
+  onOpen() {
+    const c = this.contentEl;
+    c.classList.add('rw-modal');
+    this.titleEl.setText('添加待办');
+    new Setting(c).setName('要做什么').addText((t) => { t.setPlaceholder('例如：和导师讨论实验结果').setValue(this.v.text).onChange((x) => (this.v.text = x)); t.inputEl.style.width = '320px'; setTimeout(() => t.inputEl.focus(), 30); });
+    new Setting(c).setName('日期').addText((t) => { t.inputEl.type = 'date'; t.setValue(this.v.date).onChange((x) => (this.v.date = x)); });
+    new Setting(c).setName('时间').setDesc('可选；填了会出现在日历周视图的对应时段').addText((t) => { t.inputEl.type = 'time'; t.setValue(this.v.time).onChange((x) => (this.v.time = x)); });
+    const projects = this.plugin.buildIndex().projects.filter((p) => p.status !== '已完成');
+    new Setting(c).setName('所属项目').setDesc('写进该项目主页的「待办」小节；不选则写进 科研/计划.md').addDropdown((d) => { d.addOption('', '（不属于项目）'); projects.forEach((p) => d.addOption(p.name, p.title)); d.setValue(this.v.project).onChange((x) => (this.v.project = x)); });
+    new Setting(c).addButton((b) => b.setButtonText('添加').setCta().onClick(() => this.submit()));
+    c.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing && e.target.tagName === 'INPUT') this.submit(); });
+  }
+  async submit() {
+    if (this.busy) return;
+    if (!this.v.text.trim()) { new Notice('请填写待办内容'); return; }
+    this.busy = true;
+    try { await this.plugin.addTask(this.v); this.close(); } finally { this.busy = false; }
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+class LinksModal extends Modal {
+  constructor(app, plugin, addNew) { super(app); this.plugin = plugin; this.links = plugin.settings.inspireLinks.map((x) => Object.assign({}, x)); if (addNew) this.links.push({ name: '', url: '' }); }
+  onOpen() {
+    this.modalEl.classList.add('rw-links-modal');
+    this.titleEl.setText('管理灵感链接');
+    this.draw();
+  }
+  draw() {
+    const c = this.contentEl;
+    clear(c);
+    c.classList.add('rw-modal');
+    h(c, 'div', { cls: 'rw-muted', text: '网址里写 {q} 的地方会替换成你输入的关键词，例如 https://scholar.google.com/scholar?q={q}；不写 {q} 就直接打开该网址。' });
+    const list = h(c, 'div', { cls: 'rw-links-list' });
+    this.links.forEach((lk, i) => {
+      const r = h(list, 'div', { cls: 'rw-links-row' });
+      const n = h(r, 'input', { cls: 'rw-links-name', attr: { type: 'text', placeholder: '名称' } }); n.value = lk.name;
+      n.addEventListener('input', () => (lk.name = n.value));
+      const u = h(r, 'input', { cls: 'rw-links-url', attr: { type: 'text', placeholder: 'https://…{q}…' } }); u.value = lk.url;
+      u.addEventListener('input', () => (lk.url = u.value));
+      const up = h(r, 'button', { cls: 'rw-iconbtn', title: '上移' }); ic(up, 'arrow-up');
+      up.addEventListener('click', () => { if (i > 0) { [this.links[i - 1], this.links[i]] = [this.links[i], this.links[i - 1]]; this.draw(); } });
+      const del = h(r, 'button', { cls: 'rw-iconbtn', title: '删除' }); ic(del, 'trash-2');
+      del.addEventListener('click', () => { this.links.splice(i, 1); this.draw(); });
+      if (!lk.name && i === this.links.length - 1) setTimeout(() => n.focus(), 30);
+    });
+    new Setting(c)
+      .addButton((b) => b.setButtonText('＋ 添加一个').onClick(() => { this.links.push({ name: '', url: '' }); this.draw(); }))
+      .addButton((b) => b.setButtonText('恢复默认').onClick(() => { this.links = DEFAULT_INSPIRE_LINKS.map((x) => Object.assign({}, x)); this.draw(); }))
+      .addButton((b) => b.setButtonText('保存').setCta().onClick(async () => {
+        this.plugin.settings.inspireLinks = this.links.filter((x) => x.name.trim() && x.url.trim()).map((x) => ({ name: x.name.trim(), url: x.url.trim() }));
+        await this.plugin.saveSettings();
+        this.close();
+        this.plugin.refreshViews();
+      }));
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+class ConfirmDeleteModal extends Modal {
+  /* o: { title, lines: [], choices: [[value, label]], confirmText } → resolve(choice | true | null) */
+  constructor(app, o, resolve) { super(app); this.o = o; this.resolve = resolve; this.done = false; this.choice = o.choices ? o.choices[0][0] : true; }
+  onOpen() {
+    const c = this.contentEl;
+    this.modalEl.classList.add('rw-confirm-modal');
+    c.classList.add('rw-modal');
+    this.titleEl.setText(this.o.title);
+    const box = h(c, 'div', { cls: 'rw-confirm-body' });
+    for (const l of this.o.lines || []) h(box, 'div', { text: l });
+    if (this.o.choices) {
+      const g = h(c, 'div', { cls: 'rw-confirm-choices' });
+      this.o.choices.forEach(([v, label], idx) => {
+        const lab = h(g, 'label', { cls: 'rw-confirm-choice' });
+        const r = h(lab, 'input', { attr: { type: 'radio', name: 'rw-del-choice' } });
+        r.checked = idx === 0;
+        r.addEventListener('change', () => { if (r.checked) this.choice = v; });
+        h(lab, 'span', { text: label });
+      });
+    }
+    if (!this.o.noTrashNote) h(c, 'div', { cls: 'rw-muted rw-confirm-note', text: '删除的内容会进入回收站（系统回收站或 Obsidian 的 .trash 文件夹，取决于 Obsidian「文件与链接」设置），可以从那里找回。' });
+    new Setting(c)
+      .addButton((b) => b.setButtonText('取消').onClick(() => this.close()))
+      .addButton((b) => { b.setButtonText(this.o.confirmText || '删除'); if (this.o.noTrashNote) b.setCta(); else if (b.setWarning) b.setWarning(); b.onClick(() => { this.done = true; this.close(); this.resolve(this.choice); }); });
+  }
+  onClose() { clear(this.contentEl); if (!this.done) this.resolve(null); }
+}
+
+class TextPromptModal extends Modal {
+  constructor(app, title, value, onSubmit) { super(app); this.t = title; this.value = value || ''; this.onSubmit = onSubmit; }
+  onOpen() {
+    this.titleEl.setText(this.t);
+    new Setting(this.contentEl).addText((t) => {
+      t.setValue(this.value).onChange((x) => (this.value = x));
+      t.inputEl.style.width = '100%';
+      t.inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) this.done(); });
+      setTimeout(() => t.inputEl.focus(), 30);
+    });
+    new Setting(this.contentEl).addButton((b) => b.setButtonText('保存').setCta().onClick(() => this.done()));
+  }
+  done() { this.close(); this.onSubmit(this.value.trim()); }
+  onClose() { this.contentEl.empty ? this.contentEl.empty() : clear(this.contentEl); }
+}
+
+/* ───────────────────────── 文件预览 ───────────────────────── */
+
+const TEXT_EXTS = ['txt', 'csv', 'tsv', 'json', 'xml', 'yaml', 'yml', 'log', 'dat', 'xy', 'py', 'm', 'r', 'rmd', 'jl', 'sh', 'bat', 'ps1', 'cpp', 'c', 'h', 'java', 'js', 'ts', 'tex', 'bib', 'ris', 'enw', 'ini', 'cfg', 'toml', 'css', 'sql'];
+const IMG_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp'];
+const AV_EXTS = ['mp3', 'wav', 'm4a', 'ogg', 'flac', 'webm', 'mp4', 'mov', 'mkv', 'aac'];
+
+/* 极简 zip 读取（docx / pptx / xlsx 都是 zip），用浏览器自带的 DecompressionStream 解压 */
+async function unzipEntries(buf, wanted) {
+  const u8 = new Uint8Array(buf);
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  let eocd = -1;
+  for (let i = u8.length - 22; i >= Math.max(0, u8.length - 65557); i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) throw new Error('文件可能已损坏，或不是 Office 2007 以后的格式（.ppt / .doc / .xls 旧格式无法预览）');
+  const n = dv.getUint16(eocd + 10, true);
+  let off = dv.getUint32(eocd + 16, true);
+  const dec = new TextDecoder();
+  const out = {};
+  for (let k = 0; k < n; k++) {
+    if (dv.getUint32(off, true) !== 0x02014b50) break;
+    const method = dv.getUint16(off + 10, true);
+    const csize = dv.getUint32(off + 20, true);
+    const nameLen = dv.getUint16(off + 28, true);
+    const extraLen = dv.getUint16(off + 30, true);
+    const cmtLen = dv.getUint16(off + 32, true);
+    const lho = dv.getUint32(off + 42, true);
+    const name = dec.decode(u8.subarray(off + 46, off + 46 + nameLen));
+    off += 46 + nameLen + extraLen + cmtLen;
+    if (!wanted(name)) continue;
+    const start = lho + 30 + dv.getUint16(lho + 26, true) + dv.getUint16(lho + 28, true);
+    const data = u8.subarray(start, start + csize);
+    if (method === 0) out[name] = data.slice();
+    else if (method === 8) out[name] = new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
+  }
+  return out;
+}
+function xmlDoc(bytes) { return new DOMParser().parseFromString(new TextDecoder().decode(bytes), 'application/xml'); }
+function tagText(node, tag) { return Array.from(node.getElementsByTagName(tag)).map((t) => t.textContent).join(''); }
+function colIndex(ref) { const m = String(ref || '').match(/^([A-Z]+)/); if (!m) return 0; let n = 0; for (const ch of m[1]) n = n * 26 + (ch.charCodeAt(0) - 64); return n - 1; }
+function parseCsv(text, delim) {
+  const rows = [];
+  let row = [], cur = '', inQ = false;
+  for (let i = 0; i < text.length && rows.length < 201; i++) {
+    const ch = text[i];
+    if (inQ) { if (ch === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else inQ = false; } else cur += ch; }
+    else if (ch === '"') inQ = true;
+    else if (ch === delim) { row.push(cur); cur = ''; }
+    else if (ch === '\n' || ch === '\r') { if (ch === '\r' && text[i + 1] === '\n') i++; row.push(cur); rows.push(row); row = []; cur = ''; }
+    else cur += ch;
+  }
+  if (cur || row.length) { row.push(cur); rows.push(row); }
+  return rows;
+}
+function renderGrid(parent, rows, note) {
+  const wrap = h(parent, 'div', { cls: 'rw-pv-tablewrap' });
+  const t = h(wrap, 'table', { cls: 'rw-pv-table' });
+  const maxCols = Math.min(30, Math.max(0, ...rows.map((r) => r.length)));
+  rows.slice(0, 200).forEach((r, i) => {
+    const tr = h(t, 'tr');
+    h(tr, i === 0 ? 'th' : 'td', { cls: 'rw-pv-rownum', text: i + 1 });
+    for (let c = 0; c < maxCols; c++) h(tr, i === 0 ? 'th' : 'td', { text: r[c] != null ? r[c] : '' });
+  });
+  if (note) h(parent, 'div', { cls: 'rw-muted rw-pv-note', text: note });
+}
+
+/* ---- PPTX 幻灯片渲染：按 xml 里的位置 / 颜色 / 字号把每页画出来（近似效果，用于快速判断） ---- */
+const PPT_DEFAULT_SCHEME = { dk1: '000000', lt1: 'FFFFFF', dk2: '44546A', lt2: 'E7E6E6', accent1: '4472C4', accent2: 'ED7D31', accent3: 'A5A5A5', accent4: 'FFC000', accent5: '5B9BD5', accent6: '70AD47', hlink: '0563C1', folHlink: '954F72' };
+function kids(el, name) { return el ? Array.from(el.children).filter((c) => c.nodeName === name) : []; }
+function kid(el, name) { return el ? Array.from(el.children).find((c) => c.nodeName === name) || null : null; }
+function deep(el, name) { return el ? el.getElementsByTagName(name)[0] || null : null; }
+function relPath(base, target) {
+  if (target.startsWith('/')) return target.slice(1);
+  const parts = base.split('/'); parts.pop();
+  for (const seg of target.split('/')) { if (seg === '..') parts.pop(); else if (seg !== '.') parts.push(seg); }
+  return parts.join('/');
+}
+function relsPathOf(p) { const i = p.lastIndexOf('/'); return p.slice(0, i) + '/_rels/' + p.slice(i + 1) + '.rels'; }
+function parseRels(bytes, base) {
+  const m = {};
+  if (!bytes) return m;
+  for (const r of Array.from(xmlDoc(bytes).getElementsByTagName('Relationship'))) m[r.getAttribute('Id')] = { target: r.getAttribute('TargetMode') === 'External' ? null : relPath(base, r.getAttribute('Target')), type: r.getAttribute('Type') || '' };
+  return m;
+}
+function shade(hex, mods) {
+  let r = parseInt(hex.slice(0, 2), 16), g = parseInt(hex.slice(2, 4), 16), b = parseInt(hex.slice(4, 6), 16);
+  for (const md of mods) {
+    const v = Number(md.getAttribute('val')) / 100000;
+    if (md.nodeName === 'a:lumMod') { r *= v; g *= v; b *= v; }
+    else if (md.nodeName === 'a:lumOff') { r += 255 * v; g += 255 * v; b += 255 * v; }
+    else if (md.nodeName === 'a:tint') { r = r + (255 - r) * (1 - v); g = g + (255 - g) * (1 - v); b = b + (255 - b) * (1 - v); }
+    else if (md.nodeName === 'a:shade') { r *= v; g *= v; b *= v; }
+  }
+  const c = (x) => Math.max(0, Math.min(255, Math.round(x)));
+  const al = mods.find((m) => m.nodeName === 'a:alpha');
+  if (al) return 'rgba(' + [r, g, b].map(c).join(',') + ',' + (Number(al.getAttribute('val')) / 100000).toFixed(3) + ')';
+  return '#' + [r, g, b].map((x) => c(x).toString(16).padStart(2, '0')).join('');
+}
+class PptxRenderer {
+  constructor(z, getMedia) { this.z = z; this.getMedia = getMedia; this.cache = {}; }
+  doc(p) { if (!(p in this.cache)) this.cache[p] = this.z[p] ? xmlDoc(this.z[p]) : null; return this.cache[p]; }
+  init() {
+    const pres = this.doc('ppt/presentation.xml');
+    const sz = pres && deep(pres, 'p:sldSz');
+    this.cx = sz ? Number(sz.getAttribute('cx')) : 12192000;
+    this.cy = sz ? Number(sz.getAttribute('cy')) : 6858000;
+    // 幻灯片顺序以 presentation.xml 为准
+    const prels = parseRels(this.z['ppt/_rels/presentation.xml.rels'], 'ppt/presentation.xml');
+    const ids = pres ? Array.from(pres.getElementsByTagName('p:sldId')).map((s) => (prels[s.getAttribute('r:id')] || {}).target).filter(Boolean) : [];
+    this.slides = ids.length ? ids.filter((p) => this.z[p]) : Object.keys(this.z).filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n)).sort((a, b) => Number(a.match(/(\d+)\.xml/)[1]) - Number(b.match(/(\d+)\.xml/)[1]));
+    const th = this.doc('ppt/theme/theme1.xml');
+    this.scheme = Object.assign({}, PPT_DEFAULT_SCHEME);
+    const cs = th && deep(th, 'a:clrScheme');
+    if (cs) for (const c of Array.from(cs.children)) {
+      const k = c.nodeName.replace('a:', '');
+      const s = deep(c, 'a:srgbClr'), sy = deep(c, 'a:sysClr');
+      if (s) this.scheme[k] = s.getAttribute('val'); else if (sy) this.scheme[k] = sy.getAttribute('lastClr') || this.scheme[k];
+    }
+    const fs = th && deep(th, 'a:fontScheme');
+    this.font = fs ? ((deep(deep(fs, 'a:minorFont'), 'a:ea') || {}).getAttribute ? deep(deep(fs, 'a:minorFont'), 'a:ea').getAttribute('typeface') : '') || (deep(deep(fs, 'a:minorFont'), 'a:latin') || { getAttribute: () => '' }).getAttribute('typeface') : '';
+  }
+  color(el) {
+    if (!el) return null;
+    const s = kid(el, 'a:srgbClr') || (el.nodeName === 'a:srgbClr' ? el : null);
+    if (s) return shade(s.getAttribute('val'), Array.from(s.children));
+    const sc = kid(el, 'a:schemeClr') || (el.nodeName === 'a:schemeClr' ? el : null);
+    if (sc) {
+      let k = sc.getAttribute('val');
+      k = { tx1: 'dk1', bg1: 'lt1', tx2: 'dk2', bg2: 'lt2', phClr: 'accent1' }[k] || k;
+      return shade(this.scheme[k] || '000000', Array.from(sc.children));
+    }
+    const sy = kid(el, 'a:sysClr');
+    if (sy) return '#' + (sy.getAttribute('lastClr') || '000000');
+    const pc = kid(el, 'a:prstClr');
+    if (pc) return pc.getAttribute('val');
+    return null;
+  }
+  fillOf(spPr) {
+    if (!spPr || kid(spPr, 'a:noFill')) return null;
+    const sf = kid(spPr, 'a:solidFill');
+    if (sf) return this.color(sf);
+    const gf = kid(spPr, 'a:gradFill');
+    if (gf) { const stops = Array.from(gf.getElementsByTagName('a:gs')).map((g) => this.color(g)).filter(Boolean); if (stops.length) return 'linear-gradient(180deg,' + stops.join(',') + ')'; }
+    return null;
+  }
+  bgOf(docEl) {
+    const bg = docEl && deep(docEl, 'p:bg');
+    if (!bg) return null;
+    const pr = kid(bg, 'p:bgPr');
+    if (pr) {
+      const blip = deep(pr, 'a:blip');
+      if (blip) return { image: blip.getAttribute('r:embed') };
+      return { color: this.fillOf(pr) };
+    }
+    const ref = kid(bg, 'p:bgRef');
+    if (ref) return { color: this.color(ref) };
+    return null;
+  }
+  xfrmOf(sp) {
+    let x = null;
+    if (sp.nodeName === 'p:graphicFrame') x = kid(sp, 'p:xfrm');
+    else { const pr = kid(sp, 'p:spPr') || kid(sp, 'p:grpSpPr'); x = pr && kid(pr, 'a:xfrm'); }
+    if (!x) return null;
+    const off = kid(x, 'a:off'), ext = kid(x, 'a:ext');
+    if (!off || !ext) return null;
+    return { x: Number(off.getAttribute('x')), y: Number(off.getAttribute('y')), w: Number(ext.getAttribute('cx')), h: Number(ext.getAttribute('cy')), rot: Number(x.getAttribute('rot') || 0) / 60000, flipH: x.getAttribute('flipH') === '1', flipV: x.getAttribute('flipV') === '1', x0: x };
+  }
+  phOf(sp) { const nv = kid(sp, 'p:nvSpPr') || kid(sp, 'p:nvPicPr'); const ph = nv && deep(nv, 'p:ph'); return ph ? { type: ph.getAttribute('type') || 'body', idx: ph.getAttribute('idx') } : null; }
+  findPh(docEl, ph) {
+    if (!docEl) return null;
+    const sps = Array.from(docEl.getElementsByTagName('p:sp'));
+    const t = (x) => (x === 'ctrTitle' ? 'title' : x === 'subTitle' ? 'body' : x);
+    return sps.find((s) => { const p = this.phOf(s); return p && ph.idx != null && p.idx === ph.idx; }) || sps.find((s) => { const p = this.phOf(s); return p && t(p.type) === t(ph.type); }) || null;
+  }
+  async render(host, i, width) {
+    const path = this.slides[i];
+    const sd = this.doc(path);
+    const rels = parseRels(this.z[relsPathOf(path)], path);
+    const layoutP = Object.values(rels).find((r) => /slideLayout$/.test(r.type));
+    const layout = layoutP ? this.doc(layoutP.target) : null;
+    const lrels = layoutP ? parseRels(this.z[relsPathOf(layoutP.target)], layoutP.target) : {};
+    const masterP = Object.values(lrels).find((r) => /slideMaster$/.test(r.type));
+    const master = masterP ? this.doc(masterP.target) : null;
+    const mrels = masterP ? parseRels(this.z[relsPathOf(masterP.target)], masterP.target) : {};
+    const scale = width / this.cx;
+    const slide = h(host, 'div', { cls: 'rw-slide' });
+    slide.style.width = width + 'px';
+    slide.style.height = Math.round(this.cy * scale) + 'px';
+    slide.style.fontFamily = (this.font ? '"' + this.font + '", ' : '') + '"Microsoft YaHei", "PingFang SC", sans-serif';
+    let bg = this.bgOf(sd) && { b: this.bgOf(sd), rels } || this.bgOf(layout) && { b: this.bgOf(layout), rels: lrels } || this.bgOf(master) && { b: this.bgOf(master), rels: mrels };
+    slide.style.background = '#ffffff';
+    if (bg && bg.b.color) slide.style.background = bg.b.color;
+    if (bg && bg.b.image && bg.rels[bg.b.image]) { const url = await this.getMedia(bg.rels[bg.b.image].target); if (url) { slide.style.backgroundImage = 'url("' + url + '")'; slide.style.backgroundSize = 'cover'; } }
+    // 先画母版 / 版式里的非占位符图形（logo、装饰条），再画本页
+    const showMaster = sd.documentElement.getAttribute('showMasterSp') !== '0' && !(layout && layout.documentElement.getAttribute('showMasterSp') === '0');
+    if (showMaster && master) await this.drawTree(slide, deep(master, 'p:spTree'), mrels, scale, null, true, {});
+    if (layout && sd.documentElement.getAttribute('showMasterSp') !== '0') await this.drawTree(slide, deep(layout, 'p:spTree'), lrels, scale, null, true, {});
+    await this.drawTree(slide, deep(sd, 'p:spTree'), rels, scale, null, false, { layout, master });
+    return slide;
+  }
+  async drawTree(parent, tree, rels, scale, grp, skipPh, ctx) {
+    if (!tree) return;
+    for (const el of Array.from(tree.children)) {
+      try {
+        if (el.nodeName === 'p:sp' || el.nodeName === 'p:cxnSp') await this.drawShape(parent, el, rels, scale, grp, skipPh, ctx);
+        else if (el.nodeName === 'p:pic') await this.drawPic(parent, el, rels, scale, grp);
+        else if (el.nodeName === 'p:grpSp') {
+          const x = this.xfrmOf(el);
+          if (!x) continue;
+          const ch = kid(x.x0, 'a:chOff'), ce = kid(x.x0, 'a:chExt');
+          const g2 = { x: x.x, y: x.y, sx: ce && Number(ce.getAttribute('cx')) ? x.w / Number(ce.getAttribute('cx')) : 1, sy: ce && Number(ce.getAttribute('cy')) ? x.h / Number(ce.getAttribute('cy')) : 1, cx: ch ? Number(ch.getAttribute('x')) : 0, cy: ch ? Number(ch.getAttribute('y')) : 0, parent: grp };
+          await this.drawTree(parent, el, rels, scale, g2, skipPh, ctx);
+        } else if (el.nodeName === 'p:graphicFrame') this.drawFrame(parent, el, scale, grp);
+        else if (el.nodeName === 'mc:AlternateContent') { const fb = kid(el, 'mc:Fallback') || kid(el, 'mc:Choice'); if (fb) await this.drawTree(parent, fb, rels, scale, grp, skipPh, ctx); }
+      } catch (e) { /* 单个图形出错不影响整页 */ }
+    }
+  }
+  place(el, x, scale, grp) {
+    let X = x.x, Y = x.y, W = x.w, H = x.h;
+    for (let g = grp; g; g = g.parent) { X = g.x + (X - g.cx) * g.sx; Y = g.y + (Y - g.cy) * g.sy; W *= g.sx; H *= g.sy; }
+    el.style.left = X * scale + 'px';
+    el.style.top = Y * scale + 'px';
+    el.style.width = Math.max(1, W * scale) + 'px';
+    el.style.height = Math.max(1, H * scale) + 'px';
+    const tf = [];
+    if (x.rot) tf.push('rotate(' + x.rot + 'deg)');
+    if (x.flipH) tf.push('scaleX(-1)');
+    if (x.flipV) tf.push('scaleY(-1)');
+    if (tf.length) el.style.transform = tf.join(' ');
+    return { W: W * scale, H: H * scale };
+  }
+  async drawShape(parent, sp, rels, scale, grp, skipPh, ctx) {
+    const ph = this.phOf(sp);
+    if (skipPh && ph) return; // 母版 / 版式的占位符不显示（只是提示文字）
+    let x = this.xfrmOf(sp);
+    let inh = null;
+    if (ph && ctx) inh = this.findPh(ctx.layout, ph) || this.findPh(ctx.master, ph);
+    if (!x && inh) x = this.xfrmOf(inh);
+    if (!x) return;
+    const spPr = kid(sp, 'p:spPr');
+    const geom = spPr && kid(spPr, 'a:prstGeom') ? kid(spPr, 'a:prstGeom').getAttribute('prst') : 'rect';
+    const d = h(parent, 'div', { cls: 'rw-sl-sp' });
+    const box = this.place(d, x, scale, grp);
+    let fill = this.fillOf(spPr);
+    const style = kid(sp, 'p:style');
+    if (!fill && style && spPr && !kid(spPr, 'a:noFill') && kid(style, 'a:fillRef') && kid(style, 'a:fillRef').getAttribute('idx') !== '0') fill = this.color(kid(style, 'a:fillRef'));
+    const ln = spPr && kid(spPr, 'a:ln');
+    let lnColor = ln && !kid(ln, 'a:noFill') ? this.color(kid(ln, 'a:solidFill')) : null;
+    if (!lnColor && ln && !kid(ln, 'a:noFill') && style && kid(style, 'a:lnRef') && kid(style, 'a:lnRef').getAttribute('idx') !== '0') lnColor = this.color(kid(style, 'a:lnRef'));
+    const lnW = ln && ln.getAttribute('w') ? Math.max(1, Number(ln.getAttribute('w')) * scale) : 1;
+    if (geom === 'line' || sp.nodeName === 'p:cxnSp' || /Connector/.test(geom)) {
+      if (lnColor || !fill) {
+        d.classList.add('is-line');
+        const len = Math.sqrt(box.W * box.W + box.H * box.H);
+        const ang = Math.atan2(box.H * (x.flipV ? -1 : 1), box.W * (x.flipH ? -1 : 1)) * 180 / Math.PI;
+        d.style.width = Math.max(1, len) + 'px';
+        d.style.height = '0px';
+        d.style.borderTop = lnW + 'px solid ' + (lnColor || '#888');
+        d.style.transformOrigin = '0 0';
+        if (x.flipH) d.style.left = parseFloat(d.style.left) + box.W + 'px';
+        if (x.flipV) d.style.top = parseFloat(d.style.top) + box.H + 'px';
+        d.style.transform = 'rotate(' + ang + 'deg)';
+      }
+      return;
+    }
+    if (fill) d.style.background = fill;
+    if (lnColor) d.style.border = Math.min(lnW, 6) + 'px solid ' + lnColor;
+    if (geom === 'ellipse') d.style.borderRadius = '50%';
+    else if (geom === 'roundRect' || geom === 'round2SameRect') {
+      const gd = spPr && Array.from(spPr.getElementsByTagName('a:gd')).find((g) => /^adj1?$/.test(g.getAttribute('name')));
+      const adj = gd ? Number((gd.getAttribute('fmla') || '').replace(/[^\d.]/g, '')) / 100000 : 0.16667;
+      const rad = Math.min(box.W, box.H) * Math.min(0.5, adj) + 'px';
+      d.style.borderRadius = geom === 'roundRect' ? rad : rad + ' ' + rad + ' 0 0';
+    }
+    const tx = kid(sp, 'p:txBody');
+    if (tx) this.drawText(d, tx, scale, ph, inh);
+  }
+  drawText(d, tx, scale, ph, inh) {
+    const bp = kid(tx, 'a:bodyPr');
+    const ins = (k, def) => (bp && bp.getAttribute(k) != null ? Number(bp.getAttribute(k)) : def) * scale;
+    d.style.padding = ins('tIns', 45720) + 'px ' + ins('rIns', 91440) + 'px ' + ins('bIns', 45720) + 'px ' + ins('lIns', 91440) + 'px';
+    const anchor = bp && bp.getAttribute('anchor');
+    d.style.display = 'flex';
+    d.style.flexDirection = 'column';
+    d.style.justifyContent = anchor === 'ctr' ? 'center' : anchor === 'b' ? 'flex-end' : 'flex-start';
+    const autofit = bp && kid(bp, 'a:normAutofit');
+    const fscale = autofit && autofit.getAttribute('fontScale') ? Number(autofit.getAttribute('fontScale')) / 100000 : 1;
+    const isTitle = ph && /title/i.test(ph.type);
+    let defSz = isTitle ? 4000 : ph ? 2000 : 1800;
+    const inhRpr = inh && deep(inh, 'a:defRPr');
+    if (inhRpr && inhRpr.getAttribute('sz')) defSz = Number(inhRpr.getAttribute('sz'));
+    for (const p of kids(tx, 'a:p')) {
+      const pd = h(d, 'div', { cls: 'rw-sl-p' });
+      const pPr = kid(p, 'a:pPr');
+      const algn = pPr && pPr.getAttribute('algn');
+      pd.style.textAlign = algn === 'ctr' ? 'center' : algn === 'r' ? 'right' : algn === 'just' ? 'justify' : 'left';
+      const lvl = pPr ? Number(pPr.getAttribute('lvl') || 0) : 0;
+      const marL = pPr && pPr.getAttribute('marL') ? Number(pPr.getAttribute('marL')) : lvl * 457200;
+      if (marL) pd.style.paddingLeft = marL * scale + 'px';
+      const lnSpc = pPr && deep(pPr, 'a:lnSpc');
+      const pct = lnSpc && deep(lnSpc, 'a:spcPct');
+      pd.style.lineHeight = pct ? (Number(pct.getAttribute('val')) / 100000) * 1.15 : 1.2;
+      const spcB = pPr && deep(pPr, 'a:spcBef');
+      if (spcB && deep(spcB, 'a:spcPts')) pd.style.marginTop = (Number(deep(spcB, 'a:spcPts').getAttribute('val')) / 100) * 12700 * scale + 'px';
+      const runs = Array.from(p.children).filter((c) => c.nodeName === 'a:r' || c.nodeName === 'a:br' || c.nodeName === 'a:fld');
+      const bullet = pPr && kid(pPr, 'a:buChar');
+      const endR = kid(p, 'a:endParaRPr');
+      let firstSz = null;
+      if (!runs.length) { const sz = (endR && Number(endR.getAttribute('sz'))) || defSz; pd.style.height = (sz / 100) * 12700 * scale * fscale * 1.2 + 'px'; continue; }
+      if (bullet) { const b = h(pd, 'span', { text: bullet.getAttribute('char') + ' ' }); b.style.opacity = '.8'; }
+      for (const r of runs) {
+        if (r.nodeName === 'a:br') { h(pd, 'br'); continue; }
+        const rPr = kid(r, 'a:rPr');
+        const t = kid(r, 'a:t');
+        const s = h(pd, 'span', { text: t ? t.textContent : '' });
+        const sz = (rPr && Number(rPr.getAttribute('sz'))) || defSz;
+        if (firstSz == null) firstSz = sz;
+        s.style.fontSize = Math.max(3, (sz / 100) * 12700 * scale * fscale) + 'px';
+        if (rPr && rPr.getAttribute('b') === '1') s.style.fontWeight = '700';
+        if (rPr && rPr.getAttribute('i') === '1') s.style.fontStyle = 'italic';
+        if (rPr && rPr.getAttribute('u') && rPr.getAttribute('u') !== 'none') s.style.textDecoration = 'underline';
+        const c = rPr && this.color(kid(rPr, 'a:solidFill'));
+        if (c) s.style.color = c;
+        const lt = rPr && (kid(rPr, 'a:ea') || kid(rPr, 'a:latin'));
+        if (lt && lt.getAttribute('typeface') && !/^\+/.test(lt.getAttribute('typeface'))) s.style.fontFamily = '"' + lt.getAttribute('typeface') + '", inherit';
+        const base = rPr && rPr.getAttribute('baseline');
+        if (base) s.style.verticalAlign = Number(base) > 0 ? 'super' : 'sub';
+      }
+      if (bullet && pd.firstChild && firstSz) pd.firstChild.style.fontSize = (firstSz / 100) * 12700 * scale * fscale + 'px';
+    }
+  }
+  async drawPic(parent, pic, rels, scale, grp) {
+    const x = this.xfrmOf(pic);
+    if (!x) return;
+    const blip = deep(pic, 'a:blip');
+    const r = blip && rels[blip.getAttribute('r:embed')];
+    const d = h(parent, 'div', { cls: 'rw-sl-sp rw-sl-pic' });
+    this.place(d, x, scale, grp);
+    if (!r || !r.target) return;
+    const url = await this.getMedia(r.target);
+    if (!url) { d.classList.add('is-missing'); return; }
+    const img = h(d, 'img');
+    img.src = url;
+    const src = deep(pic, 'a:srcRect');
+    if (src) {
+      const l = Number(src.getAttribute('l') || 0) / 1e5, t = Number(src.getAttribute('t') || 0) / 1e5, rr = Number(src.getAttribute('r') || 0) / 1e5, b = Number(src.getAttribute('b') || 0) / 1e5;
+      const sw = 1 - l - rr, sh = 1 - t - b;
+      if (sw > 0 && sh > 0) { img.style.width = 100 / sw + '%'; img.style.height = 100 / sh + '%'; img.style.marginLeft = (-l / sw) * 100 + '%'; img.style.marginTop = (-t / sh) * 100 + '%'; img.style.objectFit = 'fill'; }
+    }
+  }
+  drawFrame(parent, gf, scale, grp) {
+    const x = this.xfrmOf(gf);
+    if (!x) return;
+    const tbl = deep(gf, 'a:tbl');
+    const d = h(parent, 'div', { cls: 'rw-sl-sp rw-sl-frame' });
+    this.place(d, x, scale, grp);
+    if (!tbl) { d.classList.add('is-chart'); h(d, 'span', { text: deep(gf, 'c:chart') ? '图表' : '对象' }); return; }
+    const t = h(d, 'table', { cls: 'rw-sl-tbl' });
+    for (const tr of kids(tbl, 'a:tr')) {
+      const r = h(t, 'tr');
+      const rh = Number(tr.getAttribute('h') || 0) * scale;
+      if (rh) r.style.height = rh + 'px';
+      for (const tc of kids(tr, 'a:tc')) {
+        if (tc.getAttribute('hMerge') === '1' || tc.getAttribute('vMerge') === '1') continue;
+        const c = h(r, 'td');
+        if (tc.getAttribute('gridSpan')) c.colSpan = Number(tc.getAttribute('gridSpan'));
+        if (tc.getAttribute('rowSpan')) c.rowSpan = Number(tc.getAttribute('rowSpan'));
+        const tcPr = kid(tc, 'a:tcPr');
+        const f = this.fillOf(tcPr);
+        if (f) c.style.background = f;
+        const tx = kid(tc, 'a:txBody');
+        if (tx) {
+          const inner = h(c, 'div');
+          this.drawText(inner, tx, scale, null, null);
+          inner.style.padding = '1px 3px';
+        }
+      }
+    }
+  }
+}
+
+class FilePreviewModal extends Modal {
+  /* entries: [{ kind: 'file'|'link', file, name, ext, extPath, projectName, cat, size, mtime }] */
+  constructor(app, plugin, entries, idx) { super(app); this.plugin = plugin; this.entries = entries; this.idx = idx || 0; }
+  onOpen() {
+    this.modalEl.classList.add('rw-preview-modal');
+    this.scope && this.scope.register && this.scope.register([], 'ArrowRight', () => { this.go(1); return false; });
+    this.scope && this.scope.register && this.scope.register([], 'ArrowLeft', () => { this.go(-1); return false; });
+    this.show();
+  }
+  go(d) {
+    if (this.entries.length < 2) return;
+    this.idx = (this.idx + d + this.entries.length) % this.entries.length;
+    this.show();
+  }
+  async show() {
+    const x = this.entries[this.idx];
+    const c = this.contentEl;
+    if (this.comp) { this.comp.unload(); this.comp = null; }
+    if (this.blobUrls) this.blobUrls.forEach((u) => URL.revokeObjectURL(u));
+    this.blobUrls = [];
+    if (this.pdfDoc) { try { this.pdfDoc.destroy(); } catch (e) { /* ignore */ } this.pdfDoc = null; }
+    clear(c);
+    c.classList.add('rw-modal');
+    this.titleEl.setText('');
+    const head = h(c, 'div', { cls: 'rw-pv-head' });
+    const iw = h(head, 'span', { cls: 'rw-ficon cat-' + (x.cat || 'other') });
+    ic(iw, x.ext === 'md' ? 'file-text' : fileIcon(x.ext));
+    const mid = h(head, 'div', { cls: 'rw-row-mid' });
+    h(mid, 'div', { cls: 'rw-pv-title', text: x.title || x.name });
+    const meta = [x.projectName ? '项目：' + x.projectName : '', x.cat && FILE_CATS[x.cat] ? FILE_CATS[x.cat].label : x.ext === 'md' ? '笔记' : '', fmtSize(x.size), x.mtime ? '修改于 ' + relTime(x.mtime) : '', x.kind === 'link' ? '库外：' + x.extPath : x.file.path];
+    h(mid, 'div', { cls: 'rw-row-sub rw-pv-meta', text: meta.filter(Boolean).join(' · ') });
+    const acts = h(head, 'div', { cls: 'rw-pv-acts' });
+    if (this.entries.length > 1) {
+      const nav = h(acts, 'div', { cls: 'rw-pv-nav' });
+      const pb = h(nav, 'button', { cls: 'rw-iconbtn', title: '上一个（←）' }); ic(pb, 'chevron-left'); pb.addEventListener('click', () => this.go(-1));
+      h(nav, 'span', { cls: 'rw-muted', text: (this.idx + 1) + ' / ' + this.entries.length });
+      const nb = h(nav, 'button', { cls: 'rw-iconbtn', title: '下一个（→）' }); ic(nb, 'chevron-right'); nb.addEventListener('click', () => this.go(1));
+    }
+    const ob = h(acts, 'button', { cls: 'rw-btn rw-btn-sm mod-cta' }); ic(ob, 'external-link'); h(ob, 'span', { text: '打开' });
+    ob.addEventListener('click', () => { this.close(); this.plugin.openEntry(x); });
+    const rb = h(acts, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(rb, 'folder-open'); h(rb, 'span', { text: '所在文件夹' });
+    rb.addEventListener('click', () => this.plugin.revealEntry(x));
+    const body = h(c, 'div', { cls: 'rw-pv-body' });
+    const loading = h(body, 'div', { cls: 'rw-empty-sm', text: '加载预览…' });
+    const token = (this.token = {});
+    try {
+      await this.renderBody(x, body);
+    } catch (e) {
+      if (this.token !== token) return;
+      clear(body);
+      const em = h(body, 'div', { cls: 'rw-pv-none' });
+      ic(em, 'eye-off');
+      h(em, 'div', { text: '无法预览：' + e.message });
+    }
+    if (this.token === token && loading.parentNode) loading.remove();
+  }
+  async readBin(x) {
+    if (x.kind === 'link') { const fs = require('fs'); const b = await fs.promises.readFile(x.extPath); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); }
+    return this.app.vault.readBinary(x.file);
+  }
+  async readText(x) {
+    if (x.kind === 'link') { const fs = require('fs'); return (await fs.promises.readFile(x.extPath)).toString('utf8'); }
+    return this.app.vault.cachedRead(x.file);
+  }
+  resUrl(x) {
+    if (x.kind === 'link') { const pre = (obsidian.Platform && obsidian.Platform.resourcePathPrefix) || 'app://local/'; return pre + String(x.extPath).replace(/\\/g, '/'); }
+    return this.app.vault.getResourcePath(x.file);
+  }
+  async renderMd(md, el, sourcePath) {
+    this.comp = new obsidian.Component();
+    this.comp.load();
+    const MR = obsidian.MarkdownRenderer;
+    if (MR && MR.render) await MR.render(this.app, md, el, sourcePath, this.comp);
+    else if (MR && MR.renderMarkdown) await MR.renderMarkdown(md, el, sourcePath, this.comp);
+    else h(el, 'pre', { text: md });
+  }
+  async renderBody(x, body) {
+    const ext = (x.ext || '').toLowerCase();
+    const size = x.size || 0;
+    const done = () => { const l = body.querySelector('.rw-empty-sm'); if (l) l.remove(); };
+    if (ext === 'md') {
+      const text = await this.readText(x);
+      done();
+      const el = h(body, 'div', { cls: 'rw-pv-md markdown-rendered' });
+      await this.renderMd(text.length > 200000 ? text.slice(0, 200000) + '\n\n…（内容过长，已截断）' : text, el, x.file ? x.file.path : '');
+      return;
+    }
+    if (IMG_EXTS.includes(ext)) { done(); const img = h(body, 'img', { cls: 'rw-pv-img' }); img.src = this.resUrl(x); return; }
+    if (ext === 'html' || ext === 'htm') {
+      if (size > 30e6) throw new Error('文件太大（' + fmtSize(size) + '），请直接打开');
+      const src = await this.readText(x);
+      done();
+      const bar = h(body, 'div', { cls: 'rw-pv-bar' });
+      const host = h(body, 'div', { cls: 'rw-pv-htmlhost' });
+      const showRendered = () => {
+        clear(host);
+        const fr = h(host, 'iframe', { cls: 'rw-pv-frame rw-pv-html', attr: { sandbox: 'allow-scripts allow-popups allow-popups-to-escape-sandbox', referrerpolicy: 'no-referrer' } });
+        // 让页面里的相对路径图片能找到（指向文件所在文件夹）
+        let base = '';
+        try { const u = this.resUrl(x).split('?')[0]; base = u.slice(0, u.lastIndexOf('/') + 1); } catch (e) { /* ignore */ }
+        fr.srcdoc = (base && !/<base\s/i.test(src) ? '<base href="' + base + '">' : '') + src;
+      };
+      const showSource = () => { clear(host); h(host, 'pre', { cls: 'rw-pv-pre', text: src.length > 200000 ? src.slice(0, 200000) + '\n…（已截断）' : src }); };
+      const seg = h(bar, 'div', { cls: 'rw-seg' });
+      const b1 = h(seg, 'button', { cls: 'rw-seg-btn is-active', text: '网页效果' });
+      const b2 = h(seg, 'button', { cls: 'rw-seg-btn', text: '源码' });
+      b1.addEventListener('click', () => { b1.classList.add('is-active'); b2.classList.remove('is-active'); showRendered(); });
+      b2.addEventListener('click', () => { b2.classList.add('is-active'); b1.classList.remove('is-active'); showSource(); });
+      h(bar, 'span', { cls: 'rw-muted', text: '预览里已禁止访问本机文件；联网字体 / 图片可能加载不全' });
+      showRendered();
+      return;
+    }
+    if (ext === 'pdf') {
+      // 用 Obsidian 自带的 pdf.js 把页面直接画出来（不带阅读器工具栏，适合快速浏览）
+      let pdfjs = null;
+      try { if (obsidian.loadPdfJs) pdfjs = await obsidian.loadPdfJs(); } catch (e) { pdfjs = null; }
+      if (!pdfjs) {
+        done();
+        if (x.kind === 'file') { const el = h(body, 'div', { cls: 'rw-pv-pdf' }); await this.renderMd('![[' + x.file.path + ']]', el, x.file.path); }
+        else { const fr = h(body, 'iframe', { cls: 'rw-pv-frame' }); fr.src = this.resUrl(x); }
+        return;
+      }
+      const buf = await this.readBin(x);
+      const pdf = await pdfjs.getDocument({ data: new Uint8Array(buf.slice(0)) }).promise;
+      const token = this.token;
+      done();
+      this.pdfDoc = pdf;
+      const total = pdf.numPages;
+      const bar = h(body, 'div', { cls: 'rw-pv-bar' });
+      h(bar, 'span', { cls: 'rw-muted', text: '共 ' + total + ' 页 · 快速预览（要批注 / 搜索请点「打开」）' });
+      h(bar, 'div', { cls: 'rw-spacer' });
+      const zoomSeg = h(bar, 'div', { cls: 'rw-seg' });
+      const zooms = [['fit', '适合宽度'], ['half', '两页并排']];
+      const mode = this.plugin.settings.pdfZoom || 'fit';
+      for (const [v, label] of zooms) {
+        const b = h(zoomSeg, 'button', { cls: 'rw-seg-btn' + (mode === v ? ' is-active' : ''), text: label });
+        b.addEventListener('click', () => { this.plugin.settings.pdfZoom = v; this.plugin.saveSettingsSoon(); this.show(); });
+      }
+      const list = h(body, 'div', { cls: 'rw-pdf-pages' + (mode === 'half' ? ' is-half' : '') });
+      const avail = Math.max(300, (body.clientWidth || 900) - 24);
+      const width = mode === 'half' ? Math.floor((avail - 14) / 2) : Math.min(avail, 960);
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      let shown = 0;
+      const more = h(body, 'div', { cls: 'rw-more' });
+      const step = async () => {
+        clear(more);
+        const end = Math.min(total, shown + (mode === 'half' ? 6 : 3));
+        for (; shown < end; shown++) {
+          if (this.token !== token) return;
+          const wrap = h(list, 'div', { cls: 'rw-pdf-page' });
+          const cv = h(wrap, 'canvas');
+          h(wrap, 'div', { cls: 'rw-pdf-no', text: (shown + 1) + ' / ' + total });
+          try {
+            const page = await pdf.getPage(shown + 1);
+            const vp0 = page.getViewport({ scale: 1 });
+            const vp = page.getViewport({ scale: (width / vp0.width) * dpr });
+            cv.width = Math.floor(vp.width);
+            cv.height = Math.floor(vp.height);
+            cv.style.width = width + 'px';
+            cv.style.height = Math.floor(vp.height / dpr) + 'px';
+            await page.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
+          } catch (e) { h(wrap, 'div', { cls: 'rw-muted', text: '第 ' + (shown + 1) + ' 页渲染失败：' + e.message }); }
+        }
+        if (shown < total) {
+          const b = h(more, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(b, 'chevrons-down');
+          h(b, 'span', { text: '再显示 ' + Math.min(mode === 'half' ? 6 : 3, total - shown) + ' 页（还有 ' + (total - shown) + ' 页）' });
+          b.addEventListener('click', step);
+        }
+      };
+      await step();
+      return;
+    }
+    if (AV_EXTS.includes(ext)) {
+      done();
+      const isVideo = ['mp4', 'mov', 'mkv', 'webm'].includes(ext);
+      const m = h(body, isVideo ? 'video' : 'audio', { cls: isVideo ? 'rw-pv-video' : 'rw-pv-audio', attr: { controls: '' } });
+      m.src = this.resUrl(x);
+      return;
+    }
+    if (TEXT_EXTS.includes(ext) || (!size || size < 2e6) && ['', 'txt'].includes(ext)) {
+      if (size > 20e6) throw new Error('文件太大（' + fmtSize(size) + '），请直接打开');
+      let text = await this.readText(x);
+      done();
+      if (['csv', 'tsv'].includes(ext) || (ext === 'dat' || ext === 'txt' || ext === 'xy') && /^[^\n]*[,\t;][^\n]*\n/.test(text.slice(0, 2000))) {
+        const delim = ext === 'tsv' || /\t/.test(text.slice(0, 500)) ? '\t' : /;/.test(text.split('\n')[0]) && !/,/.test(text.split('\n')[0]) ? ';' : ',';
+        const rows = parseCsv(text.slice(0, 2e6), delim);
+        const total = text.split('\n').length;
+        renderGrid(body, rows, total > 200 ? '只显示前 200 行（共约 ' + total + ' 行）' : '共 ' + rows.length + ' 行');
+        return;
+      }
+      if (text.length > 100000) text = text.slice(0, 100000) + '\n…（已截断）';
+      h(body, 'pre', { cls: 'rw-pv-pre', text });
+      return;
+    }
+    if (['docx', 'pptx', 'xlsx', 'xlsm'].includes(ext)) {
+      if (size > 200e6) throw new Error('文件太大（' + fmtSize(size) + '），请直接打开');
+      const buf = await this.readBin(x);
+      if (ext === 'docx') {
+        const z = await unzipEntries(buf, (n) => n === 'word/document.xml');
+        if (!z['word/document.xml']) throw new Error('读取不到正文');
+        const doc = xmlDoc(z['word/document.xml']);
+        const paras = Array.from(doc.getElementsByTagName('w:p')).map((p) => ({ text: tagText(p, 'w:t'), style: (p.getElementsByTagName('w:pStyle')[0] || { getAttribute: () => '' }).getAttribute('w:val') || '' })).filter((p) => p.text.trim());
+        done();
+        const el = h(body, 'div', { cls: 'rw-pv-doc' });
+        let chars = 0;
+        for (const p of paras) {
+          if (chars > 30000) { h(el, 'p', { cls: 'rw-muted', text: '…（只预览前 3 万字）' }); break; }
+          const isH = /heading|标题|^[1-9]$/i.test(p.style);
+          h(el, isH ? 'h4' : 'p', { text: p.text });
+          chars += p.text.length;
+        }
+        if (!paras.length) h(el, 'p', { cls: 'rw-muted', text: '（文档里没有文字内容）' });
+        return;
+      }
+      if (ext === 'pptx') {
+        const z = await unzipEntries(buf, (n) => (n.startsWith('ppt/') && /\.(xml|rels)$/.test(n) && !n.startsWith('ppt/notesSlides/')) || n === 'docProps/thumbnail.jpeg');
+        const mediaCache = {};
+        const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', svg: 'image/svg+xml', bmp: 'image/bmp', webp: 'image/webp', tif: 'image/tiff', tiff: 'image/tiff' };
+        const getMedia = async (target) => {
+          if (target in mediaCache) return mediaCache[target];
+          const mt = MIME[extOf(target)];
+          if (!mt) return (mediaCache[target] = null); // emf / wmf 等矢量格式浏览器画不了
+          const got = await unzipEntries(buf, (n) => n === target);
+          if (!got[target]) return (mediaCache[target] = null);
+          const url = URL.createObjectURL(new Blob([got[target]], { type: mt }));
+          this.blobUrls.push(url);
+          return (mediaCache[target] = url);
+        };
+        const R = new PptxRenderer(z, getMedia);
+        R.init();
+        done();
+        const total = R.slides.length;
+        const bar = h(body, 'div', { cls: 'rw-pv-bar' });
+        const seg = h(bar, 'div', { cls: 'rw-seg' });
+        const bS = h(seg, 'button', { cls: 'rw-seg-btn', text: '幻灯片' });
+        const bT = h(seg, 'button', { cls: 'rw-seg-btn', text: '文字大纲' });
+        h(bar, 'span', { cls: 'rw-muted', text: '共 ' + total + ' 页 · 幻灯片为近似还原，字体 / 特效以 PowerPoint 为准' });
+        const host = h(body, 'div');
+        const token = this.token;
+        const showSlides = async () => {
+          bS.classList.add('is-active'); bT.classList.remove('is-active');
+          clear(host);
+          const list = h(host, 'div', { cls: 'rw-slides' });
+          const width = Math.max(320, Math.min(900, (body.clientWidth || 900) - 40));
+          let shown = 0;
+          const more = h(host, 'div', { cls: 'rw-more' });
+          const step = async () => {
+            clear(more);
+            const end = Math.min(total, shown + 6);
+            for (; shown < end; shown++) {
+              if (this.token !== token) return;
+              const wrap = h(list, 'div', { cls: 'rw-slide-wrap' });
+              h(wrap, 'div', { cls: 'rw-slide-no', text: shown + 1 });
+              try { await R.render(wrap, shown, width); } catch (e) { h(wrap, 'div', { cls: 'rw-muted', text: '第 ' + (shown + 1) + ' 页渲染失败：' + e.message }); }
+            }
+            if (shown < total) { const b = h(more, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(b, 'chevrons-down'); h(b, 'span', { text: '再显示 ' + Math.min(6, total - shown) + ' 页（还有 ' + (total - shown) + ' 页）' }); b.addEventListener('click', step); }
+          };
+          await step();
+        };
+        const showText = () => {
+          bT.classList.add('is-active'); bS.classList.remove('is-active');
+          clear(host);
+          const el = h(host, 'div', { cls: 'rw-pv-slides' });
+          R.slides.forEach((n, i) => {
+            const doc = R.doc(n);
+            const paras = Array.from(doc.getElementsByTagName('a:p')).map((p) => tagText(p, 'a:t')).filter((t) => t.trim());
+            const card = h(el, 'div', { cls: 'rw-pv-slide' });
+            h(card, 'div', { cls: 'rw-pv-slide-no', text: i + 1 });
+            const tx = h(card, 'div', { cls: 'rw-pv-slide-text' });
+            if (!paras.length) h(tx, 'div', { cls: 'rw-muted', text: '（无文字，可能是图片页）' });
+            paras.slice(0, 10).forEach((t, j) => h(tx, 'div', { cls: j === 0 ? 'rw-pv-slide-title' : '', text: t }));
+            if (paras.length > 10) h(tx, 'div', { cls: 'rw-muted', text: '…' });
+          });
+        };
+        bS.addEventListener('click', showSlides);
+        bT.addEventListener('click', showText);
+        if (!total) h(host, 'div', { cls: 'rw-muted', text: '（没有幻灯片）' });
+        else await showSlides();
+        return;
+      }
+      // xlsx
+      const z = await unzipEntries(buf, (n) => n === 'xl/sharedStrings.xml' || n === 'xl/workbook.xml' || /^xl\/worksheets\/sheet\d+\.xml$/.test(n));
+      const shared = z['xl/sharedStrings.xml'] ? Array.from(xmlDoc(z['xl/sharedStrings.xml']).getElementsByTagName('si')).map((si) => tagText(si, 't')) : [];
+      const names = z['xl/workbook.xml'] ? Array.from(xmlDoc(z['xl/workbook.xml']).getElementsByTagName('sheet')).map((s) => s.getAttribute('name')) : [];
+      const sheets = Object.keys(z).filter((n) => n.startsWith('xl/worksheets/')).sort((a, b) => Number(a.match(/(\d+)\.xml/)[1]) - Number(b.match(/(\d+)\.xml/)[1]));
+      done();
+      const drawSheet = (si, host) => {
+        clear(host);
+        const doc = xmlDoc(z[sheets[si]]);
+        const rows = [];
+        for (const r of Array.from(doc.getElementsByTagName('row')).slice(0, 200)) {
+          const ri = Number(r.getAttribute('r') || rows.length + 1) - 1;
+          const arr = [];
+          for (const cEl of Array.from(r.getElementsByTagName('c'))) {
+            const ci = colIndex(cEl.getAttribute('r'));
+            if (ci > 29) continue;
+            const t = cEl.getAttribute('t');
+            const v = cEl.getElementsByTagName('v')[0];
+            let val = '';
+            if (t === 's' && v) val = shared[Number(v.textContent)] || '';
+            else if (t === 'inlineStr') val = tagText(cEl, 't');
+            else if (v) val = v.textContent;
+            arr[ci] = val;
+          }
+          rows[ri] = arr;
+        }
+        const dense = [];
+        for (let i = 0; i < rows.length; i++) dense.push(rows[i] || []);
+        renderGrid(host, dense.length ? dense : [['（空表）']], dense.length >= 200 ? '只显示前 200 行' : '');
+      };
+      if (sheets.length > 1) {
+        const tabs = h(body, 'div', { cls: 'rw-catbar' });
+        const host = h(body, 'div');
+        sheets.forEach((s, i) => {
+          const b = h(tabs, 'button', { cls: 'rw-catchip' + (i === 0 ? ' is-active' : ''), text: names[i] || 'Sheet' + (i + 1) });
+          b.addEventListener('click', () => { tabs.querySelectorAll('.rw-catchip').forEach((e) => e.classList.remove('is-active')); b.classList.add('is-active'); drawSheet(i, host); });
+        });
+        drawSheet(0, host);
+      } else if (sheets.length) drawSheet(0, h(body, 'div'));
+      else h(body, 'div', { cls: 'rw-muted', text: '（没有工作表）' });
+      return;
+    }
+    done();
+    const em = h(body, 'div', { cls: 'rw-pv-none' });
+    ic(em, 'eye-off');
+    h(em, 'div', { text: '「.' + ext + '」格式暂不支持预览' });
+    h(em, 'div', { cls: 'rw-muted', text: '可预览：PDF、图片、音视频、Word、PPT、Excel、CSV / TXT / 代码、Markdown 笔记' });
+  }
+  onClose() {
+    if (this.pdfDoc) { try { this.pdfDoc.destroy(); } catch (e) { /* ignore */ } this.pdfDoc = null; }
+    if (this.comp) this.comp.unload();
+    if (this.blobUrls) this.blobUrls.forEach((u) => URL.revokeObjectURL(u));
+    clear(this.contentEl);
+  }
+}
+
+class ImportFilesModal extends Modal {
+  constructor(app, plugin, files, ctx) {
+    super(app);
+    this.plugin = plugin;
+    ctx = ctx || {};
+    const thr = (plugin.settings.linkThresholdMB || 200) * 1048576;
+    this.items = files.map((f) => {
+      const ext = extOf(f.name);
+      if (ext === 'md' || ext === 'markdown') {
+        // Markdown 默认当作笔记导入：在笔记页里拖入 → 该类型；文件名像日期 → 会议纪要
+        const nt = ctx.noteType || (dateFromName(f.name) ? 'meeting' : 'idea');
+        return { f, name: f.name, size: f.size, ext: 'md', cat: 'note:' + nt, path: fsPathOf(f) };
+      }
+      let cat = catOfExt(ext);
+      if (ctx.cat && (cat === 'other' || (cat === 'image' && (ctx.cat === 'data' || ctx.cat === 'meeting')))) cat = ctx.cat;
+      return { f, name: f.name, size: f.size, ext, cat, path: fsPathOf(f) };
+    });
+    this.project = ctx.project || '';
+    // 放到哪：'auto' 按类型自动归档；'' 项目自由空间（根目录）；其他 = 项目内文件夹相对路径
+    this.dest = 'auto';
+    if (ctx.folder && this.project) {
+      const base = plugin.projectDir(this.project);
+      if (ctx.folder === base) this.dest = '';
+      else if (ctx.folder.startsWith(base + '/')) this.dest = ctx.folder.slice(base.length + 1);
+    }
+    this.anyPath = this.items.some((x) => x.path);
+    this.mode = this.anyPath && this.items.some((x) => x.size > thr) ? 'link' : 'copy';
+    this.makeLit = true;
+    this.makeMeeting = true;
+  }
+  onOpen() {
+    const c = this.contentEl;
+    this.modalEl.classList.add('rw-import-modal');
+    c.classList.add('rw-modal');
+    this.titleEl.setText('导入 ' + this.items.length + ' 个文件');
+    const list = h(c, 'div', { cls: 'rw-import-list' });
+    for (const it of this.items) {
+      const r = h(list, 'div', { cls: 'rw-import-row' });
+      const iw = h(r, 'span', { cls: 'rw-ficon cat-' + it.cat.replace('note:', '') });
+      ic(iw, it.ext === 'md' ? 'file-text' : fileIcon(it.ext));
+      const mid = h(r, 'div', { cls: 'rw-row-mid' });
+      h(mid, 'div', { cls: 'rw-row-title', text: it.name });
+      h(mid, 'div', { cls: 'rw-row-sub', text: fmtSize(it.size) + (it.path ? '' : '') });
+      const sel = h(r, 'select', { cls: 'dropdown rw-select rw-select-sm' });
+      if (it.ext === 'md') {
+        for (const k of Object.keys(NOTE_TYPES)) { const o = h(sel, 'option', { text: '笔记：' + NOTE_TYPES[k].label }); o.value = 'note:' + k; }
+      }
+      for (const k of Object.keys(FILE_CATS)) { const o = h(sel, 'option', { text: (it.ext === 'md' ? '文件：' : '') + FILE_CATS[k].label }); o.value = k; }
+      sel.value = it.cat;
+      sel.addEventListener('change', () => { it.cat = sel.value; iw.className = 'rw-ficon cat-' + it.cat.replace('note:', ''); this.updateDest(); });
+      if (it.ext !== 'md') { sel.classList.add('rw-cat-sel'); it.sel = sel; }
+    }
+    const projects = this.plugin.buildIndex().projects.filter((p) => p.status !== '已完成' || p.name === this.project);
+    new Setting(c).setName('放进哪个项目').addDropdown((d) => {
+      d.addOption('', '（不归属项目）');
+      projects.forEach((p) => d.addOption(p.name, p.title));
+      d.setValue(this.project).onChange((v) => { this.project = v; if (!v) this.dest = 'auto'; else if (this.dest !== 'auto' && this.dest !== '') this.dest = 'auto'; this.drawDestPick(); this.updateDest(); });
+    });
+    this.destPickEl = h(c, 'div');
+    this.drawDestPick();
+    const modeSet = new Setting(c).setName('保存方式');
+    modeSet.addDropdown((d) => {
+      d.addOption('copy', '复制进库（推荐：随库备份、同步）');
+      if (this.anyPath) d.addOption('link', '只记录链接（文件留在原位置，适合很大的数据）');
+      d.setValue(this.mode).onChange((v) => { this.mode = v; this.updateDest(); });
+    });
+    if (!this.anyPath) modeSet.setDesc('当前环境拿不到文件原路径，只能复制进库。');
+    else if (this.mode === 'link') modeSet.setDesc('有文件超过 ' + this.plugin.settings.linkThresholdMB + ' MB，已默认改为只记录链接。');
+    if (this.items.some((x) => x.ext === 'pdf')) {
+      new Setting(c).setName('为文献 PDF 创建阅读笔记').setDesc('分类为「文献」的 PDF 会自动生成一条文献笔记并链接原文').addToggle((t) => t.setValue(this.makeLit).onChange((v) => (this.makeLit = v)));
+    }
+    if (this.items.some((x) => FILE_CATS.meeting.exts.includes(x.ext))) {
+      new Setting(c).setName('为录音 / 视频创建会议纪要').setDesc('自动生成会议纪要笔记，并在笔记里嵌入播放器').addToggle((t) => t.setValue(this.makeMeeting).onChange((v) => (this.makeMeeting = v)));
+    }
+    this.destEl = h(c, 'div', { cls: 'rw-dest' });
+    this.updateDest();
+    new Setting(c).addButton((b) => b.setButtonText('导入').setCta().onClick(() => this.submit()));
+  }
+  drawDestPick() {
+    const el = this.destPickEl;
+    if (!el) return;
+    clear(el);
+    if (!this.project) return;
+    const pl = this.plugin;
+    const list = pl.projectFolderList(this.project);
+    const st = new Setting(el).setName('放到项目里的哪个位置').setDesc('可以选一个文件夹，或直接放在项目的自由空间里；以后在项目详情页的「项目文件夹」里也能整理');
+    st.addDropdown((d) => {
+      d.addOption('auto', '按文件类型自动归档（PPT→汇报、数据→数据…）');
+      d.addOption('', '📂 项目自由空间（不放进任何文件夹）');
+      for (const f of list) d.addOption(f.rel, '\u3000'.repeat(f.depth) + '📁 ' + f.name + (f.auto ? '（自动归档）' : ''));
+      if (this.dest && this.dest !== 'auto' && !list.some((f) => f.rel === this.dest)) d.addOption(this.dest, '📁 ' + this.dest + '（新建）');
+      d.addOption('__new', '＋ 新建文件夹…');
+      d.setValue(this.dest);
+      d.onChange((v) => {
+        if (v === '__new') {
+          d.setValue(this.dest);
+          const parent = this.dest && this.dest !== 'auto' ? this.dest : '';
+          new TextPromptModal(this.app, '新文件夹名称' + (parent ? '（建在「' + parent + '」里）' : '（建在项目根目录）'), '', (name) => {
+            name = sanitize(String(name || '').trim()).replace(/[\\/]/g, '-');
+            if (!name) return;
+            this.dest = parent ? parent + '/' + name : name;
+            this.drawDestPick(); this.updateDest();
+          }).open();
+          return;
+        }
+        this.dest = v; this.updateDest();
+      });
+    });
+  }
+  targetFolder() {
+    if (!this.project || this.dest === 'auto') return '';
+    const base = this.plugin.projectDir(this.project);
+    return this.dest ? normalizePath(base + '/' + this.dest) : base;
+  }
+  updateDest() {
+    if (!this.destEl) return;
+    const tf = this.targetFolder();
+    for (const it of this.items) if (it.sel) it.sel.style.display = tf ? 'none' : '';
+    const folders = tf ? [tf] : [...new Set(this.items.map((x) => this.plugin.catFolder(this.project, x.cat)))];
+    this.destEl.textContent = (this.mode === 'link' ? '链接笔记将保存到：' : '保存到：') + folders.join('、') + (tf && !this.app.vault.getAbstractFileByPath(tf) ? '（会自动新建这个文件夹）' : '');
+  }
+  async submit() {
+    if (this.busy) return;
+    this.busy = true;
+    try {
+      await this.plugin.importFiles(this.items, { project: this.project, folder: this.targetFolder(), mode: this.mode, makeLit: this.makeLit, makeMeeting: this.makeMeeting });
+      this.close();
+    } finally { this.busy = false; }
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+class PdfPickModal extends Modal {
+  constructor(app, plugin, n) { super(app); this.plugin = plugin; this.n = n; this.q = ''; }
+  onOpen() {
+    const c = this.contentEl;
+    this.modalEl.classList.add('rw-folderpick-modal');
+    c.classList.add('rw-modal');
+    this.titleEl.setText('给「' + this.n.title + '」关联 PDF');
+    const inp = h(c, 'input', { cls: 'rw-filter-input rw-pdfpick-q', attr: { type: 'text', placeholder: '搜索库里的 PDF…' } });
+    inp.addEventListener('input', () => { this.q = inp.value.trim().toLowerCase(); this.drawList(); });
+    this.listEl = h(c, 'div', { cls: 'rw-fp-list' });
+    const nb = h(c, 'button', { cls: 'rw-btn rw-btn-sm' });
+    ic(nb, 'upload'); h(nb, 'span', { text: '从电脑选一个 PDF 导入并关联…' });
+    nb.addEventListener('click', () => this.importPdf());
+    this.drawList();
+    setTimeout(() => inp.focus(), 30);
+  }
+  drawList() {
+    const el = this.listEl;
+    clear(el);
+    const n = this.n;
+    const projDir = n.projectName ? this.plugin.projectDir(n.projectName) + '/' : '';
+    const words = (n.title || '').toLowerCase().split(/[^a-z0-9\u4e00-\u9fa5]+/).filter((w) => w.length > 3);
+    const score = (f) => (projDir && f.path.startsWith(projDir) ? 100 : 0) + words.filter((w) => f.basename.toLowerCase().includes(w)).length * 10;
+    let pdfs = this.app.vault.getFiles().filter((f) => (f.extension || '').toLowerCase() === 'pdf');
+    if (this.q) pdfs = pdfs.filter((f) => f.path.toLowerCase().includes(this.q));
+    pdfs.sort((a, b) => score(b) - score(a) || b.stat.mtime - a.stat.mtime);
+    if (!pdfs.length) { h(el, 'div', { cls: 'rw-empty-sm', text: this.q ? '没有匹配的 PDF' : '库里还没有 PDF，可以点下面的按钮导入一个' }); return; }
+    for (const f of pdfs.slice(0, 80)) {
+      const r = h(el, 'div', { cls: 'rw-row rw-fp-row' });
+      ic(r, 'file-text', 'rw-row-icon');
+      const mid = h(r, 'div', { cls: 'rw-row-mid' });
+      h(mid, 'div', { cls: 'rw-row-title', text: f.basename });
+      h(mid, 'div', { cls: 'rw-row-sub', text: f.parent ? f.parent.path : '' });
+      r.addEventListener('click', async () => { await this.link(f); });
+    }
+  }
+  async link(f) {
+    await this.plugin.setField(this.n.file, 'pdf', '[[' + f.path + ']]');
+    new Notice('已关联 PDF：' + f.name);
+    this.close();
+  }
+  importPdf() {
+    const input = document.createElement('input');
+    input.type = 'file'; input.accept = '.pdf,application/pdf'; input.style.display = 'none';
+    document.body.appendChild(input);
+    input.addEventListener('change', async () => {
+      const file = input.files && input.files[0];
+      input.remove();
+      if (!file) return;
+      const folder = this.n.file.parent && this.n.file.parent.path !== '/' ? this.n.file.parent.path : this.plugin.settings.rootFolder;
+      const tf = await this.app.vault.createBinary(this.plugin.uniqueFilePath(folder, file.name), await file.arrayBuffer());
+      await this.link(tf);
+    });
+    input.click();
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+class FolderPickModal extends Modal {
+  constructor(app, plugin, project, o, cb) { super(app); this.plugin = plugin; this.project = project; this.o = o; this.cb = cb; }
+  onOpen() {
+    const c = this.contentEl;
+    this.modalEl.classList.add('rw-folderpick-modal');
+    c.classList.add('rw-modal');
+    this.titleEl.setText(this.o.title || '选择文件夹');
+    this.draw();
+  }
+  draw() {
+    const c = this.contentEl;
+    clear(c);
+    const pl = this.plugin;
+    const base = pl.projectDir(this.project);
+    const list = h(c, 'div', { cls: 'rw-fp-list' });
+    const row = (label, path, depth, icon, sub) => {
+      const r = h(list, 'div', { cls: 'rw-row rw-fp-row' });
+      r.style.paddingLeft = 10 + depth * 18 + 'px';
+      ic(r, icon, 'rw-row-icon');
+      const mid = h(r, 'div', { cls: 'rw-row-mid' });
+      h(mid, 'div', { cls: 'rw-row-title', text: label });
+      if (sub) h(mid, 'div', { cls: 'rw-row-sub', text: sub });
+      r.addEventListener('click', async () => { this.close(); await this.cb(path); });
+    };
+    row('项目自由空间（' + this.project + ' 根目录）', base, 0, 'folder-open');
+    for (const f of pl.projectFolderList(this.project)) row(f.name, f.path, f.depth + 1, 'folder', f.auto ? '工作台自动归档' : '');
+    const nb = h(c, 'button', { cls: 'rw-btn rw-btn-sm rw-fp-new' });
+    ic(nb, 'folder-plus'); h(nb, 'span', { text: '新建文件夹…' });
+    nb.addEventListener('click', () => new TextPromptModal(this.app, '新文件夹名称（建在项目根目录，可用 / 建多级）', '', async (v) => {
+      const parts = String(v || '').split('/').map((x) => sanitize(x.trim())).filter(Boolean);
+      if (!parts.length) return;
+      const np = normalizePath(base + '/' + parts.join('/'));
+      await pl.ensureFolder(np);
+      this.close();
+      await this.cb(np);
+    }).open());
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+class ZoteroImportModal extends Modal {
+  constructor(app, plugin, preset) {
+    super(app);
+    this.plugin = plugin;
+    preset = preset || {};
+    this.project = preset.project || '';
+    this.status = '待读';
+    this.annotations = !!plugin.settings.zoteroAnnotations;
+    this.collection = plugin.settings.zoteroLastCollection || '';
+    this.query = '';
+    this.items = [];
+    this.selected = new Map();
+  }
+  async onOpen() {
+    this.modalEl.classList.add('rw-zotero-modal');
+    this.titleEl.setText('从 Zotero 导入文献');
+    const c = this.contentEl;
+    c.classList.add('rw-modal');
+    this.statusEl = h(c, 'div', { cls: 'rw-zstatus', text: '正在连接本机 Zotero…' });
+    this.bodyEl = h(c, 'div');
+    await this.connect();
+  }
+  async connect() {
+    clear(this.bodyEl);
+    this.statusEl.className = 'rw-zstatus';
+    this.statusEl.textContent = '正在连接本机 Zotero…';
+    const st = await this.plugin.zoteroStatus();
+    if (!st.ok) {
+      this.statusEl.classList.add('is-error');
+      clear(this.statusEl);
+      ic(this.statusEl, 'alert-triangle');
+      h(this.statusEl, 'span', { text: st.code === 'disabled' ? 'Zotero 已打开，但还没开启本地接口' : '没有连上 Zotero' });
+      const help = h(this.bodyEl, 'div', { cls: 'rw-zhelp' });
+      const steps = st.code === 'disabled'
+        ? ['在 Zotero 7 中打开：编辑 → 设置（macOS：Zotero → 设置）', '进入「高级」→「杂项」，勾选「允许此计算机上的其他应用程序与 Zotero 通讯」', '回到这里点「重试」；如果还不行，完全退出并重新打开 Zotero 后再试']
+        : ['确认已安装并打开 Zotero 7（导入时需要保持运行）', '在 Zotero 设置 → 高级 中勾选「允许此计算机上的其他应用程序与 Zotero 通讯」', '如果改过端口，在工作台设置里填写相同端口（默认 23119）', '回到这里点「重试」'];
+      const ol = h(help, 'ol');
+      for (const s of steps) h(ol, 'li', { text: s });
+      h(help, 'div', { cls: 'rw-muted', text: '详情：' + (st.message || '') });
+      new Setting(this.bodyEl).addButton((b) => b.setButtonText('重试').setCta().onClick(() => this.connect()));
+      return;
+    }
+    this.statusEl.classList.add('is-ok');
+    clear(this.statusEl);
+    ic(this.statusEl, 'check-circle');
+    h(this.statusEl, 'span', { text: '已连接本机 Zotero 文库' });
+    this.buildUI();
+    try {
+      const cols = await this.plugin.zCollections();
+      for (const col of cols) { const o = h(this.collSel, 'option', { text: col.label }); o.value = col.key; }
+      this.collSel.value = cols.some((x) => x.key === this.collection) ? this.collection : '';
+      this.collection = this.collSel.value;
+    } catch (e) { console.warn('[科研工作台] 读取 Zotero 分类失败', e); }
+    await this.load();
+  }
+  buildUI() {
+    const c = this.bodyEl;
+    const bar = h(c, 'div', { cls: 'rw-zbar' });
+    this.collSel = h(bar, 'select', { cls: 'dropdown rw-select' });
+    const o = h(this.collSel, 'option', { text: '我的文库（全部）' });
+    o.value = '';
+    this.collSel.addEventListener('change', () => {
+      this.collection = this.collSel.value;
+      this.plugin.settings.zoteroLastCollection = this.collection;
+      this.plugin.saveSettingsSoon();
+      this.load();
+    });
+    const qi = h(bar, 'input', { cls: 'rw-filter-input rw-zq', attr: { type: 'text', placeholder: '搜索标题 / 作者 / 年份，按 Enter' } });
+    qi.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); this.query = qi.value.trim(); this.load(); } });
+    this.allCb = h(bar, 'label', { cls: 'rw-check' });
+    const cb = h(this.allCb, 'input', { attr: { type: 'checkbox' } });
+    h(this.allCb, 'span', { text: '全选' });
+    cb.addEventListener('change', () => {
+      for (const it of this.items) if (!it._imported) { if (cb.checked) this.selected.set(it.key, it); else this.selected.delete(it.key); }
+      this.renderList();
+    });
+    this.listEl = h(c, 'div', { cls: 'rw-zlist' });
+    const projects = this.plugin.buildIndex().projects.filter((p) => p.status !== '已完成' || p.name === this.project);
+    new Setting(c).setName('导入到项目').addDropdown((d) => {
+      d.addOption('', '（不归属项目，放进文献库）');
+      projects.forEach((p) => d.addOption(p.name, p.title));
+      d.setValue(this.project).onChange((v) => (this.project = v));
+    });
+    new Setting(c).setName('阅读状态').addDropdown((d) => {
+      NOTE_TYPES.literature.statuses.forEach((s) => d.addOption(s, s));
+      d.setValue(this.status).onChange((v) => (this.status = v));
+    });
+    new Setting(c).setName('同时导入 PDF 高亮和批注').addToggle((t) => t.setValue(this.annotations).onChange((v) => (this.annotations = v)));
+    const s = new Setting(c);
+    s.addButton((b) => { this.importBtn = b; b.setButtonText('导入选中（0）').setCta().onClick(() => this.submit()); });
+  }
+  async load() {
+    clear(this.listEl);
+    h(this.listEl, 'div', { cls: 'rw-empty-sm', text: '加载中…' });
+    try {
+      this.items = await this.plugin.zSearch(this.query, this.collection);
+    } catch (e) {
+      clear(this.listEl);
+      h(this.listEl, 'div', { cls: 'rw-empty-sm', text: '读取失败：' + e.message });
+      return;
+    }
+    this.renderList();
+  }
+  renderList() {
+    clear(this.listEl);
+    const existing = this.plugin.zoteroImportedKeys();
+    if (!this.items.length) { h(this.listEl, 'div', { cls: 'rw-empty-sm', text: '没有找到条目' }); }
+    for (const it of this.items) {
+      const d = it.data || {};
+      it._imported = existing.has(it.key);
+      const r = h(this.listEl, 'label', { cls: 'rw-zitem' + (it._imported ? ' is-imported' : '') });
+      const cb = h(r, 'input', { attr: { type: 'checkbox' } });
+      cb.checked = it._imported || this.selected.has(it.key);
+      cb.disabled = it._imported;
+      cb.addEventListener('change', () => { if (cb.checked) this.selected.set(it.key, it); else this.selected.delete(it.key); this.updateBtn(); });
+      const mid = h(r, 'div', { cls: 'rw-row-mid' });
+      h(mid, 'div', { cls: 'rw-zitem-title', text: d.title || '(无标题)' });
+      const meta = it.meta || {};
+      const year = ((meta.parsedDate || d.date || '').match(/\d{4}/) || [''])[0];
+      const pub = d.publicationTitle || d.proceedingsTitle || d.conferenceName || d.bookTitle || d.university || d.publisher || '';
+      h(mid, 'div', { cls: 'rw-row-sub', text: [meta.creatorSummary, year, pub].filter(Boolean).join(' · ') });
+      if (it._imported) h(r, 'span', { cls: 'rw-badge', text: '已导入' });
+      else if (meta.numChildren) h(r, 'span', { cls: 'rw-badge rw-badge-soft', text: '附件 ' + meta.numChildren });
+    }
+    this.updateBtn();
+  }
+  updateBtn() { if (this.importBtn) this.importBtn.setButtonText('导入选中（' + this.selected.size + '）'); }
+  async submit() {
+    if (this.busy || !this.selected.size) { if (!this.selected.size) new Notice('请先勾选要导入的文献'); return; }
+    this.busy = true;
+    this.importBtn.setButtonText('导入中…');
+    try {
+      this.plugin.settings.zoteroAnnotations = this.annotations;
+      this.plugin.saveSettingsSoon();
+      await this.plugin.importZoteroItems([...this.selected.values()], { project: this.project, status: this.status, annotations: this.annotations });
+      this.close();
+    } finally { this.busy = false; }
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+/* ───────────────────────── 设置页 ───────────────────────── */
+
+/* ───────────────────────── 划词翻译 · Remarkble · PaperGrid 文献阅读 ───────────────────────── */
+const READER_VIEW = 'research-workbench-reader';
+const TRANS_SERVICES = {
+  google:    { label: 'Google 翻译', short: 'Google', desc: '免费，无需密钥' },
+  microsoft: { label: '微软翻译', short: '微软', desc: '免费，无需密钥' },
+  mymemory:  { label: 'MyMemory', short: 'MM', desc: '免费，无需密钥，有每日额度' },
+  deepl:     { label: 'DeepL', short: 'DeepL', desc: '需要 API Key（免费版以 :fx 结尾）' },
+  baidu:     { label: '百度翻译', short: '百度', desc: '需要 APPID 和密钥' },
+  llm:       { label: 'AI 大模型', short: 'AI', desc: 'OpenAI 兼容接口（DeepSeek / Kimi / 通义…），在「AI 设置」里填' },
+};
+const TRANS_ORDER = ['google', 'microsoft', 'mymemory', 'deepl', 'baidu', 'llm'];
+const TRANS_LANGS = [['zh-CN', '简体中文'], ['zh-TW', '繁體中文'], ['en', 'English'], ['ja', '日本語'], ['ko', '한국어'], ['de', 'Deutsch'], ['fr', 'Français']];
+const LANG_MAP = {
+  microsoft: { 'zh-CN': 'zh-Hans', 'zh-TW': 'zh-Hant' },
+  deepl: { 'zh-CN': 'ZH-HANS', 'zh-TW': 'ZH-HANT', en: 'EN-US', ja: 'JA', ko: 'KO', de: 'DE', fr: 'FR' },
+  baidu: { 'zh-CN': 'zh', 'zh-TW': 'cht', en: 'en', ja: 'jp', ko: 'kor', de: 'de', fr: 'fra' },
+};
+const EXCERPT_HEADING = '## 划线摘录';
+const DEFAULT_LLM_PROMPT = '你是学术论文翻译助手。把用户给的文字翻译成{lang}，保持专业术语准确（必要时在括号里保留英文原词），公式、变量名、引用编号原样保留。只输出译文，不要解释。';
+/* AI 动作的提示词（来自 PaperGrid） */
+const AI_ACTION_PROMPTS = {
+  speedread: '你是一名学术文献速读助手。请基于论文内容输出结构化速读，包含：研究背景、核心问题、方法、主要结果、创新点、局限。使用中文条目式回答。',
+  translate: '请只翻译“待处理文本”中的学术文本，输出流畅中文并保留术语准确性。不要翻译上下文，不要扩展到上下文中的其他句子。',
+  explain: '请只解释“待处理文本”中的学术内容，可参考上下文理解概念，但不要解释上下文中的其他内容。如果用户要求分节，就按要求的标题用中文分节，公式用 LaTeX 的 $ 或 $$ 包裹。',
+  summarize: '请只总结“待处理文本”的要点，使用条目列表。不要总结上下文。',
+  simplify: '请只精简解释“待处理文本”，保留核心信息，控制在原文 1/3 长度以内。不要处理上下文。',
+};
+/* 划词按钮（PDF 里选中文字后显示）：mode = send 立即发问（右侧 AI 问答）/ quote 引用后自己问 / inline 在小窗里直接回答 */
+const SEL_PRESET_MODES = [['send', '立即发问'], ['quote', '引用后自己问'], ['inline', '小窗里回答']];
+const DEFAULT_SEL_PRESETS = [
+  { id: 'explain', on: true, name: '解释', mode: 'send', prompt: '请解释下面选中的原文，用简洁中文说明其含义、上下文作用与关键术语。' },
+  { id: 'aitrans', on: true, name: 'AI释译', mode: 'send', prompt: '请将下面选中的原文翻译成流畅中文，保留专有名词；必要时加简短注释。' },
+  { id: 'simple', on: true, name: '简单解释', mode: 'send', prompt: '不用公式，尽量用全中文来解释这个概念，如果公式比较多的情况，可以用中文来代替公式里的符号进行' },
+  { id: 'summary', on: true, name: '总结', mode: 'send', prompt: '请概括下面选中原文的核心观点，用 3 条以内要点列出。' },
+  { id: 'ask', on: true, name: '问 AI', mode: 'quote', prompt: '' },
+];
+const SEL_PRESET_ICON = { send: 'send', quote: 'message-circle', inline: 'sparkles' };
+const AI_ACTION_LABEL = { explain: 'AI 解释', summarize: 'AI 总结', translate: 'AI 释译', speedread: '要点速读', simplify: '精简解释' };
+/* 与 PaperGrid 阅读器问答的选区提示词一致 */
+const SELECTION_PROMPTS = {
+  explain: '请解释下面选中的原文，用简洁中文说明其含义、上下文作用与关键术语。',
+  translate: '请将下面选中的原文翻译成流畅中文，保留专有名词；必要时加简短注释。',
+  summarize: '请概括下面选中原文的核心观点，用 3 条以内要点列出。',
+  ask: '请基于论文全文，围绕下面选中原文回答我的问题。若我未另写问题，请先解释这段话并指出它与全文论点的关系。',
+};
+const CHAT_QUICK = [
+  ['速读全文', '请对这篇论文做结构化速读：研究背景、核心问题、方法、主要结果、创新点、局限。'],
+  ['方法细节', '请详细说明这篇论文的方法：模型/算法的结构、关键公式（用 LaTeX）、输入输出、训练或求解流程。'],
+  ['实验设置', '请梳理论文的实验设置：数据集或仿真参数、对比方法、评价指标、主要结论，用表格列出关键数字。'],
+  ['局限与可做', '这篇论文有哪些局限、假设或没解决的问题？如果我要在它基础上继续做，有哪些可行的方向？'],
+];
+/* PDF 里复制出来的文字：去掉断行连字符（estima-\ntion → estimation，但 Direction-of-\narrival 保留）、合并换行 */
+const KEEP_HYPHEN_NEXT = new Set(['based', 'aware', 'driven', 'free', 'wise', 'like', 'level', 'order', 'domain', 'dimensional', 'scale', 'specific', 'related', 'of', 'the', 'art', 'to', 'and', 'resolution', 'rank', 'noise', 'arrival', 'shot', 'learning']);
+const KEEP_HYPHEN = new Set(['self', 'non', 'low', 'high', 'well', 'cross', 'semi', 'anti', 'post', 'inter', 'data', 'deep', 'time', 'real', 'state', 'end', 'long', 'short', 'large', 'small', 'single', 'double', 'joint', 'model', 'sub', 'pre', 'co', 're']);
+function cleanPdfText(t) {
+  return String(t || '')
+    .replace(/­/g, '')
+    .replace(/([A-Za-z]+)-[ \t]*\n\s*([a-z]+)/g, (m, w, nx, off, all) => (all[off - 1] === '-' || KEEP_HYPHEN.has(w.toLowerCase()) || KEEP_HYPHEN_NEXT.has(nx) ? w + '-' + nx : w + nx))
+    .replace(/\s*\n\s*/g, ' ')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+function hasCJK(t) { const s = String(t || ''); const n = (s.match(/[㐀-鿿]/g) || []).length; return n > s.length * 0.3; }
+
+/* 百度翻译签名、文件名哈希用的 MD5 */
+function md5(str) {
+  const s = unescape(encodeURIComponent(str));
+  const k = []; for (let i = 0; i < 64; i++) k[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296) | 0;
+  const r = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+  const n = s.length; const words = [];
+  for (let i = 0; i < n; i++) words[i >> 2] |= s.charCodeAt(i) << ((i % 4) * 8);
+  words[n >> 2] |= 0x80 << ((n % 4) * 8);
+  const total = (((n + 8) >> 6) + 1) * 16;
+  for (let i = (n >> 2) + 1; i < total; i++) words[i] = words[i] | 0;
+  words[total - 2] = n * 8;
+  let a = 0x67452301, b = 0xefcdab89 | 0, c = 0x98badcfe | 0, d = 0x10325476;
+  for (let i = 0; i < total; i += 16) {
+    let A = a, B = b, C = c, D = d;
+    for (let j = 0; j < 64; j++) {
+      let f, g;
+      if (j < 16) { f = (B & C) | (~B & D); g = j; }
+      else if (j < 32) { f = (D & B) | (~D & C); g = (5 * j + 1) % 16; }
+      else if (j < 48) { f = B ^ C ^ D; g = (3 * j + 5) % 16; }
+      else { f = C ^ (B | ~D); g = (7 * j) % 16; }
+      const tmp = D; D = C; C = B;
+      const x = (A + f + k[j] + (words[i + g] | 0)) | 0;
+      B = (B + ((x << r[j]) | (x >>> (32 - r[j])))) | 0;
+      A = tmp;
+    }
+    a = (a + A) | 0; b = (b + B) | 0; c = (c + C) | 0; d = (d + D) | 0;
+  }
+  let out = '';
+  for (const v of [a, b, c, d]) for (let i = 0; i < 4; i++) out += ((v >>> (i * 8)) & 255).toString(16).padStart(2, '0');
+  return out;
+}
+
+/* 把选区的矩形收成「每行一条」，坐标是相对 PDF 页面的比例，缩放后仍对得上（来自 Remarkble） */
+function mergeClientRects(pageRect, clientRects) {
+  if (!pageRect || !(pageRect.width > 1) || !(pageRect.height > 1)) return [];
+  const raw = [];
+  for (const rect of clientRects || []) {
+    if (!(rect.width > 0.5) || !(rect.height > 0.5)) continue;
+    const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+    if (cx < pageRect.left - 2 || cx > pageRect.right + 2 || cy < pageRect.top - 2 || cy > pageRect.bottom + 2) continue;
+    raw.push({ x: (rect.left - pageRect.left) / pageRect.width, y: (rect.top - pageRect.top) / pageRect.height, w: rect.width / pageRect.width, h: rect.height / pageRect.height });
+  }
+  raw.sort((a, b) => a.y - b.y || a.x - b.x);
+  const lines = [];
+  for (const rc of raw) {
+    const last = lines[lines.length - 1];
+    if (last && Math.abs(rc.y - last.y) < Math.max(rc.h, last.h) * 0.65) {
+      const right = Math.max(last.x + last.w, rc.x + rc.w);
+      last.x = Math.min(last.x, rc.x); last.w = right - last.x;
+      last.y = Math.min(last.y, rc.y); last.h = Math.max(last.h, rc.h);
+    } else lines.push({ x: rc.x, y: rc.y, w: rc.w, h: rc.h });
+  }
+  return lines.map((l) => ({ x: +l.x.toFixed(5), y: +l.y.toFixed(5), w: +l.w.toFixed(5), h: +l.h.toFixed(5) }));
+}
+
+/* 轻量渲染 AI 返回的 Markdown（标题、列表、加粗、代码、公式原样） */
+function renderAiMarkdown(app, md, el, component) {
+  clear(el);
+  if (obsidian.MarkdownRenderer && obsidian.MarkdownRenderer.render) {
+    try { obsidian.MarkdownRenderer.render(app, md, el, '', component); return; } catch (e) { /* 退回纯文本 */ }
+  }
+  el.textContent = md;
+}
+
+/* 选中文字后弹出的翻译小窗（每个窗口一个） */
+class TranslatePopup {
+  constructor(plugin, doc) { this.plugin = plugin; this.doc = doc; this.el = null; this.ctx = null; this.seq = 0; this.comp = new obsidian.Component(); }
+  ensure() {
+    if (this.el && this.el.isConnected) return;
+    const el = (this.el = this.doc.createElement('div'));
+    el.className = 'rw-tp';
+    this.doc.body.appendChild(el);
+    el.addEventListener('mousedown', (e) => e.stopPropagation());
+    el.addEventListener('mouseup', (e) => e.stopPropagation());
+  }
+  /* 只显示小按钮：译 / 标 */
+  showBubble(rect, ctx) {
+    this.ensure();
+    this.ctx = ctx;
+    const el = this.el;
+    el.className = 'rw-tp rw-tp-bubble';
+    clear(el);
+    const b = h(el, 'button', { cls: 'rw-tp-bubble-btn', title: '翻译选中的文字' });
+    ic(b, 'languages'); h(b, 'span', { text: '译' });
+    b.addEventListener('click', () => this.show(rect, ctx));
+    if (ctx.anchor) {
+      const g = h(el, 'button', { cls: 'rw-tp-bubble-btn is-alt', title: '把译文标在原文上方（Remarkble）' });
+      ic(g, 'type'); h(g, 'span', { text: '标' });
+      g.addEventListener('click', () => { this.hide(); this.plugin.glossFromContext(ctx); });
+    }
+    const pl = this.plugin;
+    for (const sp of pl.settings.selPresetsInBubble === false ? [] : pl.selPresets()) {
+      const pb = h(el, 'button', { cls: 'rw-tp-bubble-btn is-preset', title: pl.selPresetTitle(sp) });
+      h(pb, 'span', { text: sp.name });
+      pb.addEventListener('click', () => pl.runSelPreset(sp, ctx, this, rect));
+    }
+    this.place(rect, Math.max(ctx.anchor ? 110 : 64, el.offsetWidth || 0), 30);
+  }
+  async show(rect, ctx, service) {
+    this.ensure();
+    this.ctx = ctx;
+    const pl = this.plugin;
+    const st = pl.settings;
+    service = service || st.transService || 'google';
+    const el = this.el;
+    el.className = 'rw-tp';
+    if (st.transPinned) el.classList.add('is-pinned');
+    clear(el);
+    const head = h(el, 'div', { cls: 'rw-tp-head' });
+    const sel = h(head, 'select', { cls: 'dropdown rw-tp-svc', title: '翻译服务' });
+    for (const k of TRANS_ORDER) { const o = h(sel, 'option', { text: TRANS_SERVICES[k].label }); o.value = k; }
+    sel.value = service;
+    sel.addEventListener('change', () => { st.transService = sel.value; pl.saveSettingsSoon(); this.show(this.lastRect || rect, this.ctx, sel.value); });
+    if (ctx.page) h(head, 'span', { cls: 'rw-tp-page', text: 'p.' + ctx.page });
+    h(head, 'span', { cls: 'rw-tp-sp' });
+    const btn = (parent, icon, title, fn, cls) => { const b = h(parent, 'button', { cls: 'rw-tp-btn' + (cls ? ' ' + cls : ''), title }); ic(b, icon); b.addEventListener('click', fn); return b; };
+    const copyB = btn(head, 'copy', '复制译文', () => { if (this.result) pl.copyText(this.result); });
+    const noteB = btn(head, 'quote', '写入文献笔记的「划线摘录」', async () => {
+      if (!this.result) return;
+      const ok = await pl.addExcerpt({ text: ctx.text, translation: this.result, pdf: ctx.pdf, page: ctx.page, note: ctx.note });
+      if (ok) { noteB.classList.add('is-done'); ic(noteB, 'check'); }
+    });
+    if (!ctx.pdf && !ctx.note) noteB.style.display = 'none';
+    btn(head, 'pin', st.transPinned ? '取消固定（点别处会自动关闭）' : '固定小窗（点别处不关闭）', () => { st.transPinned = !st.transPinned; pl.saveSettingsSoon(); el.classList.toggle('is-pinned', st.transPinned); }, st.transPinned ? 'is-on' : '');
+    btn(head, 'x', '关闭（Esc）', () => this.hide());
+    const body = h(el, 'div', { cls: 'rw-tp-body' });
+    const out = h(body, 'div', { cls: 'rw-tp-out is-loading', text: '翻译中…' });
+    const src = h(body, 'details', { cls: 'rw-tp-src' });
+    h(src, 'summary', { text: '原文（' + ctx.text.length + ' 字符）' });
+    h(src, 'div', { cls: 'rw-tp-src-text', text: ctx.text });
+    if (st.transShowSource) src.open = true;
+    // PaperGrid / Remarkble 动作
+    const acts = h(el, 'div', { cls: 'rw-tp-acts' });
+    const act = (icon, label, title, fn, cls) => { const b = h(acts, 'button', { cls: 'rw-tp-act' + (cls ? ' ' + cls : ''), title }); ic(b, icon); h(b, 'span', { text: label }); b.addEventListener('click', fn); return b; };
+    if (ctx.anchor) {
+      const gb = act('type', '标在原文上', '把译文写在原文上方（Remarkble），下次打开还在', async () => {
+        gb.disabled = true;
+        this.hide();
+        try { this.doc.getSelection().removeAllRanges(); } catch (e) { /* ignore */ }
+        await pl.glossFromContext(ctx, this.result ? { translation: this.result, engine: service } : null);
+      });
+    }
+    this.bodyEl = body;
+    for (const sp of pl.selPresets()) act(SEL_PRESET_ICON[sp.mode] || 'sparkles', sp.name, pl.selPresetTitle(sp), () => pl.runSelPreset(sp, ctx, this, rect));
+    if (ctx.pdf || ctx.note) act('bookmark-plus', '摘录', '只把原文存进笔记摘录', async () => { this.hide(); await pl.addExcerpt({ text: ctx.text, pdf: ctx.pdf, page: ctx.page, note: ctx.note, source: '原文高亮' }); });
+    this.aiBox = null;
+    this.lastRect = rect;
+    this.place(rect, Math.min(460, (this.doc.defaultView || window).innerWidth - 24), 190);
+    this.result = '';
+    copyB.disabled = true;
+    const my = ++this.seq;
+    try {
+      const r = await pl.translate(ctx.text, service);
+      if (my !== this.seq) return;
+      this.result = r;
+      out.classList.remove('is-loading');
+      out.textContent = r;
+      copyB.disabled = false;
+      pl.recordTranslation({ src: ctx.text, dst: r, service, pdf: ctx.pdf ? ctx.pdf.path : '', note: ctx.note ? ctx.note.path : '', page: ctx.page || '' });
+    } catch (e) {
+      if (my !== this.seq) return;
+      out.classList.remove('is-loading');
+      out.classList.add('is-error');
+      out.textContent = '翻译失败：' + (e.message || e);
+      h(body, 'div', { cls: 'rw-tp-tip', text: service === 'google' ? '连不上 Google 的话，可以在上方切换到「微软翻译」。' : '可以在上方切换别的服务，或到 设置 → 科研工作台 检查密钥。' });
+    }
+    this.place(this.lastRect, el.offsetWidth, el.offsetHeight);
+  }
+  async runAi(kind, body, preset) {
+    const pl = this.plugin;
+    const ctx = this.ctx;
+    body = body || this.bodyEl;
+    if (!body || !body.isConnected) return;
+    if (!this.aiBox || !this.aiBox.isConnected) this.aiBox = h(body, 'div', { cls: 'rw-tp-ai' });
+    const box = this.aiBox;
+    clear(box);
+    const hd = h(box, 'div', { cls: 'rw-tp-ai-head' });
+    const label = preset ? preset.name : AI_ACTION_LABEL[kind] || 'AI';
+    h(hd, 'b', { text: label });
+    const stEl = h(hd, 'span', { cls: 'rw-muted', text: ' · 请求中…' });
+    const res = h(box, 'div', { cls: 'rw-tp-ai-body is-loading' });
+    this.place(this.lastRect, this.el.offsetWidth, this.el.offsetHeight);
+    try {
+      const title = ctx.note ? pl.paperTitle(ctx) : (ctx.pdf ? ctx.pdf.basename : '');
+      const r = await pl.aiAction(kind || 'explain', ctx.text, { title, system: preset && preset.prompt ? preset.prompt + '\n\n只处理“待处理文本”（上下文仅供理解）；输出简体中文，公式用 LaTeX 的 $ 或 $$ 包裹。' : null, instructions: '这是 PDF 中选中的一段原文；只处理“待处理文本”，保持学术表述，输出简体中文。' });
+      res.classList.remove('is-loading');
+      renderAiMarkdown(pl.app, r.content, res, this.comp);
+      stEl.textContent = ' · ' + r.via;
+      if (ctx.pdf || ctx.note) {
+        const sb = h(hd, 'button', { cls: 'rw-tp-btn', title: '存入文献笔记的「划线摘录」' });
+        ic(sb, 'quote');
+        sb.addEventListener('click', async () => { if (await pl.addExcerpt({ text: ctx.text, ai: { label: 'AI ' + label.replace(/^AI\s*/, ''), content: r.content }, pdf: ctx.pdf, page: ctx.page, note: ctx.note, source: label })) ic(sb, 'check'); });
+      }
+    } catch (e) {
+      res.classList.remove('is-loading');
+      res.classList.add('is-error');
+      res.textContent = e.message || String(e);
+      stEl.textContent = '';
+    }
+    this.place(this.lastRect, this.el.offsetWidth, this.el.offsetHeight);
+  }
+  place(rect, w, hgt) {
+    const el = this.el;
+    if (!el) return;
+    const win = this.doc.defaultView || window;
+    const vw = win.innerWidth, vh = win.innerHeight;
+    let left = rect ? rect.left + rect.width / 2 - w / 2 : vw / 2 - w / 2;
+    left = Math.max(8, Math.min(left, vw - w - 8));
+    let top = rect ? rect.bottom + 8 : vh / 3;
+    if (rect && top + hgt > vh - 8) top = Math.max(8, rect.top - hgt - 8);
+    el.style.left = left + 'px';
+    el.style.top = top + 'px';
+  }
+  isOpen() { return !!(this.el && this.el.isConnected && this.el.childNodes.length); }
+  isPinned() { return this.isOpen() && this.el.classList.contains('is-pinned'); }
+  contains(node) { return !!(this.el && node && this.el.contains(node)); }
+  hide() { this.seq++; if (this.el) { this.el.remove(); this.el = null; } }
+}
+
+/* 右侧栏「文献阅读」面板：问答 / 译文 / 摘录 / 信息 */
+class ReaderView extends ItemView {
+  constructor(leaf, plugin) { super(leaf); this.plugin = plugin; this.tab = plugin.settings.readerTab || 'chat'; this.cur = null; this.comp = new obsidian.Component(); }
+  getViewType() { return READER_VIEW; }
+  getDisplayText() { return '文献阅读'; }
+  getIcon() { return 'book-open-check'; }
+  async onOpen() {
+    this.contentEl.classList.add('rw-root', 'rw-reader');
+    this.comp.load();
+    this.registerEvent(this.app.workspace.on('file-open', () => this.syncFromActive()));
+    this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.syncFromActive()));
+    this.registerEvent(this.app.metadataCache.on('changed', (f) => { if (this.cur && this.cur.note && f.path === this.cur.note.path) this.renderSoon(); }));
+    this.syncFromActive(true);
+  }
+  async onClose() { clearTimeout(this._rt); this.comp.unload(); if (this.mf) this.mf.destroy(); }
+  renderSoon() { clearTimeout(this._rt); this._rt = setTimeout(() => this.render(), 250); }
+  key() { return this.plugin.paperKey(this.cur); }
+  /* 跟随当前打开的 PDF / 文献笔记；切到别的文件时保留上一篇 */
+  syncFromActive(force) {
+    const f = this.app.workspace.getActiveFile ? this.app.workspace.getActiveFile() : null;
+    const ctx = f ? this.plugin.paperOf(f) : null;
+    if (ctx) {
+      const same = this.cur && this.plugin.paperKey(this.cur) === this.plugin.paperKey(ctx);
+      this.cur = ctx;
+      if (!same || force) this.render();
+    } else if (force) this.render();
+  }
+  setPaper(ctx) { this.cur = ctx; this.render(); }
+  setTab(id) { this.tab = id; this.plugin.settings.readerTab = id; this.plugin.saveSettingsSoon(); this.render(); }
+  async render() {
+    const el = this.contentEl;
+    const keepScroll = this._scrollKeep ? el.scrollTop : 0;
+    clear(el);
+    this.plugin.applyTheme(el);
+    const pl = this.plugin;
+    const c = this.cur;
+    if (!c) {
+      const e = h(el, 'div', { cls: 'rw-rd-empty' });
+      ic(e, 'book-open-check', 'rw-rd-empty-icon');
+      h(e, 'div', { cls: 'rw-rd-empty-title', text: '打开一篇文献的 PDF 或阅读笔记' });
+      h(e, 'div', { cls: 'rw-muted', text: '这里会显示它的问答、译文、摘录和信息。在 PDF 里选中文字就能翻译、解释，或把译文标在原文上方。' });
+      this.renderTranslateBox(el, null);
+      return;
+    }
+    const n = c.noteObj;
+    const fm = n ? n.fm || {} : {};
+    const card = h(el, 'div', { cls: 'rw-rd-card' });
+    if (n && n.projectName) card.style.setProperty('--pc', projectColor(n.projectName));
+    const zt = pl.titleZh(c);
+    h(card, 'div', { cls: 'rw-rd-title', text: pl.paperTitle(c) });
+    if (zt) h(card, 'div', { cls: 'rw-rd-title-zh', text: zt });
+    const meta = [str(fm.authors), str(fm.year), str(fm.journal)].filter(Boolean).join(' · ');
+    if (meta) h(card, 'div', { cls: 'rw-rd-meta', text: meta });
+    const chips = h(card, 'div', { cls: 'rw-rd-chips' });
+    if (n && n.projectName) {
+      const pc = h(chips, 'span', { cls: 'rw-pchip is-clickable', text: n.projectName });
+      pc.style.setProperty('--pc', projectColor(n.projectName));
+      pc.addEventListener('click', () => pl.openWorkbenchProject(n.projectName));
+    }
+    if (n) {
+      const ss = h(chips, 'select', { cls: 'dropdown rw-select rw-select-sm' });
+      for (const s of NOTE_TYPES.literature.statuses) { const o = h(ss, 'option', { text: s }); o.value = s; }
+      ss.value = NOTE_TYPES.literature.statuses.includes(n.status) ? n.status : NOTE_TYPES.literature.statuses[0];
+      ss.addEventListener('change', () => pl.setField(n.file, 'status', ss.value));
+      for (const x of pl.pdfsOf(n)) {
+        const TXT = { vault: 'PDF · 库内', zotero: 'PDF · Zotero', path: 'PDF · 电脑', url: 'PDF · 网络' };
+        const ch = h(chips, 'span', { cls: 'rw-pdfchip is-' + x.kind, text: TXT[x.kind], title: x.label });
+        ch.addEventListener('click', () => pl.openPdf(x));
+      }
+    }
+    const acts = h(card, 'div', { cls: 'rw-rd-acts' });
+    const act = (icon, label, fn) => { const b = h(acts, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(b, icon); h(b, 'span', { text: label }); b.addEventListener('click', fn); return b; };
+    if (n) act('file-text', '笔记', () => pl.openFile(n.file));
+    if (c.pdf) act('file', 'PDF', () => pl.openFile(c.pdf));
+    if (fm.zotero) act('library', 'Zotero', () => pl.openLinkValue(fm.zotero, n.file));
+    if (fm.doi) act('link', 'DOI', () => pl.openUrl('https://doi.org/' + str(fm.doi)));
+    if (!n && c.pdf) act('file-plus', '建文献笔记', async () => { const nn = await pl.createLitNoteForPdf(c.pdf); if (nn) this.setPaper(pl.paperOf(c.pdf)); });
+    // 分页
+    const tabs = h(el, 'div', { cls: 'rw-rd-tabs' });
+    const excerpts = n ? await pl.readExcerpts(n.file) : [];
+    const glosses = c.pdf ? (await pl.glossStore(c.pdf.path)).glosses.filter((g) => !g.failed) : [];
+    const T = [['chat', '问答', 0], ['trans', '译文', glosses.length + pl.historyFor(c).length], ['excerpt', '摘录', excerpts.length], ['info', '信息', 0]];
+    if (!T.some((t) => t[0] === this.tab)) this.tab = 'chat';
+    for (const [id, label, cnt] of T) {
+      const b = h(tabs, 'button', { cls: 'rw-rd-tab' + (this.tab === id ? ' is-active' : '') });
+      h(b, 'span', { text: label });
+      if (cnt) h(b, 'span', { cls: 'rw-tab-count', text: cnt });
+      b.addEventListener('click', () => this.setTab(id));
+    }
+    const body = h(el, 'div', { cls: 'rw-rd-body' });
+    if (this.tab === 'chat') {
+      const box = h(body, 'div', { cls: 'rw-rd-mf' });
+      if (this.mf) this.mf.destroy();
+      this.mf = new MindflowPanel(pl, box, c);
+      this.mf.load();
+      const op = h(body, 'button', { cls: 'rw-linkbtn', text: '在文献阅读视图里打开（PDF + AI 并排）→' });
+      op.addEventListener('click', () => pl.openPaperReader(c));
+    }
+    else if (this.tab === 'trans') this.renderTrans(body, c, glosses);
+    else if (this.tab === 'excerpt') this.renderExcerpts(body, c, excerpts);
+    else await this.renderInfo(body, c);
+    if (keepScroll) el.scrollTop = keepScroll;
+    this._scrollKeep = false;
+  }
+  /* ---- 译文：Remarkble 原文上方译文 + 翻译记录 ---- */
+  renderTrans(body, c, glosses) {
+    const pl = this.plugin;
+    this.renderTranslateBox(body, c);
+    if (c.pdf) {
+      const sec = h(body, 'div', { cls: 'rw-rd-sec' });
+      const hd = h(sec, 'div', { cls: 'rw-rd-sec-head' });
+      h(hd, 'b', { text: '标在原文上的译文 · ' + glosses.length });
+      h(hd, 'span', { cls: 'rw-tp-sp' });
+      const vis = h(hd, 'button', { cls: 'rw-tp-btn' + (pl.settings.glossShow !== false ? ' is-on' : ''), title: pl.settings.glossShow !== false ? '隐藏 PDF 上的译文' : '显示 PDF 上的译文' });
+      ic(vis, pl.settings.glossShow !== false ? 'eye' : 'eye-off');
+      vis.addEventListener('click', async () => { pl.settings.glossShow = pl.settings.glossShow === false; await pl.saveSettings(); pl.repaintAllGlosses(); this.render(); });
+      if (glosses.length) {
+        const clr = h(hd, 'button', { cls: 'rw-tp-btn', title: '清除本篇全部译文' }); ic(clr, 'trash-2');
+        clr.addEventListener('click', async () => { const ok = await pl.confirmDelete({ title: '清除译文', lines: ['清除这篇 PDF 上标注的全部 ' + glosses.length + ' 条译文吗？', 'PDF 文件本身不受影响。'] }); if (ok) { await pl.clearGlosses(c.pdf.path); this.render(); } });
+      }
+      if (!glosses.length) h(sec, 'div', { cls: 'rw-empty-sm', text: '在 PDF 里选中单词或句子，点小窗的「标在原文上」或按 Alt+Shift+T，译文会写在原文上方，下次打开还在。' });
+      for (const g of glosses.slice().sort((a, b) => a.page - b.page || a.createdAt - b.createdAt)) {
+        const r = h(sec, 'div', { cls: 'rw-rd-ex is-gloss' });
+        const gh = h(r, 'div', { cls: 'rw-rd-ex-head' });
+        const pg = h(gh, 'button', { cls: 'rw-linkbtn', text: '第 ' + g.page + ' 页', title: '跳到这一处' });
+        pg.addEventListener('click', () => pl.openPdfPage(c.pdf, g.page));
+        h(gh, 'span', { cls: 'rw-muted', text: (TRANS_SERVICES[g.engine] || { short: g.engine || '' }).short });
+        h(gh, 'span', { cls: 'rw-tp-sp' });
+        const ex = h(gh, 'button', { cls: 'rw-tp-btn', title: '写入划线摘录' }); ic(ex, 'quote');
+        ex.addEventListener('click', async () => { if (await pl.addExcerpt({ text: g.text, translation: g.translation, pdf: c.pdf, page: g.page, note: c.note })) ic(ex, 'check'); });
+        const del = h(gh, 'button', { cls: 'rw-tp-btn', title: '删除这条译文' }); ic(del, 'x');
+        del.addEventListener('click', async () => { await pl.removeGloss(c.pdf.path, g.id); this.render(); });
+        h(r, 'div', { cls: 'rw-rd-ex-src', text: g.text });
+        h(r, 'div', { cls: 'rw-rd-ex-dst', text: g.translation });
+      }
+    }
+    const hist = pl.historyFor(c);
+    if (hist.length) {
+      const sec = h(body, 'div', { cls: 'rw-rd-sec' });
+      h(h(sec, 'div', { cls: 'rw-rd-sec-head' }), 'b', { text: '翻译记录 · ' + hist.length });
+      for (const x of hist) this.histItem(sec, x, c);
+    }
+  }
+  renderExcerpts(body, c, excerpts) {
+    const pl = this.plugin;
+    const n = c.noteObj;
+    if (!n) h(body, 'div', { cls: 'rw-empty-sm', text: '这个 PDF 还没有文献笔记。点上面「建文献笔记」后，划线翻译和 AI 解释可以一键写进笔记。' });
+    else if (!excerpts.length) h(body, 'div', { cls: 'rw-empty-sm', text: '还没有摘录。翻译小窗里点「❝」，原文和译文会写进笔记的「划线摘录」。' });
+    for (const x of excerpts) {
+      const r = h(body, 'div', { cls: 'rw-rd-ex' });
+      const hd = h(r, 'div', { cls: 'rw-rd-ex-head' });
+      if (x.page) { const pg = h(hd, 'button', { cls: 'rw-linkbtn', text: 'p.' + x.page, title: '跳到 PDF 这一页' }); pg.addEventListener('click', () => pl.openPdfPage(c.pdf, x.page)); }
+      if (x.text) h(r, 'div', { cls: 'rw-rd-ex-src', text: x.text });
+      if (x.translation) h(r, 'div', { cls: 'rw-rd-ex-dst', text: x.translation });
+    }
+    if (n && excerpts.length) { const b = h(body, 'button', { cls: 'rw-linkbtn', text: '在笔记里查看全部 →' }); b.addEventListener('click', () => pl.openFile(n.file)); }
+  }
+  /* ---- 信息：PaperGrid 中文摘要 / 要点速读 ---- */
+  async renderInfo(body, c) {
+    const pl = this.plugin;
+    const n = c.noteObj;
+    const fm = n ? n.fm || {} : {};
+    const abs = n ? await pl.abstractOf(n) : '';
+    const saved = n ? await pl.noteSections(n.file, ['中文摘要', '要点速读']) : {};
+    const cache = pl.infoCache(c);
+    const card = (title, icon) => { const s = h(body, 'div', { cls: 'rw-rd-sec' }); const hd = h(s, 'div', { cls: 'rw-rd-sec-head' }); ic(hd, icon); h(hd, 'b', { text: title }); h(hd, 'span', { cls: 'rw-tp-sp' }); return { s, hd }; };
+    // 摘要
+    const A = card('摘要', 'align-left');
+    if (abs) {
+      const v = h(A.s, 'details', { cls: 'rw-rd-absd' });
+      h(v, 'summary', { text: '原文摘要（' + abs.length + ' 字符）' });
+      h(v, 'div', { cls: 'rw-rd-v rw-rd-abs', text: abs });
+      if (!cache.zhAbs && !saved['中文摘要']) v.open = true;
+    } else h(A.s, 'div', { cls: 'rw-empty-sm', text: n ? '笔记里没有摘要（「## 摘要」一节或 abstract 属性）。可以用下面的「要点速读」直接读全文。' : '先给这个 PDF 建文献笔记。' });
+    const zh = cache.zhAbs || saved['中文摘要'] || '';
+    const zhBox = h(A.s, 'div', { cls: 'rw-rd-ai' });
+    if (zh) renderAiMarkdown(pl.app, zh, zhBox, this.comp);
+    // 速读
+    const S = card('要点速读', 'zap');
+    const sr = cache.speed || saved['要点速读'] || '';
+    const srBox = h(S.s, 'div', { cls: 'rw-rd-ai' });
+    if (sr) renderAiMarkdown(pl.app, sr, srBox, this.comp);
+    else h(srBox, 'div', { cls: 'rw-empty-sm', text: '用 AI 按「背景 / 问题 / 方法 / 结果 / 创新 / 局限」速读这篇论文。' });
+    const status = h(body, 'div', { cls: 'rw-muted rw-rd-status' });
+    const btnRow = h(body, 'div', { cls: 'rw-rd-acts' });
+    const mk = (icon, label, fn) => { const b = h(btnRow, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(b, icon); h(b, 'span', { text: label }); b.addEventListener('click', async () => { b.disabled = true; try { await fn(); } catch (e) { status.textContent = '失败：' + (e.message || e); status.classList.add('is-error'); } b.disabled = false; }); return b; };
+    if (abs) mk('languages', zh ? '重新翻译摘要' : '翻译摘要', async () => {
+      status.textContent = '正在翻译摘要…';
+      const r = await pl.aiAction('translate', abs, { title: pl.paperTitle(c) });
+      cache.zhAbs = r.content; status.textContent = '摘要已翻译 · ' + r.via + ' · 点「存为笔记」可永久保存';
+      renderAiMarkdown(pl.app, r.content, zhBox, this.comp);
+    });
+    mk('zap', sr ? '重新速读' : '要点速读', async () => {
+      status.textContent = '正在生成要点速读…';
+      let text = abs;
+      if (c.pdf) { status.textContent = '正在读取 PDF 全文…'; const full = await pl.paperText(c); if (full) text = full.slice(0, 6000); status.textContent = '正在生成要点速读…'; }
+      if (!text) throw new Error('没有摘要也没有 PDF 全文可用');
+      const r = await pl.aiAction('speedread', text, { title: pl.paperTitle(c) });
+      cache.speed = r.content; status.textContent = '要点速读已生成 · ' + r.via;
+      renderAiMarkdown(pl.app, r.content, srBox, this.comp);
+    });
+    if (n) mk('save', '存为笔记', async () => {
+      const parts = {};
+      if (cache.zhAbs) parts['中文摘要'] = cache.zhAbs;
+      if (cache.speed) parts['要点速读'] = cache.speed;
+      if (!Object.keys(parts).length) { status.textContent = '还没有新生成的内容'; return; }
+      await pl.writeNoteSections(n.file, parts);
+      status.textContent = '已写入笔记：' + Object.keys(parts).join('、');
+    });
+    if (!pl.titleZh(c) && pl.paperTitle(c) && !hasCJK(pl.paperTitle(c))) mk('heading', '中文标题', async () => {
+      const r = await pl.aiAction('translate', pl.paperTitle(c), { instructions: '这是论文标题，只输出中文标题本身。' });
+      const t = r.content.replace(/^["“「《]|["”」》]$/g, '').split('\n')[0].trim();
+      if (n) await pl.setField(n.file, 'title_zh', t); else cache.titleZh = t;
+      this.render();
+    });
+    // 元数据
+    const M = card('文献信息', 'info');
+    const kv = (k, v) => { if (!v) return; h(M.s, 'div', { cls: 'rw-rd-k', text: k }); h(M.s, 'div', { cls: 'rw-rd-v', text: v }); };
+    kv('作者', str(fm.authors));
+    kv('期刊 / 年份', [str(fm.journal), str(fm.year)].filter(Boolean).join(' · '));
+    kv('DOI', str(fm.doi));
+    kv('引用键', str(fm.citekey));
+    kv('标签', Array.isArray(fm.tags) ? fm.tags.join('、') : str(fm.tags));
+    if (c.pdf) kv('PDF', c.pdf.path);
+  }
+  renderTranslateBox(parent, c) {
+    const pl = this.plugin;
+    const box = h(parent, 'div', { cls: 'rw-rd-tbox' });
+    const ta = h(box, 'textarea', { cls: 'rw-rd-ta', attr: { rows: '2', placeholder: '输入或粘贴要翻译的文字（Ctrl+Enter 翻译）' } });
+    const bar = h(box, 'div', { cls: 'rw-rd-tbar' });
+    const sel = h(bar, 'select', { cls: 'dropdown rw-select rw-select-sm' });
+    for (const k of TRANS_ORDER) { const o = h(sel, 'option', { text: TRANS_SERVICES[k].label }); o.value = k; }
+    sel.value = pl.settings.transService || 'google';
+    sel.addEventListener('change', () => { pl.settings.transService = sel.value; pl.saveSettingsSoon(); });
+    const go = h(bar, 'button', { cls: 'rw-btn rw-btn-sm mod-cta' });
+    ic(go, 'languages'); h(go, 'span', { text: '翻译' });
+    const out = h(box, 'div', { cls: 'rw-rd-tout' });
+    const run = async () => {
+      const t = cleanPdfText(ta.value);
+      if (!t) return;
+      out.className = 'rw-rd-tout is-loading'; out.textContent = '翻译中…';
+      try {
+        const r = await pl.translate(t, sel.value);
+        out.className = 'rw-rd-tout'; out.textContent = r;
+        pl.recordTranslation({ src: t, dst: r, service: sel.value, pdf: c && c.pdf ? c.pdf.path : '', note: c && c.note ? c.note.path : '', page: '' }, true);
+      } catch (e) { out.className = 'rw-rd-tout is-error'; out.textContent = '翻译失败：' + e.message; }
+    };
+    go.addEventListener('click', run);
+    ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); run(); } });
+  }
+  histItem(parent, x, c) {
+    const pl = this.plugin;
+    const r = h(parent, 'div', { cls: 'rw-rd-ex' });
+    const hd = h(r, 'div', { cls: 'rw-rd-ex-head' });
+    if (x.page && c.pdf) { const pg = h(hd, 'button', { cls: 'rw-linkbtn', text: 'p.' + x.page }); pg.addEventListener('click', () => pl.openPdfPage(c.pdf, x.page)); }
+    h(hd, 'span', { cls: 'rw-muted', text: relTime(x.t) + ' · ' + (TRANS_SERVICES[x.service] || { short: x.service }).short });
+    h(hd, 'span', { cls: 'rw-tp-sp' });
+    const cp = h(hd, 'button', { cls: 'rw-tp-btn', title: '复制译文' }); ic(cp, 'copy'); cp.addEventListener('click', () => pl.copyText(x.dst));
+    if (c.note || c.pdf) {
+      const nb = h(hd, 'button', { cls: 'rw-tp-btn', title: '写入划线摘录' }); ic(nb, 'quote');
+      nb.addEventListener('click', async () => { if (await pl.addExcerpt({ text: x.src, translation: x.dst, pdf: c.pdf, page: x.page, note: c.note })) ic(nb, 'check'); });
+    }
+    h(r, 'div', { cls: 'rw-rd-ex-src', text: x.src });
+    h(r, 'div', { cls: 'rw-rd-ex-dst', text: x.dst });
+  }
+}
+
+/* ───────────── 我的文献（表格）与笔记摘录用到的小工具 ───────────── */
+const PG_DEFAULT_COLUMNS = [
+  { id: 'purpose', name: '研究目的', prompt: '用一段话写出核心研究目的和要解决的问题，不超过 300 字。' },
+  { id: 'method', name: '研究方法', prompt: '用一段话点出方法、数据和关键步骤，不超过 300 字。' },
+  { id: 'findings', name: '主要结论', prompt: '用一段话写出最重要的结果，不超过 300 字。' },
+];
+const PG_PRESET_COLUMNS = [
+  { name: '研究背景', prompt: '用一段话写出研究背景和开展这项研究的原因，不超过 300 字。' },
+  { name: '研究问题', prompt: '用一段话写出本文要回答的核心问题，不超过 300 字。' },
+  { name: '理论基础', prompt: '用一段话写出采用的理论、框架或基础模型，不超过 300 字。' },
+  { name: '数据与样本', prompt: '用一段话写出数据来源、样本规模和划分方式（仿真参数也算），不超过 300 字。' },
+  { name: '评价指标', prompt: '用一段话列出主要评价指标，不超过 300 字。' },
+  { name: '创新点', prompt: '用一段话写出相对于已有研究的主要创新，不超过 300 字。' },
+  { name: '局限与建议', prompt: '用一段话写出作者说明的局限和后续建议，不超过 300 字。' },
+  { name: '阵列与信号模型', prompt: '写出论文采用的阵列结构（ULA/UPA/稀疏阵等）、阵元数、信号模型和关键假设（窄带/远场/噪声类型等），不超过 200 字。' },
+  { name: '对比方法', prompt: '列出论文对比的基线方法（如 MUSIC、ESPRIT、CNN 等）以及谁表现最好，不超过 200 字。' },
+  { name: '可复现性', prompt: '说明是否公开代码/数据、关键超参数是否给全、复现难点在哪里，不超过 200 字。' },
+];
+const EXCERPT_SOURCES = ['原文高亮', '划线翻译', 'AI 解释', 'AI 回答', '手动'];
+
+function parseAiJson(content) {
+  const raw = String(content || '').trim();
+  if (!raw) return null;
+  const cands = [];
+  const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) cands.push(fence[1].trim());
+  cands.push(raw);
+  const a = raw.indexOf('{'), b = raw.lastIndexOf('}');
+  if (a >= 0 && b > a) cands.push(raw.slice(a, b + 1));
+  for (const c of cands) for (const t of [c, c.replace(/,\s*([}\]])/g, '$1')]) { try { return JSON.parse(t); } catch (e) { /* 下一个 */ } }
+  return null;
+}
+
+/* 解析笔记「## 划线摘录」里的每个 > [!quote] 块（带在文件里的起止位置） */
+function excerptBlocks(data) {
+  const out = [];
+  const hi = data.search(/(^|\n)## 划线摘录[ \t]*(\n|$)/);
+  if (hi < 0) return out;
+  const secStart = data.indexOf('## 划线摘录', hi);
+  let secEnd = data.indexOf('\n## ', secStart + 6);
+  if (secEnd < 0) secEnd = data.length;
+  let pos = secStart;
+  const lines = [];
+  while (pos < secEnd) {
+    let e = data.indexOf('\n', pos);
+    if (e < 0 || e > secEnd) e = secEnd;
+    lines.push({ s: pos, e, t: data.slice(pos, e) });
+    pos = e + 1;
+  }
+  let idx = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^>\s*\[!quote\]/.test(lines[i].t)) continue;
+    let j = i + 1;
+    while (j < lines.length && /^>/.test(lines[j].t) && !/^>\s*\[!quote\]/.test(lines[j].t)) j++;
+    const blk = lines.slice(i, j);
+    const head = blk[0].t;
+    const body = blk.slice(1).map((l) => l.t.replace(/^>\s?/, ''));
+    const x = { idx: idx++, start: blk[0].s, end: Math.min(data.length, blk[blk.length - 1].e + 1) };
+    const pm = head.match(/#page=(\d+)/) || head.match(/\bp\.(\d+)/);
+    x.page = pm ? pm[1] : '';
+    const lm = head.match(/\[\[([^\]|#]+)/);
+    x.pdfPath = lm ? lm[1] : '';
+    const dm = head.match(/(\d{4}-\d{2}-\d{2})/);
+    x.date = dm ? dm[1] : '';
+    const im = head.match(/%%rw:([\w-]+)%%/);
+    x.id = im ? im[1] : '';
+    const after = dm ? head.slice(head.indexOf(dm[1]) + dm[1].length) : '';
+    const sm = after.replace(/%%[^%]*%%/g, '').match(/·\s*([^·]+?)\s*$/);
+    x.source = sm ? sm[1].trim() : '';
+    // 正文分段：原文 / **译** / **AI …** / **我的笔记**
+    const segs = [];
+    let cur = { key: 'text', lines: [] };
+    for (const l of body) {
+      const mk = l.match(/^\*\*([^*]{1,20})\*\*：\s*(.*)$/);
+      if (mk) { segs.push(cur); cur = { key: mk[1], lines: mk[2] ? [mk[2]] : [] }; } else cur.lines.push(l);
+    }
+    segs.push(cur);
+    x.text = ''; x.translation = ''; x.note = ''; x.ai = [];
+    for (const sg of segs) {
+      const v = sg.lines.join('\n').trim();
+      if (sg.key === 'text') x.text = v;
+      else if (sg.key === '译') x.translation = v;
+      else if (sg.key === '我的笔记') x.note = v;
+      else if (v) x.ai.push({ label: sg.key, content: v });
+    }
+    if (!x.source) x.source = x.translation ? '划线翻译' : x.ai.length ? x.ai[0].label : '原文高亮';
+    out.push(x);
+  }
+  return out;
+}
+function excerptToMd(x) {
+  const q = (t) => String(t || '').split('\n').map((l) => ('> ' + l).replace(/\s+$/, '')).join('\n');
+  const link = x.pdfPath ? '[[' + x.pdfPath + (x.page ? '#page=' + x.page : '') + '|' + (x.page ? 'p.' + x.page : '原文') + ']]' : x.page ? 'p.' + x.page : '摘录';
+  let s = '> [!quote] ' + link + ' · ' + (x.date || today()) + (x.source ? ' · ' + x.source : '') + (x.id ? ' %%rw:' + x.id + '%%' : '') + '\n';
+  s += q(x.text || '');
+  if (x.translation) s += '\n>\n> **译**：' + String(x.translation).replace(/\n/g, '\n> ');
+  for (const a of x.ai || []) s += '\n>\n> **' + a.label + '**：\n' + q(a.content);
+  if (x.note) s += '\n>\n> **我的笔记**：' + String(x.note).replace(/\n/g, '\n> ');
+  return s + '\n';
+}
+
+/* ───────────────────────── 文献阅读：PDF（中）+ Mindflow 式 AI 问答树（右） ───────────────────────── */
+const PAPER_READER_VIEW = 'research-workbench-paper';
+const MF_PRESETS = ['详细解释这段', '举个例子说明', '这段在论文里起什么作用？', '有哪些前提或假设？'];
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const trunc = (s, n) => { s = String(s || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '…' : s; };
+
+/* 在渲染好的回答里给划线追问过的原文加高亮 */
+function markTextIn(root, text, cls, onClick) {
+  const needle = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!needle) return false;
+  const tries = [needle, needle.slice(0, 60), needle.slice(0, 24)].filter((x, i, a) => x.length >= 4 && a.indexOf(x) === i);
+  const doc = root.ownerDocument;
+  for (const t of tries) {
+    const walker = doc.createTreeWalker(root, 4 /* SHOW_TEXT */);
+    let node;
+    while ((node = walker.nextNode())) {
+      if (node.parentElement && node.parentElement.closest('mark')) continue;
+      const idx = node.nodeValue.indexOf(t);
+      if (idx < 0) continue;
+      const range = doc.createRange();
+      range.setStart(node, idx);
+      range.setEnd(node, Math.min(node.nodeValue.length, idx + t.length));
+      const mk = doc.createElement('mark');
+      mk.className = cls;
+      try { range.surroundContents(mk); } catch (e) { continue; }
+      if (onClick) mk.addEventListener('click', (e) => { e.stopPropagation(); onClick(e); });
+      return true;
+    }
+  }
+  return false;
+}
+
+/* 一篇文献的 Mindflow 对话（问答树），存在插件目录 mindflow/ 下 */
+class MindflowStore {
+  constructor(plugin) { this.plugin = plugin; this.cache = new Map(); this.timers = new Map(); }
+  dir() { return normalizePath(((this.plugin.manifest && this.plugin.manifest.dir) || (this.plugin.app.vault.configDir || '.obsidian') + '/plugins/research-workbench') + '/mindflow'); }
+  path(key) { return this.dir() + '/' + md5(key) + '.json'; }
+  async get(key, title) {
+    if (this.cache.has(key)) return this.cache.get(key);
+    const pl = this.plugin;
+    let s = await pl.dataRead(pl.dataFind('AI问答', key));
+    if (!s || !s.nodes) {
+      const old = await pl.legacyRead(this.path(key));
+      if (old && old.nodes) { s = old; s.key = key; this.cache.set(key, s); await this.save(s, true); }
+    }
+    if (!s || !s.nodes) {
+      const root = { id: uid(), parentId: null, anchor: null, title: '关于这篇论文', createdAt: Date.now(), messages: [] };
+      s = { key, title: title || '', rootId: root.id, nodes: { [root.id]: root }, cur: root.id, createdAt: Date.now(), updatedAt: Date.now() };
+    }
+    s.key = key;
+    if (title) s.title = title;
+    if (this.cache.has(key)) return this.cache.get(key);
+    this.cache.set(key, s);
+    return s;
+  }
+  save(s, now) {
+    s.updatedAt = Date.now();
+    clearTimeout(this.timers.get(s.key));
+    const write = async () => {
+      if (Object.values(s.nodes).every((n) => !n.messages.length)) { await this.plugin.dataRemove('AI问答', s.key); return; }
+      const name = s.title || s.key.split('/').pop().replace(/\.(md|pdf)$/i, '');
+      await this.plugin.dataWrite('AI问答', name, s.key, s, '「' + name + '」的 AI 问答树');
+    };
+    if (now) return write();
+    this.timers.set(s.key, setTimeout(write, 600));
+  }
+  async rename(oldKey, newKey) {
+    const s = await this.get(oldKey);
+    if (!s.nodes || Object.values(s.nodes).every((n) => !n.messages.length)) { this.cache.delete(oldKey); return; }
+    this.cache.delete(oldKey); s.key = newKey; this.cache.set(newKey, s);
+    await this.save(s, true);
+    await this.plugin.dataRemove('AI问答', oldKey);
+  }
+}
+const mfChildren = (s, id) => Object.values(s.nodes).filter((n) => n.parentId === id).sort((a, b) => a.createdAt - b.createdAt);
+const mfChain = (s, id) => { const out = []; let n = s.nodes[id]; while (n) { out.unshift(n); n = n.parentId ? s.nodes[n.parentId] : null; } return out; };
+const mfSubtree = (s, id) => { const out = [id]; for (const c of mfChildren(s, id)) out.push(...mfSubtree(s, c.id)); return out; };
+
+/* 右侧 AI：主窗口提问 → 划线追问长出子窗口 → 问答树（照 Canvas Mindflow 的对话视图） */
+/* 短文字里的 $公式$ 用 Obsidian 自带的 MathJax 渲染（问答树、追问卡片、标题、引用）；截断时不切断公式 */
+let _mathFinT = null;
+function setMathText(el, text, max, wrap) {
+  clear(el);
+  text = String(text || '').replace(/\s+/g, ' ').trim();
+  const re = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\\\(([\s\S]+?)\\\)|\$(?!\s)([^$\n]*?[^\s$\\])\$(?!\d)|\$(?!\s)([^$\s\\])\$(?!\d)/g;
+  const parts = [];
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) parts.push({ t: text.slice(last, m.index) });
+    parts.push({ tex: (m[1] || m[2] || m[3] || m[4] || m[5] || '').trim(), display: !!(m[1] || m[2]) });
+    last = re.lastIndex;
+  }
+  if (last < text.length) parts.push({ t: text.slice(last) });
+  let budget = max || 1e9, cut = false;
+  const pre = wrap ? wrap[0] : '', post = wrap ? wrap[1] : '';
+  if (pre) el.appendChild(document.createTextNode(pre));
+  const canMath = typeof obsidian.renderMath === 'function';
+  for (const p of parts) {
+    if (budget <= 0) { cut = true; break; }
+    if (p.t != null) {
+      if (p.t.length > budget) { el.appendChild(document.createTextNode(p.t.slice(0, budget))); cut = true; budget = 0; break; }
+      el.appendChild(document.createTextNode(p.t)); budget -= p.t.length;
+    } else {
+      budget -= Math.max(2, Math.ceil(p.tex.length / 3));
+      if (!canMath) { el.appendChild(document.createTextNode('$' + p.tex + '$')); continue; }
+      try { const me = obsidian.renderMath(p.tex, false); me.classList.add('rw-inline-math'); el.appendChild(me); }
+      catch (e) { el.appendChild(document.createTextNode('$' + p.tex + '$')); }
+    }
+  }
+  if (cut) el.appendChild(document.createTextNode('…'));
+  if (post) el.appendChild(document.createTextNode(post));
+  if (canMath && typeof obsidian.finishRenderMath === 'function') { clearTimeout(_mathFinT); _mathFinT = setTimeout(() => { try { obsidian.finishRenderMath(); } catch (e) { /* ignore */ } }, 0); }
+  return el;
+}
+const mfMath = () => (__mf && __mf.loaded && __mf.exports._mathsel) || null;
+class MindflowPanel {
+  constructor(plugin, el, ctx) {
+    this.plugin = plugin; this.app = plugin.app; this.el = el; this.ctx = ctx;
+    this.tab = 'chat'; this.expanded = new Set(); this.comp = new obsidian.Component(); this.comp.load();
+    this.quote = null; // { text, page, from }
+    el.classList.add('rw-mf');
+    this.unsub = plugin.mfSubscribe((ev) => { if (this.session && ev.key === this.session.key) this.onEvent(ev); });
+    // 拖选经过公式时给公式加选中底色（公式是画出来的，浏览器自带的选中色盖不到）
+    this._selPaint = () => {
+      const M = mfMath();
+      if (!M || !this.msgsEl || this.pop) return;
+      const sel = el.ownerDocument.getSelection();
+      let r = sel && sel.rangeCount && !sel.isCollapsed ? sel.getRangeAt(0) : null;
+      if (r && !(this.msgsEl.contains(r.commonAncestorContainer) || r.intersectsNode(this.msgsEl))) r = null;
+      M.markSelectedMath(this.msgsEl, r);
+    };
+    el.ownerDocument.addEventListener('selectionchange', this._selPaint);
+  }
+  destroy() { this.closePop(); if (this.unsub) this.unsub(); this.comp.unload(); if (this._selPaint) this.el.ownerDocument.removeEventListener('selectionchange', this._selPaint); }
+  async setPaper(ctx) { this.ctx = ctx; this.session = null; await this.load(); }
+  async load() {
+    if (!this.ctx) { this.render(); return; }
+    this.session = await this.plugin.mfSession(this.ctx);
+    if (!this.session.nodes[this.session.cur]) this.session.cur = this.session.rootId;
+    this.render();
+  }
+  get node() { return this.session ? this.session.nodes[this.session.cur] : null; }
+  openNode(id, msgId) {
+    if (!this.session || !this.session.nodes[id]) return;
+    this.session.cur = id; this.tab = 'chat'; this.plugin.mfStore.save(this.session);
+    this.focusMsg = msgId || null;
+    this.render();
+  }
+  setQuote(q) { this.quote = q; this.tab = 'chat'; this.render(); setTimeout(() => this.inputEl && this.inputEl.focus(), 40); }
+  onEvent(ev) {
+    if (ev.type === 'reload') { this.load(); return; }
+    if (ev.type === 'delta' && ev.nodeId === this.session.cur && this.tab === 'chat') {
+      const box = this.msgEls && this.msgEls.get(ev.msgId);
+      if (box) {
+        const th = this.thinkEls && this.thinkEls.get(ev.msgId);
+        if (th) this.renderThink(th, ev.reasoning || '', !ev.content);
+        this.renderMd(box, ev.content || (ev.reasoning ? '' : '思考中…'));
+        box.classList.toggle('is-thinking', !ev.content && !!ev.reasoning);
+        this.stickBottom(); return;
+      }
+    }
+    if (ev.type === 'delta' && this.tab === 'chat' && this.cardEls && this.cardEls.has(ev.nodeId)) {
+      const sn = this.cardEls.get(ev.nodeId).querySelector('.rw-mf-card-snip');
+      if (sn) { sn.textContent = trunc(ev.content.replace(/[#*>`$]/g, ''), 90); return; }
+    }
+    clearTimeout(this._rt); this._rt = setTimeout(() => this.render(true), 60);
+  }
+  /* 深度思考过程：生成中展开显示最新一段，完成后折叠 */
+  renderThink(th, text, live) {
+    clear(th);
+    if (!text) { th.style.display = 'none'; return; }
+    th.style.display = '';
+    const d = h(th, 'details', { cls: 'rw-mf-think' + (live ? ' is-live' : '') });
+    if (live) d.open = true;
+    h(d, 'summary', { text: (live ? '深度思考中… ' : '思考过程 · ') + text.length + ' 字' });
+    const body = h(d, 'div', { cls: 'rw-mf-think-body', text: live ? (text.length > 800 ? '…' + text.slice(-800) : text) : text });
+    if (live) body.scrollTop = body.scrollHeight;
+  }
+  renderMd(box, md) {
+    clear(box);
+    let p = null;
+    try { p = obsidian.MarkdownRenderer.render(this.app, md, box, '', this.comp); } catch (e) { box.textContent = md; }
+    // 给公式记下 LaTeX 源码：划线时公式能一起选上、带进追问
+    const ann = () => { const M = mfMath(); if (M && box.isConnected !== false) { try { M.annotateMath(box, md); } catch (e) { /* ignore */ } } };
+    setTimeout(ann, 400);
+    if (p && p.then) return p.then(ann, ann);
+    ann();
+    return Promise.resolve();
+  }
+  stickBottom() { const m = this.msgsEl; if (m && m.scrollHeight - m.scrollTop - m.clientHeight < 160) m.scrollTop = m.scrollHeight; }
+  render(keep) {
+    const el = this.el;
+    const prevScroll = keep && this.msgsEl ? this.msgsEl.scrollTop : null;
+    this.closePop();
+    clear(el);
+    const s = this.session, node = this.node;
+    // 头部
+    const head = h(el, 'div', { cls: 'rw-mf-head' });
+    if (node && node.parentId) {
+      const back = h(head, 'button', { cls: 'rw-tp-btn', title: '返回上一层' }); ic(back, 'chevron-left');
+      back.addEventListener('click', () => this.openNode(node.parentId, node.anchor && node.anchor.msgId));
+    }
+    const tt = h(head, 'div', { cls: 'rw-mf-title' });
+    if (s && node) {
+      const chain = mfChain(s, node.id);
+      const nl = (n) => (n.parentId || n.messages.length ? this.mfLabel(n).main : n.title) || 'AI 问答';
+      if (chain.length > 1) { const pe = h(tt, 'div', { cls: 'rw-mf-path' }); chain.slice(0, -1).forEach((n, i) => { if (i) pe.appendChild(document.createTextNode(' › ')); setMathText(h(pe, 'span'), nl(n), 10); }); }
+      setMathText(h(tt, 'div', { cls: 'rw-mf-main', title: nl(node) }), nl(node), 60);
+    } else h(tt, 'div', { cls: 'rw-mf-main', text: 'AI 问答' });
+    const tabs = h(head, 'div', { cls: 'rw-mf-tabs' });
+    const tb = (id, icon, title) => { const b = h(tabs, 'button', { cls: 'rw-tp-btn' + (this.tab === id ? ' is-on' : ''), title }); ic(b, icon); b.addEventListener('click', () => { this.tab = id; this.render(); }); };
+    tb('chat', 'messages-square', '对话');
+    tb('tree', 'git-fork', '问答树');
+    const more = h(head, 'button', { cls: 'rw-tp-btn', title: '更多' }); ic(more, 'more-horizontal');
+    more.addEventListener('click', (e) => this.moreMenu(e));
+    if (!this.ctx) { h(el, 'div', { cls: 'rw-empty-sm', text: '打开一篇文献后，可以在这里基于全文提问。' }); return; }
+    if (!this.plugin.directAiReady()) {
+      const w = h(el, 'div', { cls: 'rw-mf-warn' });
+      h(w, 'span', { text: '还没配置 AI：到 设置 → 科研工作台 → AI 填接口地址和密钥（DeepSeek / Kimi / 通义…）。' });
+      const b = h(w, 'button', { cls: 'rw-linkbtn', text: '去设置' }); b.addEventListener('click', () => this.plugin.openSettings());
+    }
+    if (!s) { h(el, 'div', { cls: 'rw-empty-sm', text: '加载中…' }); return; }
+    if (this.tab === 'tree') { this.renderTree(h(el, 'div', { cls: 'rw-mf-body' })); return; }
+    // 对话
+    this.msgsEl = h(el, 'div', { cls: 'rw-mf-msgs' });
+    this.msgEls = new Map(); this.thinkEls = new Map();
+    if (node.anchor && node.anchor.text) {
+      const a = h(this.msgsEl, 'div', { cls: 'rw-mf-anchor', title: '回到上一层' });
+      h(a, 'span', { cls: 'rw-mf-anchor-label', text: '追问自' });
+      h(a, 'div', { cls: 'rw-mf-anchor-text', text: trunc(node.anchor.text, 300) });
+      a.addEventListener('click', () => this.openNode(node.parentId, node.anchor.msgId));
+    }
+    if (!node.messages.length && !node.parentId) {
+      const e = h(this.msgsEl, 'div', { cls: 'rw-mf-empty' });
+      h(e, 'div', { cls: 'rw-mf-empty-title', text: '基于整篇论文提问' });
+      h(e, 'div', { cls: 'rw-muted', text: '读回答时，划选看不懂的句子就能追问；追问会长成子窗口，在「问答树」里能看到整条探索路径。在 PDF 里选中文字点「问 AI」，原文会作为引用带进来。' });
+      const qk = h(e, 'div', { cls: 'rw-chat-quick' });
+      for (const [label, q] of CHAT_QUICK) { const b = h(qk, 'button', { cls: 'rw-catchip', text: label }); b.addEventListener('click', () => this.send(q)); }
+    }
+    for (const m of node.messages) this.renderMsg(m);
+    // 追问卡片
+    const kids = mfChildren(s, node.id);
+    this.cardEls = new Map();
+    if (kids.length) {
+      const sec = h(this.msgsEl, 'div', { cls: 'rw-mf-cards' });
+      h(sec, 'div', { cls: 'rw-mf-cards-head', text: '追问 · ' + kids.length });
+      for (const c of kids) this.renderCard(sec, c);
+    }
+    this.msgsEl.addEventListener('mouseup', (e) => { if (e.button === 0) setTimeout(() => this.onSelect(), 10); });
+    if (TOUCH) this.msgsEl.addEventListener('touchend', () => setTimeout(() => this.onSelect(), 350));
+    this.msgsEl.addEventListener('scroll', () => this.closePop());
+    // 输入区
+    const comp = h(el, 'div', { cls: 'rw-mf-composer' });
+    if (this.quote) {
+      const q = h(comp, 'div', { cls: 'rw-chat-quote' });
+      ic(q, 'quote');
+      h(q, 'span', { text: (this.quote.page ? 'p.' + this.quote.page + ' · ' : '') + trunc(this.quote.text, 140) });
+      const x = h(q, 'button', { cls: 'rw-tp-btn', title: '取消引用' }); ic(x, 'x');
+      x.addEventListener('click', () => { this.quote = null; this.render(true); });
+    }
+    if (this.pendingImgs && this.pendingImgs.length) {
+      const strip = h(comp, 'div', { cls: 'rw-mf-imgs is-pending' });
+      this.pendingImgs.forEach((im, i) => {
+        const th = h(strip, 'div', { cls: 'rw-mf-img' });
+        const img = h(th, 'img', { attr: { src: this.imgSrc(im.path), alt: '图片' } });
+        img.addEventListener('click', () => { const f = this.app.vault.getAbstractFileByPath(im.path); if (f) this.plugin.openFile(f); });
+        const x = h(th, 'button', { cls: 'rw-mf-img-x', title: '去掉这张图' }); ic(x, 'x');
+        x.addEventListener('click', () => { this.pendingImgs.splice(i, 1); if (this.inputEl) this.draft = this.inputEl.value; this.render(true); });
+      });
+    }
+    const row = h(comp, 'div', { cls: 'rw-chat-input' });
+    const running = this.plugin.mfIsRunning(s, node.id);
+    const pick = h(row, 'button', { cls: 'rw-tp-btn rw-mf-attach', title: '添加图片（也可以直接粘贴截图，或把图片拖进来）' }); ic(pick, 'image-plus');
+    const fileIn = h(row, 'input', { attr: { type: 'file', accept: 'image/*', multiple: '' } });
+    fileIn.style.display = 'none';
+    pick.addEventListener('click', () => fileIn.click());
+    fileIn.addEventListener('change', () => { this.addImages(fileIn.files); fileIn.value = ''; });
+    this.inputEl = h(row, 'textarea', { cls: 'rw-rd-ta', attr: { rows: '2', placeholder: this.quote ? '就引用的这段提问…（留空 = 详细解释这段）' : node.parentId ? '继续追问…（可粘贴图片）' : '问这篇论文…（Enter 发送，Shift+Enter 换行，可粘贴截图）' } });
+    this.inputEl.value = this.draft || '';
+    this.inputEl.addEventListener('input', () => { this.draft = this.inputEl.value; });
+    this.inputEl.addEventListener('paste', (e) => {
+      const items = e.clipboardData ? [...e.clipboardData.items] : [];
+      const files = items.filter((it) => it.kind === 'file' && /^image\//.test(it.type)).map((it) => it.getAsFile()).filter(Boolean);
+      if (!files.length) return;
+      e.preventDefault();
+      this.addImages(files);
+    });
+    comp.addEventListener('dragover', (e) => { if (e.dataTransfer && [...e.dataTransfer.items || []].some((it) => it.kind === 'file')) { e.preventDefault(); comp.classList.add('is-drop'); } });
+    comp.addEventListener('dragleave', () => comp.classList.remove('is-drop'));
+    comp.addEventListener('drop', (e) => { comp.classList.remove('is-drop'); const fs = e.dataTransfer && e.dataTransfer.files; if (fs && [...fs].some((f) => /^image\//.test(f.type))) { e.preventDefault(); e.stopPropagation(); this.addImages(fs); } });
+    const send = h(row, 'button', { cls: 'rw-btn rw-btn-sm ' + (running ? '' : 'mod-cta') });
+    ic(send, running ? 'square' : 'send'); h(send, 'span', { text: running ? '停止' : '发送' });
+    const go = () => { if (this.plugin.mfIsRunning(s, node.id)) { this.plugin.mfStop(s, node.id); return; } if (!this.inputEl.value.trim() && !this.quote && !(this.pendingImgs && this.pendingImgs.length)) return; this.send(this.inputEl.value); };
+    send.addEventListener('click', go);
+    this.inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); go(); } });
+    if (this.focusMsg && this.msgEls.has(this.focusMsg)) {
+      const tgt = this.msgEls.get(this.focusMsg).closest('.rw-mf-msg');
+      const box = this.msgsEl;
+      const go = () => { if (!tgt.isConnected) return; box.scrollTop = Math.max(0, box.scrollTop + tgt.getBoundingClientRect().top - box.getBoundingClientRect().top - 12); };
+      // 回答是异步渲染的（Markdown / 公式），高度会变：多校正几次
+      setTimeout(go, 30); setTimeout(go, 250); setTimeout(go, 700);
+      tgt.classList.add('is-flash'); setTimeout(() => tgt.classList.remove('is-flash'), 1400);
+      this.focusMsg = null;
+    } else if (prevScroll != null) this.msgsEl.scrollTop = prevScroll;
+    else setTimeout(() => { if (this.msgsEl) this.msgsEl.scrollTop = this.msgsEl.scrollHeight; }, 0);
+  }
+  renderMsg(m) {
+    const s = this.session, node = this.node;
+    const row = h(this.msgsEl, 'div', { cls: 'rw-mf-msg is-' + m.role });
+    if (m.role === 'user') {
+      const b = h(row, 'div', { cls: 'rw-chat-bubble' });
+      if (m.quote) setMathText(h(b, 'div', { cls: 'rw-chat-q' }), m.quote, 220, [(m.quotePage ? 'p.' + m.quotePage + ' · ' : '') + '“', '”']);
+      if (m.images && m.images.length) {
+        const strip = h(b, 'div', { cls: 'rw-mf-imgs' });
+        for (const pth of m.images) {
+          const src = this.imgSrc(pth);
+          const th = h(strip, 'div', { cls: 'rw-mf-img', title: pth });
+          if (src) { const img = h(th, 'img', { attr: { src, alt: '图片' } }); img.addEventListener('click', () => { const f = this.app.vault.getAbstractFileByPath(pth); if (f) this.plugin.openFile(f); }); }
+          else h(th, 'span', { cls: 'rw-muted', text: '图片已删除' });
+        }
+      }
+      h(b, 'div', { text: m.content || (m.images && m.images.length && !m.quote ? '（看图提问）' : '（详细解释这段）') });
+      this.msgEls.set(m.id, b); // 问答树跳转用
+      return;
+    }
+    const running = this.plugin.mfIsRunning(s, node.id) && m === node.messages[node.messages.length - 1];
+    const th = h(row, 'div', { cls: 'rw-mf-think-wrap' });
+    this.thinkEls = this.thinkEls || new Map();
+    this.thinkEls.set(m.id, th);
+    this.renderThink(th, m.reasoning || '', running && !m.content);
+    const b = h(row, 'div', { cls: 'rw-chat-bubble rw-mf-ans' + (m.error ? ' is-error' : '') });
+    b.dataset.msgId = m.id;
+    this.msgEls.set(m.id, b);
+    if (m.error) b.textContent = '出错了：' + m.error;
+    else {
+      const done = this.renderMd(b, m.content || (running && !m.reasoning ? '思考中…' : ''));
+      // 被划线追问过的原文高亮：要等 Markdown / 公式渲染完再标，不然找不到文字
+      if (!running) { done.then(() => this.paintAnchors(b, m)); setTimeout(() => this.paintAnchors(b, m), 450); }
+    }
+    if (m.retried && !m.error) h(row, 'div', { cls: 'rw-muted rw-mf-note', text: '深度思考没写出正文，已自动关闭思考重新回答' });
+    if (running && !m.content) b.classList.add('is-loading');
+    const tools = h(row, 'div', { cls: 'rw-chat-tools' });
+    const t = (icon, title, fn) => { const x = h(tools, 'button', { cls: 'rw-tp-btn', title }); ic(x, icon); x.addEventListener('click', fn); return x; };
+    t('copy', '复制（Markdown）', () => this.plugin.copyText(m.content));
+    t('refresh-cw', '重新回答', () => this.plugin.mfRegenerate(s, node.id, m.id));
+    const sv = t('bookmark-plus', '存入笔记摘录（划线原文 + 这条回答）', async () => { const src = this.excerptSourceOf(m); if (await this.plugin.addExcerpt({ text: src.text, page: src.page, ai: { label: 'AI 回答', content: (src.ask ? '问：' + src.ask + '\n\n' : '') + m.content }, pdf: this.ctx.pdf, note: this.ctx.note, source: 'AI 回答' })) ic(sv, 'check'); });
+    t('trash-2', '删除这一轮', () => this.plugin.mfDeleteRound(s, node.id, m.id));
+    if (m.model) h(tools, 'span', { cls: 'rw-muted', text: m.model + (m.content ? ' · ' + m.content.length + ' 字' : '') });
+  }
+  /* 在回答里把划线追问过的原文标成黄色（含公式）；点一下跳到对应的追问 */
+  paintAnchors(b, m) {
+    const s = this.session, node = this.node;
+    if (!b || !b.isConnected || !s || !node) return;
+    const kids = mfChildren(s, node.id).filter((c) => c.anchor && c.anchor.msgId === m.id);
+    if (!kids.length) return;
+    const M = mfMath();
+    for (const c of kids) {
+      if (b.querySelector('[data-child="' + c.id + '"]')) continue; // 已经标过
+      let marks = [];
+      if (M && M.highlightAnchor) { try { marks = M.highlightAnchor(b, c.anchor, c.id) || []; } catch (e) { marks = []; } }
+      if (!marks.length) {
+        // 兜底：按纯文字找
+        if (markTextIn(b, c.anchor.plain || c.anchor.text.replace(/\$[^$]*\$/g, ' '), 'cmf-anchor')) { const mk = [...b.querySelectorAll('mark.cmf-anchor')].pop(); if (mk) { mk.dataset.child = c.id; marks = [mk]; } }
+      }
+      const lab = this.mfLabel(c);
+      for (const mk of marks) { mk.classList.add('rw-mf-anchor-hl'); mk.title = '已追问' + (lab.sub ? '：' + lab.sub : '') + '（点击打开这个追问）'; }
+    }
+    if (!b._anchorClick) {
+      b._anchorClick = true;
+      b.addEventListener('click', (e) => {
+        const t = e.target && e.target.closest && e.target.closest('[data-child]');
+        if (!t || !b.contains(t)) return;
+        const sel = b.ownerDocument.getSelection();
+        if (sel && !sel.isCollapsed) return; // 正在划线，不当成点击
+        e.stopPropagation();
+        const id = t.dataset.child;
+        this.expanded.add(id);
+        this.render(true);
+        const card = this.cardEls && this.cardEls.get(id);
+        if (card) { card.scrollIntoView({ block: 'nearest' }); card.classList.add('is-flash'); setTimeout(() => card.classList.remove('is-flash'), 900); }
+      });
+    }
+  }
+  /* 存摘录用：这条回答针对的是哪段划线原文（追问窗口第一轮 = 划线部分；从 PDF 引用的 = 引用原文），问的是什么 */
+  excerptSourceOf(m) {
+    const node = this.node, msgs = node.messages; const i = msgs.indexOf(m);
+    let u = null, ui = -1;
+    for (let j = i - 1; j >= 0; j--) if (msgs[j].role === 'user') { u = msgs[j]; ui = j; break; }
+    const firstUser = msgs.findIndex((x) => x.role === 'user');
+    // 有引用就用引用；在划线追问的窗口里（不论第几轮）都对应那段划线原文
+    const marked = (u && u.quote) || (node.anchor && node.anchor.text) || '';
+    const ask = (u && u.content) || '';
+    return { text: marked || ask || node.title || '', ask: marked ? ask : '', page: u && u.quotePage ? u.quotePage : '' };
+  }
+  questionBefore(m) {
+    const msgs = this.node.messages; const i = msgs.indexOf(m);
+    for (let j = i - 1; j >= 0; j--) if (msgs[j].role === 'user') return (msgs[j].quote ? msgs[j].quote + '\n\n' : '') + (msgs[j].content || '');
+    return this.node.title;
+  }
+  renderCard(sec, c) {
+    const s = this.session;
+    const open = this.expanded.has(c.id);
+    const card = h(sec, 'div', { cls: 'rw-mf-card' + (open ? ' is-open' : '') });
+    this.cardEls.set(c.id, card);
+    const hd = h(card, 'div', { cls: 'rw-mf-card-head' });
+    const cl = this.mfLabel(c);
+    const ttl = setMathText(h(hd, 'div', { cls: 'rw-mf-card-title' + (cl.marked ? ' is-marked' : ''), title: (cl.sub ? '问：' + cl.sub + '\n' : '') + '在主窗口打开这个追问' }), cl.main, 60, cl.marked ? ['“', '”'] : null);
+    ttl.addEventListener('click', () => this.openNode(c.id));
+    const fold = h(hd, 'button', { cls: 'rw-tp-btn', title: open ? '收起' : '展开预览' }); ic(fold, open ? 'chevron-up' : 'chevron-down');
+    fold.addEventListener('click', () => { if (open) this.expanded.delete(c.id); else this.expanded.add(c.id); this.render(true); });
+    const del = h(hd, 'button', { cls: 'rw-tp-btn', title: '删除这个追问' }); ic(del, 'x');
+    del.addEventListener('click', async () => {
+      const n = mfSubtree(s, c.id).length;
+      const ok = await this.plugin.confirmDelete({ title: '删除追问', lines: [n > 1 ? '删除「' + c.title + '」和它下面的 ' + (n - 1) + ' 个追问？' : '删除「' + c.title + '」？'] });
+      if (ok) this.plugin.mfDeleteNode(s, c.id);
+    });
+    const kidsN = mfChildren(s, c.id).length;
+    const running = this.plugin.mfIsRunning(s, c.id);
+    h(card, 'div', { cls: 'rw-mf-card-quote', text: '“' + trunc(c.anchor ? c.anchor.text : '', 60) + '”' });
+    const ans = [...c.messages].reverse().find((m) => m.role === 'assistant');
+    if (open) {
+      const prev = h(card, 'div', { cls: 'rw-mf-card-preview' });
+      this.renderMd(prev, ans && ans.content ? ans.content : running ? '思考中…' : '');
+      const goB = h(card, 'button', { cls: 'rw-linkbtn', text: '进入这个追问 →' }); goB.addEventListener('click', () => this.openNode(c.id));
+    } else h(card, 'div', { cls: 'rw-mf-card-snip', text: ans && ans.content ? trunc(ans.content.replace(/[#*>`$]/g, ''), 90) : running ? '思考中…' : '' });
+    h(card, 'div', { cls: 'rw-mf-card-meta', text: relTime(c.createdAt) + (running ? ' · 生成中…' : '') + (kidsN ? ' · ' + kidsN + ' 个追问' : '') });
+  }
+  /* 问答树里一个窗口 / 一轮怎么显示：有划线就显示划的那段原文（问的什么），没划线才显示问题本身 */
+  mfLabel(node, user) {
+    const q = node && !user ? node.anchor && node.anchor.text : '';
+    const u = user || (node && node.messages.find((m) => m.role === 'user'));
+    const quoted = q || (u && u.quote) || '';
+    const ask = u && u.content ? u.content : '';
+    if (quoted) return { main: quoted, sub: ask && ask.length < 400 ? ask : '', marked: true };
+    return { main: ask || (node && node.title) || '（空）', sub: '', marked: false };
+  }
+  renderTree(body) {
+    const s = this.session;
+    const chain = mfChain(s, s.cur);
+    const path = new Set(chain.map((n) => n.id));
+    h(body, 'div', { cls: 'rw-muted rw-mf-tree-pos', text: '当前在第 ' + chain.length + ' 层 · 黄色 = 划线的原文，↳ = 在同一个窗口里接着问 · 点任一项跳过去' });
+    const list = h(body, 'div', { cls: 'rw-mf-tree' });
+    const roundsOf = (node) => {
+      const out = []; let cur = null;
+      for (const m of node.messages) { if (m.role === 'user') { cur = { user: m, ids: [m.id] }; out.push(cur); } else if (cur) { cur.ids.push(m.id); cur = null; } else out.push({ user: null, ids: [m.id] }); }
+      if (!out.length) out.push({ user: null, ids: [] });
+      return out;
+    };
+    const item = (depth, cls, num, lab, onClick, running) => {
+      const it = h(list, 'div', { cls: 'rw-mf-ti ' + cls });
+      it.style.paddingLeft = 6 + depth * 16 + 'px';
+      h(it, 'span', { cls: 'rw-mf-ti-num', text: num });
+      const mid = h(it, 'div', { cls: 'rw-mf-ti-main' });
+      const main = setMathText(h(mid, 'span', { cls: lab.marked ? 'rw-mf-ti-mark' : 'rw-mf-ti-q' }), lab.main, 70, lab.marked ? ['“', '”'] : null);
+      main.title = lab.main;
+      if (lab.sub) setMathText(h(mid, 'span', { cls: 'rw-mf-ti-sub' }), lab.sub, 40);
+      if (running) h(it, 'span', { cls: 'rw-muted', text: '…' });
+      it.addEventListener('click', onClick);
+      return it;
+    };
+    // 一个窗口：先是窗口本身（第一问），下面依次是：这一轮里划线长出的子窗口（编号 x.1、x.2…），以及在这个窗口里接着问的轮次（↳）
+    const walk = (node, label, depth) => {
+      const rounds = roundsOf(node);
+      const kidsBy = new Map();
+      for (const c of mfChildren(s, node.id)) {
+        let i = c.anchor ? rounds.findIndex((r) => r.ids.includes(c.anchor.msgId)) : -1;
+        if (i < 0) i = rounds.length - 1;
+        if (!kidsBy.has(i)) kidsBy.set(i, []);
+        kidsBy.get(i).push(c);
+      }
+      const here = node.id === s.cur ? ' is-cur' : path.has(node.id) ? ' is-path' : '';
+      const running = this.plugin.mfIsRunning(s, node.id);
+      let kid = 0;
+      rounds.forEach((r, i) => {
+        if (i === 0) item(depth, 'is-node' + here, label, this.mfLabel(node), () => this.openNode(node.id, r.user ? r.user.id : null), running && rounds.length === 1);
+        else item(depth + 1, 'is-follow' + here, '↳', this.mfLabel(node, r.user), () => this.openNode(node.id, r.user ? r.user.id : null), running && i === rounds.length - 1);
+        for (const c of kidsBy.get(i) || []) { kid++; walk(c, label + '.' + kid, depth + 1 + (i > 0 ? 1 : 0)); }
+      });
+    };
+    const root = s.nodes[s.rootId];
+    // 根窗口里每一轮都算第一层（1、2、3…），各自的划线追问挂在下面
+    const rounds = roundsOf(root);
+    const kidsBy = new Map();
+    for (const c of mfChildren(s, root.id)) {
+      let i = c.anchor ? rounds.findIndex((r) => r.ids.includes(c.anchor.msgId)) : -1;
+      if (i < 0) i = rounds.length - 1;
+      if (!kidsBy.has(i)) kidsBy.set(i, []);
+      kidsBy.get(i).push(c);
+    }
+    const here = root.id === s.cur ? ' is-cur' : path.has(root.id) ? ' is-path' : '';
+    rounds.forEach((r, i) => {
+      item(0, 'is-node' + here, String(i + 1), this.mfLabel(root, r.user || null), () => this.openNode(root.id, r.user ? r.user.id : null), this.plugin.mfIsRunning(s, root.id) && i === rounds.length - 1);
+      let kid = 0;
+      for (const c of kidsBy.get(i) || []) { kid++; walk(c, (i + 1) + '.' + kid, 1); }
+    });
+    const exp = h(body, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(exp, 'file-down'); h(exp, 'span', { text: '把问答树写进文献笔记' });
+    exp.addEventListener('click', () => this.plugin.mfExportToNote(this.ctx, s));
+  }
+  moreMenu(e) {
+    const m = new Menu();
+    const s = this.session;
+    m.addItem((i) => i.setTitle('回到主窗口').setIcon('home').onClick(() => s && this.openNode(s.rootId)));
+    m.addItem((i) => i.setTitle('把问答树写进文献笔记').setIcon('file-down').onClick(() => s && this.plugin.mfExportToNote(this.ctx, s)));
+    m.addSeparator();
+    m.addItem((i) => i.setTitle('清空这篇的全部问答…').setIcon('trash-2').onClick(async () => {
+      if (!s) return;
+      const ok = await this.plugin.confirmDelete({ title: '清空问答', lines: ['清空这篇文献的全部 AI 问答（包括所有追问）？'] });
+      if (ok) this.plugin.mfReset(s);
+    }));
+    m.showAtMouseEvent(e);
+  }
+  async send(text) {
+    const q = this.quote;
+    const imgs = (this.pendingImgs || []).map((x) => x.path);
+    this.quote = null; this.draft = ''; this.pendingImgs = [];
+    await this.plugin.mfAsk(this.ctx, this.session, this.session.cur, String(text || '').trim(), q, imgs);
+  }
+  /* 粘贴 / 拖进 / 选择的图片：先存进库，显示在输入框上方，发送时一起发给 AI */
+  async addImages(files) {
+    const list = [...(files || [])].filter((f) => f && /^image\//.test(f.type || ''));
+    if (!list.length) return false;
+    this.pendingImgs = this.pendingImgs || [];
+    for (const f of list.slice(0, 8)) {
+      try { const path = await this.plugin.mfSaveImage(f, f.name || '粘贴的图片'); this.pendingImgs.push({ path }); }
+      catch (e) { new Notice('图片保存失败：' + (e.message || e)); }
+    }
+    if (this.inputEl) this.draft = this.inputEl.value;
+    this.render(true);
+    setTimeout(() => this.inputEl && this.inputEl.focus(), 30);
+    return true;
+  }
+  imgSrc(path) { const f = this.app.vault.getAbstractFileByPath(path); return f instanceof TFile ? this.app.vault.getResourcePath(f) : ''; }
+  /* 回答里划线 → 追问小窗 */
+  onSelect() {
+    const doc = this.el.ownerDocument;
+    const sel = doc.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return;
+    let text = String(sel.toString()).trim();
+    let n = sel.anchorNode; if (n && n.nodeType === 3) n = n.parentElement;
+    let ans = n && n.closest && n.closest('.rw-mf-ans');
+    const range = sel.getRangeAt(0);
+    if (!ans) { let f = sel.focusNode; if (f && f.nodeType === 3) f = f.parentElement; ans = f && f.closest && f.closest('.rw-mf-ans'); }
+    if (!ans || !this.el.contains(ans)) return;
+    // 公式换回 $LaTeX$（只选到公式一部分时自动扩到整条公式）
+    let plain = '';
+    const M = mfMath();
+    if (M) { try { const src = M.selectionToSource(range); if (src.text) { text = src.text; plain = src.plain; } } catch (e) { /* ignore */ } }
+    if (text.length < 1 || (!/[$\\]/.test(text) && text.length < 2)) return;
+    const rect = range.getBoundingClientRect();
+    if (M) { try { M.markSelectedMath(this.msgsEl, range); M.setPendingHighlight(range); } catch (e) { /* ignore */ } }
+    this.showPop(rect, Object.assign({ text, msgId: ans.dataset.msgId }, plain && plain !== text ? { plain } : {}));
+  }
+  showPop(rect, anchor) {
+    this.closePop();
+    const doc = this.el.ownerDocument;
+    const pop = (this.pop = doc.createElement('div'));
+    pop.className = 'rw-tp rw-mf-pop';
+    doc.body.appendChild(pop);
+    pop.addEventListener('mousedown', (e) => e.stopPropagation());
+    setMathText(h(pop, 'div', { cls: 'rw-mf-pop-quote' }), anchor.text, 120, ['“', '”']);
+    const chips = h(pop, 'div', { cls: 'rw-chat-quick' });
+    const presets = Array.isArray(this.plugin.settings.mfPresets) && this.plugin.settings.mfPresets.length ? this.plugin.settings.mfPresets : MF_PRESETS;
+    for (const p of presets) { const b = h(chips, 'button', { cls: 'rw-catchip', text: p }); b.addEventListener('click', () => this.followUp(anchor, p)); }
+    const row = h(pop, 'div', { cls: 'rw-chat-input' });
+    const ta = h(row, 'textarea', { cls: 'rw-rd-ta', attr: { rows: '1', placeholder: '针对这段追问…（留空 = 详细解释）' } });
+    const go = h(row, 'button', { cls: 'rw-btn rw-btn-sm mod-cta' }); ic(go, 'corner-down-right'); h(go, 'span', { text: '追问' });
+    go.addEventListener('click', () => this.followUp(anchor, ta.value));
+    ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); this.followUp(anchor, ta.value); } if (e.key === 'Escape') this.closePop(); });
+    const bar = h(pop, 'div', { cls: 'rw-tp-acts' });
+    const act = (icon, label, fn) => { const b = h(bar, 'button', { cls: 'rw-tp-act' }); ic(b, icon); h(b, 'span', { text: label }); b.addEventListener('click', fn); };
+    act('copy', '复制', () => { this.plugin.copyText(anchor.text); this.closePop(); });
+    act('bookmark-plus', '存为摘录', async () => { this.closePop(); await this.plugin.addExcerpt({ text: anchor.text, pdf: this.ctx.pdf, note: this.ctx.note, source: 'AI 回答' }); });
+    act('languages', '翻译', async () => { const r = h(pop, 'div', { cls: 'rw-tp-ai-body is-loading' }); try { const t = await this.plugin.translate(anchor.text); r.classList.remove('is-loading'); r.textContent = t; } catch (e) { r.classList.remove('is-loading'); r.textContent = e.message; } });
+    const win = doc.defaultView || window;
+    const w = Math.min(380, win.innerWidth - 16);
+    pop.style.width = w + 'px';
+    pop.style.left = Math.max(8, Math.min(rect.left + rect.width / 2 - w / 2, win.innerWidth - w - 8)) + 'px';
+    const top = rect.bottom + 8;
+    pop.style.top = (top + 200 > win.innerHeight ? Math.max(8, rect.top - 210) : top) + 'px';
+    this._popClose = (e) => { if (!pop.contains(e.target)) this.closePop(); };
+    setTimeout(() => doc.addEventListener('mousedown', this._popClose, true), 0);
+    setTimeout(() => ta.focus(), 30);
+  }
+  closePop() {
+    if (this.pop) { this.pop.remove(); this.pop = null; const M = mfMath(); if (M) { try { M.setPendingHighlight(null); if (this.msgsEl) M.markSelectedMath(this.msgsEl, null); } catch (e) { /* ignore */ } } }
+    if (this._popClose) { this.el.ownerDocument.removeEventListener('mousedown', this._popClose, true); this._popClose = null; }
+  }
+  async followUp(anchor, question) {
+    this.closePop();
+    try { this.el.ownerDocument.getSelection().removeAllRanges(); } catch (e) { /* ignore */ }
+    const child = await this.plugin.mfFollowUp(this.ctx, this.session, this.session.cur, anchor, String(question || '').trim());
+    if (child) { this.expanded.add(child.id); this.render(true); }
+  }
+}
+
+/* 用 pdf.js 自己渲染 PDF（懒加载页面、缩放、跳页；文字层可选中 → 翻译 / 标注 / 问 AI） */
+class PdfPane {
+  constructor(plugin, el, file, opts) {
+    this.plugin = plugin; this.el = el; this.file = file; this.opts = opts || {};
+    this.scale = 1; this.fit = true; this.rendered = new Map(); this.doc = null; this.pages = [];
+  }
+  async load() {
+    const el = this.el;
+    clear(el);
+    el.classList.add('rw-pdfv');
+    const bar = (this.bar = h(el, 'div', { cls: 'rw-pdfv-bar' }));
+    this.scroller = h(el, 'div', { cls: 'rw-pdfv-scroll' });
+    this.viewer = h(this.scroller, 'div', { cls: 'pdfViewer rw-pdfv-pages' });
+    const loading = h(this.viewer, 'div', { cls: 'rw-empty-sm', text: '正在打开 PDF…' });
+    try {
+      const pdfjs = (this.pdfjs = await obsidian.loadPdfJs());
+      const buf = await this.plugin.app.vault.readBinary(this.file);
+      this.doc = await pdfjs.getDocument({ data: new Uint8Array(buf) }).promise;
+    } catch (e) {
+      loading.textContent = '打开 PDF 失败：' + (e.message || e);
+      return;
+    }
+    loading.remove();
+    this.n = this.doc.numPages;
+    const p1 = await this.doc.getPage(1);
+    const v1 = p1.getViewport({ scale: 1 });
+    this.base = { w: v1.width, h: v1.height };
+    this.sizes = new Map([[1, this.base]]);
+    this.buildBar();
+    const st = this.plugin.settings;
+    this.fit = st.pdfZoomMode !== 'manual';
+    this.scale = this.fit ? this.fitScale() : Number(st.pdfZoom) || 1.2;
+    for (let i = 1; i <= this.n; i++) {
+      const pg = h(this.viewer, 'div', { cls: 'page rw-pdfv-page' });
+      pg.setAttribute('data-page-number', String(i));
+      const lab = h(pg, 'div', { cls: 'rw-pdfv-ph', text: String(i) });
+      lab.setAttribute('aria-hidden', 'true');
+      this.pages.push(pg);
+    }
+    this.layout();
+    this.io = new IntersectionObserver((ents) => { for (const e of ents) if (e.isIntersecting) this.renderPage(Number(e.target.getAttribute('data-page-number'))); }, { root: this.scroller, rootMargin: '800px 0px' });
+    for (const pg of this.pages) this.io.observe(pg);
+    this.scroller.addEventListener('scroll', () => { clearTimeout(this._st); this._st = setTimeout(() => { this.updatePageNo(); this.unloadFar(); }, 120); });
+    this.ro = new ResizeObserver(() => { if (this.fit) { const s = this.fitScale(); if (Math.abs(s - this.scale) > 0.01) this.setScale(s, true); } });
+    this.ro.observe(this.scroller);
+    if (this.opts.page) setTimeout(() => this.goto(this.opts.page), 50);
+  }
+  destroy() { if (this.io) this.io.disconnect(); if (this.ro) this.ro.disconnect(); try { if (this.doc) this.doc.destroy(); } catch (e) { /* ignore */ } }
+  fitScale() { const w = (this.scroller.clientWidth || 800) - 36; return Math.max(0.4, Math.min(3, w / this.base.w)); }
+  buildBar() {
+    const bar = this.bar;
+    clear(bar);
+    const b = (icon, title, fn) => { const x = h(bar, 'button', { cls: 'rw-tp-btn', title }); ic(x, icon); x.addEventListener('click', fn); return x; };
+    b('chevron-up', '上一页', () => this.goto(this.cur - 1)).classList.add('rw-hide-narrow');
+    this.pageInput = h(bar, 'input', { cls: 'rw-pdfv-pageno', attr: { type: 'text', value: '1' } });
+    this.pageInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') this.goto(Number(this.pageInput.value)); });
+    h(bar, 'span', { cls: 'rw-muted', text: '/ ' + this.n });
+    b('chevron-down', '下一页', () => this.goto(this.cur + 1)).classList.add('rw-hide-narrow');
+    h(bar, 'span', { cls: 'rw-pdfv-sep' });
+    b('minus', '缩小', () => this.zoomBy(1 / 1.15));
+    this.zoomLabel = h(bar, 'button', { cls: 'rw-pdfv-zoom', title: '适合宽度' });
+    this.zoomLabel.addEventListener('click', () => { this.fit = true; this.plugin.settings.pdfZoomMode = 'fit'; this.plugin.saveSettingsSoon(); this.setScale(this.fitScale(), true); });
+    b('plus', '放大', () => this.zoomBy(1.15));
+    h(bar, 'span', { cls: 'rw-pdfv-sep' });
+    const gl = b(this.plugin.settings.glossShow !== false ? 'eye' : 'eye-off', '显示 / 隐藏标在原文上的译文', async () => { this.plugin.settings.glossShow = this.plugin.settings.glossShow === false; await this.plugin.saveSettings(); this.plugin.repaintAllGlosses(); ic(gl, this.plugin.settings.glossShow !== false ? 'eye' : 'eye-off'); });
+    const st = b('type', '译文样式：字号、与原文的距离、上方 / 下方、颜色（对全部译文生效）', () => this.plugin.glossStylePanel(bar.ownerDocument, () => st.getBoundingClientRect(), { keepOn: st }));
+    if (this.opts.extraButtons) this.opts.extraButtons(bar);
+  }
+  zoomBy(f) { this.fit = false; this.plugin.settings.pdfZoomMode = 'manual'; this.setScale(Math.max(0.4, Math.min(4, this.scale * f))); this.plugin.settings.pdfZoom = this.scale; this.plugin.saveSettingsSoon(); }
+  setScale(s, keepFit) {
+    const sc = this.scroller;
+    const ratio = sc.scrollHeight ? (sc.scrollTop + sc.clientHeight / 3) / sc.scrollHeight : 0;
+    this.scale = s;
+    if (!keepFit) this.fit = false;
+    this.layout();
+    for (const [n, st] of this.rendered) if (st.scale !== s) { this.rendered.delete(n); const pg = this.pages[n - 1]; if (this.isNear(pg)) this.renderPage(n); }
+    sc.scrollTop = ratio * sc.scrollHeight - sc.clientHeight / 3;
+  }
+  isNear(pg) { const r = pg.getBoundingClientRect(), s = this.scroller.getBoundingClientRect(); return r.bottom > s.top - 800 && r.top < s.bottom + 800; }
+  layout() {
+    for (let i = 1; i <= this.n; i++) {
+      const sz = this.sizes.get(i) || this.base;
+      const pg = this.pages[i - 1];
+      pg.style.width = Math.floor(sz.w * this.scale) + 'px';
+      pg.style.height = Math.floor(sz.h * this.scale) + 'px';
+      pg.style.setProperty('--scale-factor', this.scale);
+      pg.style.setProperty('--total-scale-factor', this.scale);
+      pg.style.setProperty('--user-unit', 1);
+      pg.style.setProperty('--scale-round-x', '1px');
+      pg.style.setProperty('--scale-round-y', '1px');
+    }
+    if (this.zoomLabel) this.zoomLabel.textContent = Math.round(this.scale * 100) + '%' + (this.fit && !(this.el.clientWidth && this.el.clientWidth < 600) ? ' · 适宽' : '');
+  }
+  async renderPage(n) {
+    const scale = this.scale;
+    const st = this.rendered.get(n);
+    if (st && st.scale === scale) return;
+    this.rendered.set(n, { scale });
+    const pg = this.pages[n - 1];
+    try {
+      const page = await this.doc.getPage(n);
+      if (this.scale !== scale) return;
+      const vp = page.getViewport({ scale });
+      const v1 = page.getViewport({ scale: 1 });
+      if (!this.sizes.has(n) || Math.abs(this.sizes.get(n).h - v1.height) > 1) { this.sizes.set(n, { w: v1.width, h: v1.height }); pg.style.width = Math.floor(vp.width) + 'px'; pg.style.height = Math.floor(vp.height) + 'px'; }
+      const dpr = Math.min(2.5, window.devicePixelRatio || 1);
+      const cv = pg.ownerDocument.createElement('canvas');
+      cv.width = Math.floor(vp.width * dpr); cv.height = Math.floor(vp.height * dpr);
+      cv.style.width = Math.floor(vp.width) + 'px'; cv.style.height = Math.floor(vp.height) + 'px';
+      const ctx2 = cv.getContext('2d');
+      await page.render({ canvasContext: ctx2, viewport: vp, transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : null, canvas: cv }).promise;
+      if (this.scale !== scale) return;
+      const tl = pg.ownerDocument.createElement('div');
+      tl.className = 'textLayer';
+      const pdfjs = this.pdfjs;
+      if (pdfjs.TextLayer) await new pdfjs.TextLayer({ textContentSource: page.streamTextContent ? page.streamTextContent() : await page.getTextContent(), container: tl, viewport: vp }).render();
+      else if (pdfjs.renderTextLayer) await pdfjs.renderTextLayer({ textContentSource: await page.getTextContent(), container: tl, viewport: vp, textDivs: [] }).promise;
+      if (this.scale !== scale) return;
+      // 替换旧内容（保留我们的译文层，让它重画）
+      for (const c of [...pg.children]) if (!c.classList.contains('rw-gl-layer')) c.remove();
+      pg.insertBefore(tl, pg.firstChild);
+      pg.insertBefore(cv, tl);
+      pg.classList.add('is-rendered');
+      this.plugin.paintGlossesFor(this.file.path, pg);
+    } catch (e) {
+      this.rendered.delete(n);
+      if (!/cancel/i.test(String(e && e.message))) console.warn('[科研工作台] 渲染 PDF 页失败', n, e);
+    }
+  }
+  /* 离当前位置很远的页面释放掉画布，长 PDF 在手机上也不会占太多内存 */
+  unloadFar() {
+    const keep = TOUCH ? 3 : 6;
+    for (const [n] of [...this.rendered]) {
+      if (Math.abs(n - this.cur) <= keep) continue;
+      const pg = this.pages[n - 1];
+      if (!pg) continue;
+      for (const c of [...pg.children]) if (c.tagName === 'CANVAS' || c.classList.contains('textLayer')) { if (c.tagName === 'CANVAS') { c.width = 0; c.height = 0; } c.remove(); }
+      pg.classList.remove('is-rendered');
+      this.rendered.delete(n);
+      if (this.io) { this.io.unobserve(pg); this.io.observe(pg); }
+    }
+  }
+  get cur() { return this._cur || 1; }
+  updatePageNo() {
+    const sc = this.scroller.getBoundingClientRect();
+    let best = 1;
+    for (const pg of this.pages) { const r = pg.getBoundingClientRect(); if (r.top <= sc.top + sc.height / 3) best = Number(pg.getAttribute('data-page-number')); else break; }
+    this._cur = best;
+    if (this.pageInput && this.pageInput.ownerDocument.activeElement !== this.pageInput) this.pageInput.value = String(best);
+  }
+  goto(n) {
+    n = Math.max(1, Math.min(this.n || 1, Number(n) || 1));
+    const pg = this.pages[n - 1];
+    if (!pg) return;
+    this.scroller.scrollTop = pg.offsetTop - 8;
+    this._cur = n; if (this.pageInput) this.pageInput.value = String(n);
+    pg.classList.add('is-flash'); setTimeout(() => pg.classList.remove('is-flash'), 900);
+  }
+}
+
+/* 文献阅读视图：一个标签页 = 一篇文献 */
+class PaperReaderView extends ItemView {
+  constructor(leaf, plugin) { super(leaf); this.plugin = plugin; this.path = ''; this.file = null; this.ctx = null; }
+  getViewType() { return PAPER_READER_VIEW; }
+  getDisplayText() { return this.ctx ? '读：' + trunc(this.plugin.paperTitle(this.ctx), 24) : '文献阅读'; }
+  getIcon() { return 'book-open-text'; }
+  getState() { return { path: this.path, page: this.pane ? this.pane.cur : 1 }; }
+  async setState(state, result) {
+    if (state && state.path && state.path !== this.path) { this.path = state.path; await this.load(state.page); }
+    else if (state && state.page && this.pane) this.pane.goto(state.page);
+    if (super.setState) return super.setState(state, result);
+  }
+  async onOpen() { this.contentEl.classList.add('rw-root', 'rw-paper'); if (this.path && !this.ctx) await this.load(); else if (!this.path) this.renderEmpty(); }
+  async onClose() { if (this.pane) this.pane.destroy(); if (this.mf) this.mf.destroy(); }
+  renderEmpty() { clear(this.contentEl); h(this.contentEl, 'div', { cls: 'rw-empty', text: '从「文献」页选一篇文献打开阅读。' }); }
+  async load(page) {
+    const pl = this.plugin;
+    const f = this.app.vault.getAbstractFileByPath(this.path);
+    if (!f) { this.renderEmpty(); return; }
+    this.ctx = pl.paperOf(f) || { pdf: (f.extension || '').toLowerCase() === 'pdf' ? f : null, note: null, noteObj: null };
+    this.file = this.ctx.pdf || null; // 让划词翻译 / 译文标注识别出这是哪篇 PDF
+    if (this.leaf.updateHeader) this.leaf.updateHeader();
+    if (this.pane) this.pane.destroy();
+    if (this.mf) this.mf.destroy();
+    const el = this.contentEl;
+    clear(el);
+    pl.applyTheme(el);
+    const wrap = h(el, 'div', { cls: 'rw-pr' });
+    const st = pl.settings;
+    el.classList.toggle('rw-mobile', IS_MOBILE);
+    el.classList.toggle('rw-touch', TOUCH);
+    const narrow = (el.clientWidth || (el.ownerDocument.defaultView || window).innerWidth) < 700;
+    if (narrow) { wrap.classList.add('is-narrow'); if (!this._sideOpen) wrap.classList.add('is-side-hidden'); }
+    else if (st.prSideHidden) wrap.classList.add('is-side-hidden');
+    if (IS_MOBILE) setTimeout(() => pl.updateNavInset(), 60);
+    const center = h(wrap, 'div', { cls: 'rw-pr-center' });
+    const split = h(wrap, 'div', { cls: 'rw-pr-split', title: '拖动调整宽度，双击恢复' });
+    const side = h(wrap, 'div', { cls: 'rw-pr-side' });
+    side.style.width = (Number(st.prSideWidth) || 420) + 'px';
+    // 分隔条
+    split.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      const x0 = e.clientX, w0 = side.offsetWidth;
+      const mv = (ev) => { side.style.width = Math.max(280, Math.min(900, w0 + (x0 - ev.clientX))) + 'px'; };
+      const up = () => { el.ownerDocument.removeEventListener('mousemove', mv); el.ownerDocument.removeEventListener('mouseup', up); st.prSideWidth = side.offsetWidth; pl.saveSettingsSoon(); if (this.pane && this.pane.fit) this.pane.setScale(this.pane.fitScale(), true); };
+      el.ownerDocument.addEventListener('mousemove', mv); el.ownerDocument.addEventListener('mouseup', up);
+    });
+    split.addEventListener('dblclick', () => { side.style.width = '420px'; st.prSideWidth = 420; pl.saveSettingsSoon(); });
+    const toggleSide = () => {
+      if (narrow) { this._sideOpen = wrap.classList.contains('is-side-hidden'); wrap.classList.toggle('is-side-hidden', !this._sideOpen); return; }
+      st.prSideHidden = !st.prSideHidden; pl.saveSettingsSoon(); wrap.classList.toggle('is-side-hidden', !!st.prSideHidden); setTimeout(() => { if (this.pane && this.pane.fit) this.pane.setScale(this.pane.fitScale(), true); }, 30); };
+    this.toggleSide = toggleSide;
+    const extra = (bar) => {
+      h(bar, 'span', { cls: 'rw-tp-sp' });
+      const t = h(bar, 'div', { cls: 'rw-pdfv-title', text: pl.paperTitle(this.ctx), title: this.ctx.pdf ? this.ctx.pdf.path : '' });
+      if (this.ctx.noteObj && this.ctx.noteObj.projectName) t.style.setProperty('--pc', projectColor(this.ctx.noteObj.projectName));
+      h(bar, 'span', { cls: 'rw-tp-sp' });
+      const mk = (icon, title, fn) => { const x = h(bar, 'button', { cls: 'rw-tp-btn', title }); ic(x, icon); x.addEventListener('click', fn); return x; };
+      if (this.ctx.note) mk('file-text', '打开文献笔记', () => pl.openFile(this.ctx.note));
+      else mk('file-plus', '为这个 PDF 建文献笔记', async () => { await pl.createLitNoteForPdf(this.ctx.pdf); this.load(this.pane && this.pane.cur); });
+      if (this.ctx.pdf) {
+        const ftB = mk('file-down', '全文：转 Markdown / 一键全文翻译 / HTML 阅读页', (e) => { const m = new Menu(); pl.ftMenuItems(m, this.ctx.pdf); m.showAtMouseEvent(e); });
+        ftB.classList.add('rw-pr-ftbtn');
+        mk('external-link', '用 Obsidian 自带的 PDF 阅读器打开', () => pl.openFile(this.ctx.pdf)).classList.add('rw-hide-narrow');
+      }
+      const aiB = mk(narrow ? 'messages-square' : 'panel-right', narrow ? '切换到 AI 问答 / 回到 PDF' : '显示 / 隐藏右侧 AI', toggleSide);
+      if (narrow) { aiB.classList.add('rw-pr-aibtn'); h(aiB, 'span', { text: 'AI' }); }
+    };
+    if (this.ctx.pdf) {
+      this.pane = new PdfPane(pl, center, this.ctx.pdf, { page, extraButtons: extra });
+      await this.pane.load();
+    } else {
+      const bar = h(center, 'div', { cls: 'rw-pdfv-bar' });
+      extra(bar);
+      const box = h(center, 'div', { cls: 'rw-pr-nopdf' });
+      const pdfs = this.ctx.noteObj ? pl.pdfsOf(this.ctx.noteObj) : [];
+      h(box, 'div', { cls: 'rw-rd-empty-title', text: pdfs.length ? '这篇文献的 PDF 不在工作台库里' : '这篇文献还没有 PDF' });
+      h(box, 'div', { cls: 'rw-muted', text: '右侧 AI 仍可基于阅读笔记的内容回答。把 PDF 关联进来就能在这里阅读、划词翻译和标注。' });
+      const acts = h(box, 'div', { cls: 'rw-rd-acts' });
+      for (const x of pdfs) { const b = h(acts, 'button', { cls: 'rw-btn rw-btn-sm' }); h(b, 'span', { text: x.kind === 'zotero' ? '在 Zotero 打开 PDF' : '打开 PDF' }); b.addEventListener('click', () => pl.openPdf(x)); }
+      if (this.ctx.noteObj) { const b = h(acts, 'button', { cls: 'rw-btn rw-btn-sm mod-cta' }); h(b, 'span', { text: '关联 / 导入 PDF…' }); b.addEventListener('click', () => pl.pickPdfFor(this.ctx.noteObj)); }
+    }
+    this.mf = new MindflowPanel(pl, side, this.ctx);
+    await this.mf.load();
+    pl.scanPdfViews();
+  }
+}
+
+/* 编辑一段较长文字 */
+class EditTextModal extends Modal {
+  constructor(app, title, value, cb) { super(app); this.t = title; this.v = value || ''; this.cb = cb; }
+  onOpen() {
+    const c = this.contentEl;
+    c.classList.add('rw-modal');
+    this.modalEl.classList.add('rw-edit-modal');
+    this.titleEl.setText(this.t);
+    const ta = h(c, 'textarea', { cls: 'rw-edit-ta' });
+    ta.value = this.v;
+    const save = () => { this.cb(ta.value); this.close(); };
+    ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(); } });
+    new Setting(c).setDesc('Ctrl/Cmd+Enter 保存').addButton((b) => b.setButtonText('取消').onClick(() => this.close())).addButton((b) => b.setButtonText('保存').setCta().onClick(save));
+    setTimeout(() => ta.focus(), 30);
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+/* 我的文献（表格）：添加 / 编辑 AI 列 */
+class PgColumnModal extends Modal {
+  constructor(app, plugin, col, done) { super(app); this.plugin = plugin; this.col = col; this.done = done; }
+  onOpen() {
+    const c = this.contentEl;
+    c.classList.add('rw-modal');
+    this.modalEl.classList.add('rw-pgcol-modal');
+    this.titleEl.setText(this.col ? '编辑 AI 列' : '添加 AI 分析列');
+    const pl = this.plugin;
+    const cols = pl.pgColumns();
+    if (!this.col) {
+      h(c, 'div', { cls: 'rw-muted', text: '一键添加常用分析维度：' });
+      const chips = h(c, 'div', { cls: 'rw-chat-quick rw-pgcol-presets' });
+      const mine = Array.isArray(pl.settings.pgMyPresets) ? pl.settings.pgMyPresets : [];
+      for (const p of PG_PRESET_COLUMNS.concat(mine)) {
+        if (cols.some((x) => x.name === p.name)) continue;
+        const b = h(chips, 'button', { cls: 'rw-catchip', text: '+ ' + p.name, title: p.prompt });
+        b.addEventListener('click', async () => { cols.push({ id: uid(), name: p.name, prompt: p.prompt }); await pl.saveSettings(); this.close(); this.done(); });
+      }
+      h(c, 'div', { cls: 'rw-muted', text: '或者自定义：' }).style.marginTop = '12px';
+    }
+    let name = this.col ? this.col.name : '';
+    let prompt = this.col ? this.col.prompt : '';
+    new Setting(c).setName('列名').addText((t) => t.setPlaceholder('例如：创新点').setValue(name).onChange((v) => (name = v)));
+    h(c, 'div', { cls: 'rw-muted', text: '让 AI 怎么回答（会读全文）：' });
+    const ta = h(c, 'textarea', { cls: 'rw-edit-ta', attr: { rows: '4', placeholder: '例如：用一段话写出相对于已有研究的主要创新，不超过 300 字。' } });
+    ta.value = prompt;
+    ta.addEventListener('input', () => (prompt = ta.value));
+    new Setting(c).addButton((b) => b.setButtonText('取消').onClick(() => this.close())).addButton((b) => b.setButtonText(this.col ? '保存' : '添加').setCta().onClick(async () => {
+      name = name.trim(); prompt = prompt.trim();
+      if (!name || !prompt) return new Notice('列名和要求都要填');
+      if (this.col) { const changed = this.col.prompt !== prompt; this.col.name = name; this.col.prompt = prompt; if (changed) for (const r of Object.values(pl._pg || {})) if (r[this.col.id]) r[this.col.id].stale = true; }
+      else {
+        cols.push({ id: uid(), name, prompt });
+        const mine = Array.isArray(pl.settings.pgMyPresets) ? pl.settings.pgMyPresets : (pl.settings.pgMyPresets = []);
+        if (!mine.some((x) => x.name === name) && !PG_PRESET_COLUMNS.some((x) => x.name === name)) mine.push({ name, prompt });
+      }
+      await pl.saveSettings();
+      this.close(); this.done();
+    }));
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+/* 笔记摘录：手动记一条 */
+class ManualExcerptModal extends Modal {
+  constructor(app, plugin, papers, preset, done) { super(app); this.plugin = plugin; this.papers = papers; this.n = preset || papers[0]; this.done = done; }
+  onOpen() {
+    const c = this.contentEl;
+    c.classList.add('rw-modal');
+    this.modalEl.classList.add('rw-edit-modal');
+    this.titleEl.setText('手动记一条摘录');
+    new Setting(c).setName('文献').addDropdown((d) => { this.papers.forEach((n, i) => d.addOption(String(i), trunc(n.title, 50))); d.setValue(String(this.papers.indexOf(this.n))).onChange((v) => (this.n = this.papers[Number(v)])); });
+    let page = '';
+    new Setting(c).setName('页码（可不填）').addText((t) => t.setValue('').onChange((v) => (page = v.trim())));
+    h(c, 'div', { cls: 'rw-muted', text: '原文 / 要点：' });
+    const q = h(c, 'textarea', { cls: 'rw-edit-ta', attr: { rows: '3' } });
+    h(c, 'div', { cls: 'rw-muted', text: '我的笔记：' });
+    const nt = h(c, 'textarea', { cls: 'rw-edit-ta', attr: { rows: '3' } });
+    new Setting(c).addButton((b) => b.setButtonText('保存').setCta().onClick(async () => {
+      if (!q.value.trim() && !nt.value.trim()) return new Notice('写点内容吧');
+      const ctx = this.plugin.paperOf(this.n.file);
+      await this.plugin.addExcerpt({ note: this.n.file, pdf: ctx && ctx.pdf, page: page.replace(/\D/g, ''), text: q.value.trim(), noteText: nt.value.trim(), source: '手动' });
+      this.close(); this.done();
+    }));
+    setTimeout(() => q.focus(), 30);
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+class WorkbenchSettingTab extends PluginSettingTab {
+  constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
+  /* 划词按钮列表：开关 / 名称 / 方式 / 上下移 / 删除 / 提示词 */
+  renderSelPresets(containerEl) {
+    const pl = this.plugin;
+    const list = pl.selPresets(true);
+    const save = () => pl.saveSettingsSoon();
+    const wrap = h(containerEl, 'div', { cls: 'rw-selp' });
+    h(wrap, 'div', { cls: 'rw-selp-title', text: '划词按钮' });
+    h(wrap, 'div', { cls: 'setting-item-description', text: '在 PDF 里选中文字后，翻译小窗、小气泡和右键菜单里显示的按钮。选中的原文会自动附在提示词后面发给 AI。「立即发问」点了就发到右侧 AI 问答（会长成问答树）；「引用后自己问」只把原文放到右侧输入框上方，提示词会先填进输入框，等你改好再发；「小窗里回答」直接在翻译小窗里出结果。改完马上生效。' });
+    const redraw = () => { const tmp = document.createElement('div'); const w2 = this.renderSelPresets(tmp); wrap.replaceWith(w2); };
+    list.forEach((sp, i) => {
+      const card = h(wrap, 'div', { cls: 'rw-selp-card' + (sp.on === false ? ' is-off' : '') });
+      const row = h(card, 'div', { cls: 'rw-selp-row' });
+      const cb = h(row, 'input', { attr: { type: 'checkbox', title: '显示这个按钮' } });
+      cb.checked = sp.on !== false;
+      cb.addEventListener('change', () => { sp.on = cb.checked; card.classList.toggle('is-off', !cb.checked); save(); });
+      const nm = h(row, 'input', { cls: 'rw-selp-name', attr: { type: 'text', placeholder: '按钮名称' } });
+      nm.value = sp.name || '';
+      nm.addEventListener('input', () => { sp.name = nm.value; save(); });
+      const md = h(row, 'select', { cls: 'dropdown rw-selp-mode' });
+      for (const [v, t] of SEL_PRESET_MODES) { const o = h(md, 'option', { text: t }); o.value = v; }
+      md.value = sp.mode || 'send';
+      md.addEventListener('change', () => { sp.mode = md.value; save(); });
+      h(row, 'span', { cls: 'rw-tp-sp' });
+      const mv = (d) => { const j = i + d; if (j < 0 || j >= list.length) return; list.splice(j, 0, list.splice(i, 1)[0]); save(); redraw(); };
+      const b = (txt, title, fn, dis) => { const x = h(row, 'button', { cls: 'rw-selp-btn', text: txt, title }); if (dis) x.disabled = true; x.addEventListener('click', fn); return x; };
+      b('↑', '上移', () => mv(-1), i === 0);
+      b('↓', '下移', () => mv(1), i === list.length - 1);
+      b('删除', '删除这个按钮', () => { list.splice(i, 1); save(); redraw(); });
+      const ta = h(card, 'textarea', { cls: 'rw-selp-prompt', attr: { rows: '2', placeholder: sp.mode === 'quote' ? '（可留空）先填进输入框的问题' : '提示词，例如：请解释下面选中的原文…' } });
+      ta.value = sp.prompt || '';
+      ta.addEventListener('input', () => { sp.prompt = ta.value; save(); });
+    });
+    const foot = h(wrap, 'div', { cls: 'rw-selp-foot' });
+    const add = h(foot, 'button', { cls: 'mod-cta', text: '+ 添加按钮' });
+    add.addEventListener('click', () => { list.push({ id: uid(), on: true, name: '新按钮', mode: 'send', prompt: '' }); save(); redraw(); });
+    const rs = h(foot, 'button', { text: '恢复默认' });
+    rs.addEventListener('click', () => { pl.settings.selPresets = DEFAULT_SEL_PRESETS.map((x) => Object.assign({}, x)); save(); redraw(); });
+    const lab = h(foot, 'label', { cls: 'rw-check' });
+    const cb2 = h(lab, 'input', { attr: { type: 'checkbox' } });
+    cb2.checked = pl.settings.selPresetsInBubble !== false;
+    h(lab, 'span', { text: '小气泡里也显示这些按钮' });
+    cb2.addEventListener('change', () => { pl.settings.selPresetsInBubble = cb2.checked; save(); });
+    return wrap;
+  }
+  display() {
+    const { containerEl } = this;
+    clear(containerEl);
+    const s = this.plugin.settings;
+    new Setting(containerEl).setName('科研根目录').setDesc('项目与笔记的存放位置。项目会建在「根目录/项目/<项目名>/」。插件按 frontmatter 识别笔记，放在别处的笔记也能被统计到。')
+      .addText((t) => t.setValue(s.rootFolder).onChange(async (v) => { s.rootFolder = v.trim() || '科研'; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('启动时打开工作台').addToggle((t) => t.setValue(s.openOnStartup).onChange(async (v) => { s.openOnStartup = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('默认标签页').addDropdown((d) => { TABS.forEach((t) => d.addOption(t.id, t.label)); d.setValue(s.defaultTab).onChange(async (v) => { s.defaultTab = v; s.lastTab = v; await this.plugin.saveSettings(); }); });
+    new Setting(containerEl).setName('文件与 Zotero').setHeading();
+    new Setting(containerEl).setName('大文件默认只记录链接（MB）').setDesc('拖入的文件超过这个大小时，默认不复制进库，只记录原位置。导入时仍可手动切换。')
+      .addText((t) => t.setValue(String(s.linkThresholdMB)).onChange(async (v) => { const n = Number(v); if (n > 0) { s.linkThresholdMB = n; await this.plugin.saveSettings(); } }));
+    new Setting(containerEl).setName('Zotero 端口').setDesc('Zotero 7 本地接口端口，默认 23119。需要在 Zotero → 设置 → 高级 中勾选「允许此计算机上的其他应用程序与 Zotero 通讯」。')
+      .addText((t) => t.setValue(String(s.zoteroPort)).onChange(async (v) => { const n = Number(v); if (n > 0) { s.zoteroPort = n; await this.plugin.saveSettings(); } }))
+      .addButton((b) => b.setButtonText('测试连接').onClick(async () => {
+        const st = await this.plugin.zoteroStatus();
+        new Notice(st.ok ? '✅ 已连接 Zotero' : '❌ ' + (st.code === 'disabled' ? 'Zotero 已运行，但本地接口未开启' : '连不上 Zotero，请先打开 Zotero 7') + '\n' + (st.message || ''), 6000);
+      }));
+    new Setting(containerEl).setName('导入 Zotero 文献时同步批注').addToggle((t) => t.setValue(s.zoteroAnnotations).onChange(async (v) => { s.zoteroAnnotations = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('网页链接打开方式').setDesc('灵感页链接、文献 DOI / URL 等。选「Obsidian 内置浏览器」需要在 设置 → 核心插件 中开启「网页浏览器」')
+      .addDropdown((d) => d.addOption('obsidian', 'Obsidian 内置浏览器').addOption('system', '系统默认浏览器').setValue(s.linkOpen || 'obsidian').onChange(async (v) => { s.linkOpen = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('点击文献标题时').setDesc('「阅读」= 打开文献阅读视图（中间 PDF、右侧 AI 问答）')
+      .addDropdown((d) => d.addOption('reader', '进入文献阅读').addOption('note', '打开阅读笔记').setValue(s.litTitleClick === 'note' ? 'note' : 'reader').onChange(async (v) => { s.litTitleClick = v; await this.plugin.saveSettings(); this.plugin.refreshViews(); }));
+    new Setting(containerEl).setName('点「PDF · 库内」时').addDropdown((d) => d.addOption('reader', '用文献阅读视图打开（可问 AI）').addOption('obsidian', '用 Obsidian 自带的 PDF 阅读器').setValue(s.pdfOpenIn === 'obsidian' ? 'obsidian' : 'reader').onChange(async (v) => { s.pdfOpenIn = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('PDF 转换与全文翻译').setHeading();
+    h(containerEl, 'div', { cls: 'setting-item-description', text: '在文献阅读视图工具栏的「全文」按钮、文献右键菜单里使用：PDF 转 Markdown、一键全文翻译、生成中英对照的 HTML 阅读页。结果放在「' + this.plugin.ftRoot() + '/」，随库同步。' });
+    new Setting(containerEl).setName('PDF 转 Markdown 的方式').setDesc('本地提取：免费、不联网，只有文字和标题（没有公式和表格结构）。MinerU / Mistral：公式、表格、图片都能还原，需要密钥')
+      .addDropdown((d) => { for (const [v, t] of FT_PROVIDERS) d.addOption(v, t); d.setValue(s.ftProvider || 'local').onChange(async (v) => { s.ftProvider = v; await this.plugin.saveSettings(); this.display(); }); });
+    if ((s.ftProvider || 'local') === 'mineru') {
+      new Setting(containerEl).setName('MinerU API Token').setDesc('在 mineru.net 登录 → 个人中心 → API Token 申请')
+        .addText((t) => { t.inputEl.type = 'password'; t.setValue(s.mineruToken || '').onChange(async (v) => { s.mineruToken = v.trim(); await this.plugin.saveSettings(); }); });
+      new Setting(containerEl).setName('MinerU 模型 / 语言').setDesc('vlm 效果最好；pipeline 更快。语言选论文正文的语言')
+        .addDropdown((d) => d.addOption('vlm', 'vlm（推荐）').addOption('pipeline', 'pipeline').setValue(s.mineruModel || 'vlm').onChange(async (v) => { s.mineruModel = v; await this.plugin.saveSettings(); }))
+        .addDropdown((d) => d.addOption('en', '英文').addOption('ch', '中文').setValue(s.mineruLang || 'en').onChange(async (v) => { s.mineruLang = v; await this.plugin.saveSettings(); }));
+      new Setting(containerEl).setName('MinerU 强制 OCR').setDesc('扫描版 PDF 才需要打开').addToggle((t) => t.setValue(!!s.mineruOcr).onChange(async (v) => { s.mineruOcr = v; await this.plugin.saveSettings(); }));
+    }
+    if ((s.ftProvider || 'local') === 'mistral') {
+      new Setting(containerEl).setName('Mistral API Key').setDesc('在 console.mistral.ai 申请；使用 mistral-ocr-latest 模型')
+        .addText((t) => { t.inputEl.type = 'password'; t.setValue(s.mistralKey || '').onChange(async (v) => { s.mistralKey = v.trim(); await this.plugin.saveSettings(); }); });
+    }
+    new Setting(containerEl).setName('全文翻译默认引擎').setDesc('AI：用上面的 AI 接口，质量更好、公式和格式保留得更稳。机器翻译：用划词翻译的服务（不花 AI 额度）')
+      .addDropdown((d) => d.addOption('ai', 'AI 翻译').addOption('machine', '机器翻译').setValue(s.ftEngine || 'ai').onChange(async (v) => { s.ftEngine = v; await this.plugin.saveSettings(); }))
+      .addDropdown((d) => { for (const k of TRANS_ORDER.filter((x) => x !== 'llm')) d.addOption(k, '机器翻译用：' + TRANS_SERVICES[k].label); d.setValue(s.ftMachineService || s.transService || 'google').onChange(async (v) => { s.ftMachineService = v; await this.plugin.saveSettings(); }); });
+    new Setting(containerEl).setName('HTML 阅读页').setDesc('转完 / 翻完自动生成单文件 HTML（公式离线渲染、图片内嵌，手机上也能看）；有译文时默认显示方式')
+      .addToggle((t) => t.setValue(s.ftAutoHtml !== false).onChange(async (v) => { s.ftAutoHtml = v; await this.plugin.saveSettings(); }))
+      .addDropdown((d) => d.addOption('dual', '中英对照').addOption('zh', '只看中文').addOption('en', '只看英文').setValue(s.ftHtmlMode || 'dual').onChange(async (v) => { s.ftHtmlMode = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('识别文献标题').setDesc('从 PDF 认出真实标题、作者、年份、期刊、DOI，写进文献笔记（只填空着的）。新建文献笔记时自动识别；能用 AI 时让 AI 根据第一页校对（更准，会用一点 AI 额度）')
+      .addToggle((t) => t.setValue(s.litAutoMeta !== false).onChange(async (v) => { s.litAutoMeta = v; await this.plugin.saveSettings(); }))
+      .addDropdown((d) => d.addOption('ai', '用 AI 校对').addOption('local', '只用 PDF 排版').setValue(s.litMetaAi === false ? 'local' : 'ai').onChange(async (v) => { s.litMetaAi = v === 'ai'; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('划词翻译与文献阅读').setHeading();
+    this.renderSelPresets(containerEl);
+    new Setting(containerEl).setName('选中文字后').setDesc('在 PDF 里选中文字时的行为。也可以用命令「翻译选中的文字」并绑定快捷键')
+      .addDropdown((d) => d.addOption('auto', '弹出翻译小窗').addOption('button', '先显示「译 / 标」小按钮').addOption('gloss', '直接把译文标在原文上方（Remarkble）').addOption('off', '不自动翻译').setValue(s.transTrigger || 'auto').onChange(async (v) => { s.transTrigger = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('在哪里划词翻译')
+      .addDropdown((d) => d.addOption('pdf', '只在 PDF 里').addOption('all', 'PDF 和笔记里都可以').setValue(s.transScope || 'pdf').onChange(async (v) => { s.transScope = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('翻译成').addDropdown((d) => { TRANS_LANGS.forEach(([k, v]) => d.addOption(k, v)); d.setValue(s.transTo || 'zh-CN').onChange(async (v) => { s.transTo = v; await this.plugin.saveSettings(); }); });
+    new Setting(containerEl).setName('默认翻译服务').setDesc(TRANS_ORDER.map((k) => TRANS_SERVICES[k].label + '：' + TRANS_SERVICES[k].desc).join('；'))
+      .addDropdown((d) => { TRANS_ORDER.forEach((k) => d.addOption(k, TRANS_SERVICES[k].label)); d.setValue(s.transService || 'google').onChange(async (v) => { s.transService = v; await this.plugin.saveSettings(); }); })
+      .addButton((b) => b.setButtonText('测试').onClick(async () => {
+        try { const r = await this.plugin.translate('Direction-of-arrival estimation with deep neural networks.', s.transService); new Notice('✅ ' + TRANS_SERVICES[s.transService].label + '：' + r, 6000); }
+        catch (e) { new Notice('❌ ' + e.message, 8000); }
+      }));
+    new Setting(containerEl).setName('翻译小窗默认展开原文').addToggle((t) => t.setValue(!!s.transShowSource).onChange(async (v) => { s.transShowSource = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('打开文献 PDF 时自动打开阅读面板').setDesc('右侧栏显示这篇文献的信息、翻译记录和划线摘录').addToggle((t) => t.setValue(s.readerAuto !== false).onChange(async (v) => { s.readerAuto = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('标在原文上方（Remarkble）').setHeading();
+    new Setting(containerEl).setName('显示 PDF 上的译文').setDesc('译文按 PDF 分别保存在插件目录的 glosses/ 里，PDF 文件本身不会被修改。快捷键默认 Alt+Shift+T')
+      .addToggle((t) => t.setValue(s.glossShow !== false).onChange(async (v) => { s.glossShow = v; await this.plugin.saveSettings(); this.plugin.repaintAllGlosses(); }));
+    new Setting(containerEl).setName('标注用的翻译服务').setDesc('留空 = 跟随上面的默认翻译服务')
+      .addDropdown((d) => { d.addOption('', '跟随默认'); TRANS_ORDER.forEach((k) => d.addOption(k, TRANS_SERVICES[k].label)); d.setValue(s.glossService || '').onChange(async (v) => { s.glossService = v; await this.plugin.saveSettings(); }); });
+    new Setting(containerEl).setName('译文位置').setDesc('对全部译文生效。阅读 PDF 时点工具栏的「Aa」或单击某条译文，可以边看边调')
+      .addDropdown((d) => d.addOption('above', '原文上方').addOption('below', '原文下方').setValue(s.glossPlace || 'above').onChange(async (v) => { s.glossPlace = v; await this.plugin.saveSettings(); this.plugin.repaintAllGlosses(); }));
+    new Setting(containerEl).setName('与原文的距离').setDesc('单位是原文行高：0 = 紧贴原文，1 = 隔一行，负数 = 压到原文上。默认 0.18')
+      .addSlider((sl) => sl.setLimits(-1, 3, 0.05).setValue(s.glossGap != null && s.glossGap !== '' ? Number(s.glossGap) : 0.18).setDynamicTooltip().onChange(async (v) => { s.glossGap = v; await this.plugin.saveSettings(); this.plugin.repaintAllGlosses(); }));
+    new Setting(containerEl).setName('译文字号').setDesc('原文行高的倍数，默认 0.5')
+      .addSlider((sl) => sl.setLimits(0.25, 1.6, 0.05).setValue(Number(s.glossScale) || 0.5).setDynamicTooltip().onChange(async (v) => { s.glossScale = v; await this.plugin.saveSettings(); this.plugin.repaintAllGlosses(); }));
+    new Setting(containerEl).setName('译文颜色')
+      .addText((t) => { t.inputEl.type = 'color'; t.setValue(s.glossColor || '#9f1239').onChange(async (v) => { s.glossColor = v; await this.plugin.saveSettings(); this.plugin.repaintAllGlosses(); }); });
+    new Setting(containerEl).setName('清除各条译文的单独设置').setDesc('之前单独调过字号 / 距离 / 位置的译文，会改回跟随上面的统一设置（拖动过的位置不变）')
+      .addButton((b) => b.setButtonText('全部改回统一样式').onClick(async () => { const n = await this.plugin.resetGlossOverrides(); new Notice('已重置 ' + n + ' 条译文'); }));
+    new Setting(containerEl).setName('AI').setHeading();
+    new Setting(containerEl).setName('密钥').setHeading();
+    new Setting(containerEl).setName('DeepL API Key').setDesc('免费版 Key 以 :fx 结尾，会自动用免费接口')
+      .addText((t) => { t.inputEl.type = 'password'; t.setValue(s.deeplKey || '').onChange(async (v) => { s.deeplKey = v.trim(); await this.plugin.saveSettings(); }); });
+    new Setting(containerEl).setName('百度翻译 APPID / 密钥').setDesc('在 百度翻译开放平台 → 管理控制台 里查看')
+      .addText((t) => t.setPlaceholder('APPID').setValue(s.baiduAppId || '').onChange(async (v) => { s.baiduAppId = v.trim(); await this.plugin.saveSettings(); }))
+      .addText((t) => { t.inputEl.type = 'password'; t.setPlaceholder('密钥').setValue(s.baiduKey || '').onChange(async (v) => { s.baiduKey = v.trim(); await this.plugin.saveSettings(); }); });
+    new Setting(containerEl).setName('AI 接口').setDesc('文献阅读的问答树、我的文献表格、解释 / 总结 / 速读、「AI 大模型」翻译都用它。OpenAI 兼容格式。例：DeepSeek https://api.deepseek.com（模型 deepseek-flash 或 deepseek-v4-pro；旧的 deepseek-chat 已停用）；Kimi https://api.moonshot.cn/v1；通义 https://dashscope.aliyuncs.com/compatible-mode/v1')
+      .addText((t) => t.setPlaceholder('接口地址').setValue(s.llmBase || '').onChange(async (v) => { s.llmBase = v.trim(); await this.plugin.saveSettings(); }))
+      .addText((t) => t.setPlaceholder('模型名').setValue(s.llmModel || '').onChange(async (v) => { s.llmModel = v.trim(); await this.plugin.saveSettings(); }))
+      .addText((t) => { t.inputEl.type = 'password'; t.setPlaceholder('API Key').setValue(s.llmKey || '').onChange(async (v) => { s.llmKey = v.trim(); await this.plugin.saveSettings(); }); });
+    new Setting(containerEl).setName('识图模型').setDesc('问答里带图片时改用这个模型（同一个接口地址和密钥）。留空 = 用上面的模型。如果当前模型不能看图，这里填一个支持图片的模型，比如 qwen-vl-max、gpt-4o')
+      .addText((t) => t.setPlaceholder('留空 = 用上面的模型').setValue(s.llmVisionModel || '').onChange(async (v) => { s.llmVisionModel = v.trim(); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('深度思考').setDesc('DeepSeek 新模型（deepseek-flash / deepseek-v4-pro）默认会先「思考」再回答，答得更好但更慢。自动 = 问答和表格用思考，翻译不用；思考把额度用完没写出正文时会自动关掉思考重答')
+      .addDropdown((d) => d.addOption('auto', '自动').addOption('on', '总是开').addOption('off', '关闭（更快）').setValue(s.llmThinking || 'auto').onChange(async (v) => { s.llmThinking = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('最大输出').setDesc('每次回答最多多少 token（含思考）。留空 = 用接口默认值；写长文可以填 32000')
+      .addText((t) => t.setPlaceholder('留空').setValue(String(s.llmMaxTokens || '')).onChange(async (v) => { s.llmMaxTokens = v.replace(/\D/g, ''); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('AI 读论文的长度').setDesc('每次把论文正文的前多少个字符发给 AI（越大越全，也越贵）。默认 60000')
+      .addText((t) => t.setValue(String(s.aiContextChars || 60000)).onChange(async (v) => { const n = Number(v); if (n >= 2000) { s.aiContextChars = n; await this.plugin.saveSettings(); } }))
+      .addButton((b) => b.setButtonText('测试 AI').onClick(async () => { try { const r = await this.plugin.directChat([{ role: 'user', content: '用一句话介绍你自己' }]); new Notice('✅ ' + r.slice(0, 120), 6000); } catch (e) { new Notice('❌ ' + e.message, 8000); } }));
+    new Setting(containerEl).setName('划线追问的预设问题').setDesc('在 AI 回答里划线后，追问小窗里一点就发。一行一个')
+      .addTextArea((t) => t.setValue((Array.isArray(s.mfPresets) && s.mfPresets.length ? s.mfPresets : MF_PRESETS).join('\n')).onChange(async (v) => { s.mfPresets = v.split('\n').map((x) => x.trim()).filter(Boolean); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('AI 翻译提示词').setDesc('{lang} 会替换成目标语言。留空用默认：' + DEFAULT_LLM_PROMPT)
+      .addTextArea((t) => t.setValue(s.llmPrompt || '').onChange(async (v) => { s.llmPrompt = v; await this.plugin.saveSettings(); }));
+    // ── Mindflow（合并进来的划线追问对话） ──
+    const mfp = this.plugin.mindflow;
+    if (mfp && mfp.settings && this.plugin.mfSettingTab) {
+      new Setting(containerEl).setName('Mindflow').setHeading();
+      new Setting(containerEl).setName('Mindflow 使用工作台的 AI 接口').setDesc('打开 = 和上面「AI」一节共用接口地址、密钥和模型，也共用深度思考的处理。关掉后可以在下面给 Mindflow 单独配接口（比如单独的识图模型）')
+        .addToggle((t) => t.setValue(mfp.settings.useHostAi !== false).onChange(async (v) => { mfp.settings.useHostAi = v; await mfp.saveSettings(); this.display(); }));
+      const box = h(containerEl, 'div', { cls: 'rw-mf-settings' });
+      const tab = this.plugin.mfSettingTab;
+      tab.containerEl = box;
+      try { tab.display(); } catch (e) { h(box, 'div', { cls: 'rw-muted', text: 'Mindflow 设置加载失败：' + e.message }); }
+    }
+    new Setting(containerEl).setName('其他').setHeading();
+    new Setting(containerEl).setName('全局记录（自动）').setDesc('自动记下新建、导入、加入灵感、移动、改名、删除、编辑、改状态，存在「工作台数据/全局记录/年-月.md」，和手写的科研日志分开')
+      .addToggle((t) => t.setValue(s.activityOn !== false).onChange(async (v) => { s.activityOn = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('全局记录里包含「编辑」').setDesc('同一个文件 30 分钟内的连续编辑合成一条')
+      .addToggle((t) => t.setValue(s.activityEdits !== false).onChange(async (v) => { s.activityEdits = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('科研日志标签').setDesc('首页「科研日志」里的快捷标签，用逗号分隔')
+      .addText((t) => t.setValue((s.logTags || []).join(', ')).onChange(async (v) => { s.logTags = v.split(/[,，]/).map((x) => x.trim().replace(/^#/, '')).filter(Boolean); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('工作台数据文件夹').setDesc('PDF 上的译文标注、AI 问答树、「我的文献」表格结果都存在这里（普通 md 文件），跟着库一起同步到手机和其他电脑。不要手动改里面的文件')
+      .addText((t) => t.setPlaceholder((s.rootFolder || '科研') + '/工作台数据').setValue(s.dataFolder || '').onChange(async (v) => { s.dataFolder = v.trim(); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('AI 协作约定').setDesc('在仓库根目录生成 CLAUDE.md 和 AGENTS.md，让 Claude Code / Codex 按工作台的格式生成笔记。')
+      .addButton((b) => b.setButtonText('生成 / 更新').onClick(() => this.plugin.writeAgentGuide()));
+    const info = h(containerEl, 'div', { cls: 'setting-item-description' });
+    info.style.marginTop = '16px';
+    info.textContent = '项目类型与流程：' + KIND_ORDER.map((k) => KINDS[k].label + '（' + (KINDS[k].stages.length ? KINDS[k].stages.map((x) => x.id).join(' → ') : '无流程') + '）').join('；') + '。类型和阶段分别写在项目主页的 kind、stage 属性里，可在工作台里直接修改。';
+  }
+}
+
+/* ───────────────────────── 插件主体 ───────────────────────── */
+
+/* ═════════ PDF 全文：转 Markdown / HTML 阅读页 / 一键全文翻译（移植自 PaperGrid，直接在 Obsidian 里跑，不需要 Companion） ═════════ */
+const __mdh = { katex: null };
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function escapeAttr(value) {
+  return escapeHtml(value).replace(/"/g, "&quot;");
+}
+
+function firstHeading(markdown) {
+  const match = String(markdown || "").match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/m);
+  return match ? match[1].replace(/[*_`]/g, "").trim() : "";
+}
+
+function preprocessMathPlain(markdown) {
+  const withDelimiters = String(markdown || "")
+    .replace(/\\\[((?:.|\n)*?)\\\]/g, (_match, formula) => `\n$$\n${formula.trim()}\n$$\n`)
+    .replace(/\\\(((?:.|\n)*?)\\\)/g, (_match, formula) => `$${formula.trim()}$`)
+    .replace(/\n\$\n([\s\S]*?)\n\$\n/g, (_match, formula) => `\n$$\n${formula.trim()}\n$$\n`);
+  let inFence = false;
+  return withDelimiters.split(/\r?\n/).map((line) => {
+    if (/^(```|~~~)/.test(line.trim())) {
+      inFence = !inFence;
+      return line;
+    }
+    if (inFence) return line;
+    const display = line.match(/^[ \t]*\$\$([^\n]+?)\$\$[ \t]*$/);
+    if (!display) return line;
+    return `$$\n${display[1].trim()}\n$$`;
+  }).join("\n");
+}
+
+/** 与阅读页一致，但不要改写 HTML 表格内部，否则表格里的公式会被拆碎。 */
+function preprocessMath(markdown) {
+  const parts = String(markdown || "").split(/(<table\b[\s\S]*?<\/table>)/gi);
+  return parts.map((part, index) => (index % 2 === 1 ? part : preprocessMathPlain(part))).join("");
+}
+
+function renderTex(tex, display) {
+  const source = String(tex || "").trim();
+  if (!source) return "";
+  try {
+    if (!__mdh.katex) return `<span class="math-raw">${escapeHtml(display ? "$$" + source + "$$" : "$" + source + "$")}</span>`;
+    return __mdh.katex.renderToString(source, {
+      displayMode: display,
+      output: "htmlAndMathml",
+      throwOnError: false,
+      strict: "ignore",
+      trust: true
+    });
+  } catch {
+    return `<code>${escapeHtml(source)}</code>`;
+  }
+}
+
+function renderMathSource(text) {
+  const tokens = [];
+  const stash = (html) => {
+    tokens.push(html);
+    return `\u0000${tokens.length - 1}\u0000`;
+  };
+  let out = String(text ?? "");
+  out = out.replace(/\\\[([\s\S]+?)\\\]/g, (_match, tex) => stash(renderTex(tex, true)));
+  out = out.replace(/\\\(([\s\S]+?)\\\)/g, (_match, tex) => stash(renderTex(tex, false)));
+  out = out.replace(/\$\$([\s\S]+?)\$\$/g, (_match, tex) => stash(renderTex(tex, true)));
+  out = out.replace(/(?<!\$)\$([^$\n]+?)\$(?!\$)/g, (_match, tex) => stash(renderTex(tex, false)));
+  return out.replace(/\u0000(\d+)\u0000/g, (_match, index) => tokens[Number(index)] || "");
+}
+
+function sanitizeHtmlFragment(html) {
+  return String(html || "")
+    .replace(/<script\b[\s\S]*?<\/script>/gi, "")
+    .replace(/<iframe\b[\s\S]*?<\/iframe>/gi, "")
+    .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+}
+
+function renderMathInHtml(html) {
+  return sanitizeHtmlFragment(html).replace(/>([^<]*)</g, (all, text) => {
+    if (!/[$\\]/.test(text)) return all;
+    return `>${renderMathSource(text)}<`;
+  });
+}
+
+function mimeForName(name) {
+  const lower = String(name || "").toLowerCase();
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".svg")) return "image/svg+xml";
+  return "image/jpeg";
+}
+
+
+
+function isTableSeparator(line) {
+  const text = String(line || "").trim();
+  if (!text.includes("-") || !text.includes("|")) return false;
+  return /^\|?[\s:|-]+\|[\s:|-]*$/.test(text) && /-/.test(text);
+}
+
+function splitTableRow(line) {
+  let text = String(line || "").trim();
+  if (text.startsWith("|")) text = text.slice(1);
+  if (text.endsWith("|")) text = text.slice(0, -1);
+  return text.split("|").map((cell) => cell.trim());
+}
+
+function renderInline(text, images) {
+  const tokens = [];
+  const stash = (html) => {
+    tokens.push(html);
+    return `\u0000${tokens.length - 1}\u0000`;
+  };
+  let out = String(text ?? "");
+  out = out.replace(/`([^`]+)`/g, (_match, code) => stash(`<code>${escapeHtml(code)}</code>`));
+  out = out.replace(/!\[([^\]]*)\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)/g, (_match, alt, href) => {
+    const src = images.get(href);
+    if (!src) return stash(`<span>${escapeHtml(alt || href)}</span>`);
+    return stash(`<img src="${escapeAttr(src)}" alt="${escapeAttr(alt)}">`);
+  });
+  out = out.replace(/\[([^\]]+)\]\(\s*([^)\s]+)(?:\s+"[^"]*")?\s*\)/g, (_match, label, href) =>
+    stash(`<a href="${escapeAttr(href)}">${escapeHtml(label)}</a>`)
+  );
+  out = out.replace(/\\\[([\s\S]+?)\\\]/g, (_match, tex) => stash(renderTex(tex, true)));
+  out = out.replace(/\\\(([\s\S]+?)\\\)/g, (_match, tex) => stash(renderTex(tex, false)));
+  out = out.replace(/\$\$([\s\S]+?)\$\$/g, (_match, tex) => stash(renderTex(tex, true)));
+  out = out.replace(/(?<!\$)\$([^$\n]+?)\$(?!\$)/g, (_match, tex) => stash(renderTex(tex, false)));
+  out = out.replace(/<\/?(?:sup|sub|br)\b[^>]*>/gi, (tag) => stash(tag));
+  out = escapeHtml(out)
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/__([^_\n]+)__/g, "<strong>$1</strong>")
+    .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
+    .replace(/(^|[^\w])_([^_\n]+)_/g, "$1<em>$2</em>")
+    .replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+  return out.replace(/\u0000(\d+)\u0000/g, (_match, index) => tokens[Number(index)] || "");
+}
+
+function isTableStart(lines, index) {
+  return lines[index].includes("|") && index + 1 < lines.length && isTableSeparator(lines[index + 1]);
+}
+
+function renderBlocks(markdown, images, ids) {
+  const lines = String(markdown || "").replace(/\r\n?/g, "\n").split("\n");
+  const html = [];
+  let index = 0;
+  const state = ids || { n: 0, prefix: "h" };
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const fence = line.match(/^\s*(```+|~~~+)/);
+    if (fence) {
+      const marker = fence[1][0].repeat(3);
+      const code = [];
+      index += 1;
+      while (index < lines.length && !new RegExp(`^\\s*${marker}`).test(lines[index])) {
+        code.push(lines[index]);
+        index += 1;
+      }
+      index += 1;
+      html.push(`<pre><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+      continue;
+    }
+
+    if (line.trim() === "$$") {
+      const formula = [];
+      index += 1;
+      while (index < lines.length && lines[index].trim() !== "$$") {
+        formula.push(lines[index]);
+        index += 1;
+      }
+      index += 1;
+      html.push(renderTex(formula.join("\n"), true));
+      continue;
+    }
+
+    if (/^\s*<table\b/i.test(line)) {
+      const table = [];
+      while (index < lines.length) {
+        table.push(lines[index]);
+        const closed = /<\/table>/i.test(lines[index]);
+        index += 1;
+        if (closed) break;
+      }
+      html.push(renderMathInHtml(table.join("\n")));
+      continue;
+    }
+
+    const heading = line.match(/^\s*(#{1,6})\s+(.*?)\s*#*\s*$/);
+    if (heading) {
+      const level = heading[1].length;
+      const inner = renderInline(heading[2], images);
+      const id = `${state.prefix}-h-${state.n}`;
+      state.n += 1;
+      html.push(`<h${level} id="${id}">${inner}</h${level}>`);
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*(?:[-*_]\s*){3,}$/.test(line)) {
+      html.push("<hr>");
+      index += 1;
+      continue;
+    }
+
+    if (isTableStart(lines, index)) {
+      const headerCells = splitTableRow(line);
+      const bodyRows = [];
+      index += 2;
+      while (index < lines.length && lines[index].includes("|") && lines[index].trim()) {
+        bodyRows.push(splitTableRow(lines[index]));
+        index += 1;
+      }
+      const head = headerCells.map((cell) => `<th>${renderInline(cell, images)}</th>`).join("");
+      const body = bodyRows
+        .map((row) => `<tr>${row.map((cell) => `<td>${renderInline(cell, images)}</td>`).join("")}</tr>`)
+        .join("");
+      html.push(`<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`);
+      continue;
+    }
+
+    if (/^\s*>/.test(line)) {
+      const quote = [];
+      while (index < lines.length && /^\s*>/.test(lines[index])) {
+        quote.push(lines[index].replace(/^\s*>\s?/, ""));
+        index += 1;
+      }
+      html.push(`<blockquote>${renderInline(quote.join(" "), images)}</blockquote>`);
+      continue;
+    }
+
+    const bullet = line.match(/^\s*[-*+]\s+(.*)$/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (bullet || ordered) {
+      const tag = bullet ? "ul" : "ol";
+      const pattern = bullet ? /^\s*[-*+]\s+(.*)$/ : /^\s*\d+[.)]\s+(.*)$/;
+      const items = [];
+      while (index < lines.length && pattern.test(lines[index])) {
+        items.push(lines[index].match(pattern)[1]);
+        index += 1;
+      }
+      html.push(`<${tag}>${items.map((item) => `<li>${renderInline(item, images)}</li>`).join("")}</${tag}>`);
+      continue;
+    }
+
+    const paragraph = [];
+    while (
+      index < lines.length &&
+      lines[index].trim() &&
+      lines[index].trim() !== "$$" &&
+      !/^\s*(#{1,6})\s+/.test(lines[index]) &&
+      !/^\s*(```+|~~~+)/.test(lines[index]) &&
+      !/^\s*>/.test(lines[index]) &&
+      !/^\s*[-*+]\s+/.test(lines[index]) &&
+      !/^\s*\d+[.)]\s+/.test(lines[index]) &&
+      !/^\s*(?:[-*_]\s*){3,}$/.test(lines[index]) &&
+      !/^\s*<table\b/i.test(lines[index]) &&
+      !isTableStart(lines, index)
+    ) {
+      paragraph.push(lines[index].trim());
+      index += 1;
+    }
+    if (paragraph.length) html.push(`<p>${renderInline(paragraph.join(" "), images)}</p>`);
+    else index += 1;
+  }
+
+  return html.join("\n");
+}
+
+function splitReaderBlocks(markdown) {
+  const lines = String(markdown || "").replace(/\r\n?/g, "\n").split("\n");
+  const blocks = [];
+  let current = [];
+  let fence = "";
+  let inMath = false;
+  let inTable = false;
+  const flush = () => {
+    const value = current.join("\n").trim();
+    current = [];
+    if (value) blocks.push(value);
+  };
+
+  for (const line of lines) {
+    if (!inTable && /<table\b/i.test(line)) inTable = true;
+    if (inTable) {
+      current.push(line);
+      if (/<\/table>/i.test(line)) {
+        inTable = false;
+        flush();
+      }
+      continue;
+    }
+
+    const trimmed = line.trim();
+    const fenceMark = trimmed.match(/^(```+|~~~+)/);
+    if (fenceMark) {
+      const marker = fenceMark[1][0];
+      if (!fence) fence = marker;
+      else if (marker === fence) fence = "";
+      current.push(line);
+      continue;
+    }
+    if (!fence && (line.match(/\$\$/g) || []).length % 2 === 1) inMath = !inMath;
+    if (!trimmed && !fence && !inMath) {
+      flush();
+      continue;
+    }
+    current.push(line);
+  }
+  flush();
+  return blocks;
+}
+
+const FT_PROVIDERS = [['local', '本地提取（免费，只有文字）'], ['mineru', 'MinerU 云端（公式 / 表格 / 图片）'], ['mistral', 'Mistral OCR（公式 / 表格 / 图片）']];
+const FT_ENGINE_LABEL = { ai: 'AI 翻译', machine: '机器翻译' };
+const HTML_VIEW = 'research-workbench-html';
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* 极简 ZIP 解包（MinerU 结果）：读中央目录，支持 stored / deflate */
+async function ftUnzip(buf, want) {
+  const u8 = new Uint8Array(buf);
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  let eocd = -1;
+  for (let i = u8.length - 22; i >= Math.max(0, u8.length - 70000); i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) throw new Error('结果不是有效的 ZIP 文件');
+  const count = dv.getUint16(eocd + 10, true);
+  let off = dv.getUint32(eocd + 16, true);
+  const dec = new TextDecoder();
+  const out = [];
+  for (let k = 0; k < count; k++) {
+    if (dv.getUint32(off, true) !== 0x02014b50) break;
+    const method = dv.getUint16(off + 10, true);
+    const csize = dv.getUint32(off + 20, true);
+    const nlen = dv.getUint16(off + 28, true), xlen = dv.getUint16(off + 30, true), clen = dv.getUint16(off + 32, true);
+    const lho = dv.getUint32(off + 42, true);
+    const name = dec.decode(u8.subarray(off + 46, off + 46 + nlen));
+    off += 46 + nlen + xlen + clen;
+    if (name.endsWith('/') || (want && !want(name))) continue;
+    const lnl = dv.getUint16(lho + 26, true), lxl = dv.getUint16(lho + 28, true);
+    const start = lho + 30 + lnl + lxl;
+    const raw = u8.subarray(start, start + csize);
+    let data;
+    if (method === 0) data = raw.slice();
+    else if (method === 8) {
+      if (typeof DecompressionStream === 'undefined') throw new Error('这台设备不支持解压（缺少 DecompressionStream）');
+      const ds = new DecompressionStream('deflate-raw');
+      data = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(ds)).arrayBuffer());
+    } else continue;
+    out.push({ name, data });
+  }
+  return out;
+}
+
+/* 全文翻译用：逐行保护公式 / 链接 / 标记（同 PaperGrid） */
+function ftMaskLine(line, lineIndex) {
+  const prefixMatch = line.match(/^(\s*(?:(?:#{1,6}|>|[-+*]|\d+[.)])\s+)+)/);
+  const prefix = (prefixMatch && prefixMatch[1]) || '';
+  const trailingMatch = line.match(/(\s{2,})$/);
+  const trailing = (trailingMatch && trailingMatch[1]) || '';
+  let text = line.slice(prefix.length, trailing ? -trailing.length : undefined);
+  const tokens = [];
+  const protect = (pattern) => { text = text.replace(pattern, (value) => { const placeholder = 'ZXQPGTOKEN' + lineIndex + 'X' + tokens.length + 'QXZ'; tokens.push({ placeholder, value }); return placeholder; }); };
+  protect(/!?\[[^\]]*\]\([^\n)]+\)/g);
+  protect(/`[^`\n]+`/g);
+  protect(/\$[^$\n]+\$/g);
+  protect(/\\\([^\n]*?\\\)/g);
+  protect(/\\[A-Za-z]+(?:\{[^{}\n]*\})?/g);
+  protect(/https?:\/\/[^\s)]+/g);
+  protect(/<[^>\n]+>/g);
+  protect(/\[[\d,;\s–—-]+\]/g);
+  protect(/\*\*|__|~~|\|/g);
+  return { prefix, trailing, text, tokens };
+}
+function ftPrepare(markdown) {
+  const lines = String(markdown || '').split(/\r?\n/);
+  const items = [];
+  let fenceMarker = '', inDisplayMath = false, inBracketMath = false;
+  lines.forEach((line, lineIndex) => {
+    const trimmed = line.trim();
+    const fm = trimmed.match(/^(```+|~~~+)/);
+    const fence = fm ? fm[1] : '';
+    if (fence) { if (!fenceMarker) fenceMarker = fence[0]; else if (fence[0] === fenceMarker) fenceMarker = ''; return; }
+    if (fenceMarker) return;
+    const dm = (line.match(/\$\$/g) || []).length;
+    if (dm) { if (dm % 2 === 1) inDisplayMath = !inDisplayMath; return; }
+    const ob = /\\\[/.test(line), cb = /\\\]/.test(line);
+    if (ob || cb) { if (ob && !cb) inBracketMath = true; else if (cb) inBracketMath = false; return; }
+    if (inDisplayMath || inBracketMath) return;
+    if (!trimmed || /^\s*[-:| ]+\s*$/.test(line) || /^\s*!\[[^\]]*\]\([^)]*\)\s*$/.test(line) || /^\s*<!--.*-->\s*$/.test(line)) return;
+    const naturalWords = line.match(/\b[A-Za-z]{4,}\b/g) || [];
+    if (/[=<>∑∫√]/.test(line) && naturalWords.length < 2) return;
+    const latin = (line.match(/[A-Za-z]/g) || []).length, cjk = (line.match(/[㐀-鿿]/g) || []).length;
+    if (latin < 2 || cjk > latin) return;
+    const masked = ftMaskLine(line, lineIndex);
+    const readable = masked.text.replace(/ZXQPGTOKEN\d+X\d+QXZ/g, '').replace(/[^A-Za-z㐀-鿿]+/g, '');
+    if (readable.length < 2) return;
+    items.push(Object.assign({ id: 'L' + lineIndex, lineIndex }, masked));
+  });
+  return { lines, items };
+}
+function ftBatches(items, maxChars, maxItems) {
+  const out = []; let cur = [], n = 0;
+  for (const it of items) { const sz = it.text.length + 40; if (cur.length && (cur.length >= maxItems || n + sz > maxChars)) { out.push(cur); cur = []; n = 0; } cur.push(it); n += sz; }
+  if (cur.length) out.push(cur);
+  return out;
+}
+async function mapLimit(list, limit, fn) {
+  let i = 0;
+  const run = async () => { while (i < list.length) { const k = i++; await fn(list[k], k); } };
+  await Promise.all(Array.from({ length: Math.min(limit, list.length) }, run));
+}
+
+/* HTML 阅读页模板：目录 / 英文·中文·对照 / 字号 / 深浅色，离线可看（公式已渲染、图片已内嵌） */
+function ftReaderPage(o) {
+  const esc = escapeHtml;
+  const css = `
+:root{--bg:#fbfaf7;--fg:#1f2328;--muted:#6b7280;--line:#e5e2da;--card:#fff;--accent:#7c3aed;--fs:17px;--lh:1.8;--w:860px}
+[data-theme=dark]{--bg:#16171a;--fg:#e6e6e6;--muted:#9aa0a6;--line:#2c2e33;--card:#1d1f23;--accent:#a78bfa}
+@media (prefers-color-scheme:dark){[data-theme=auto]{--bg:#16171a;--fg:#e6e6e6;--muted:#9aa0a6;--line:#2c2e33;--card:#1d1f23;--accent:#a78bfa}}
+*{box-sizing:border-box}html,body{margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font-family:"Iowan Old Style","Source Han Serif SC","Noto Serif CJK SC","Songti SC",Georgia,serif;font-size:var(--fs);line-height:var(--lh)}
+body.sans{font-family:-apple-system,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",system-ui,sans-serif}
+.bar{position:sticky;top:0;z-index:5;display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:8px 14px;background:var(--bg);border-bottom:1px solid var(--line);font-family:system-ui,sans-serif;font-size:13px}
+.bar .t{font-weight:600;flex:1;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar button{font:inherit;padding:4px 10px;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:8px;cursor:pointer}
+.bar button.on{border-color:var(--accent);color:var(--accent);font-weight:600}.bar button:disabled{opacity:.4;cursor:not-allowed}
+.wrap{display:flex;align-items:flex-start}
+nav{position:sticky;top:46px;flex:0 0 250px;max-height:calc(100vh - 46px);overflow:auto;padding:14px 10px 40px 16px;border-right:1px solid var(--line);font-family:system-ui,sans-serif;font-size:13px;line-height:1.5}
+nav a{display:block;color:var(--muted);text-decoration:none;padding:3px 6px;border-radius:6px}nav a:hover{background:var(--line);color:var(--fg)}
+nav a.l2{padding-left:16px}nav a.l3{padding-left:28px;font-size:12px}
+body.notoc nav{display:none}
+main{flex:1;min-width:0;padding:24px 28px 120px}
+.doc{max-width:var(--w);margin:0 auto}
+body[data-mode=dual] .doc{max-width:calc(var(--w) * 1.7)}
+.row{display:grid;grid-template-columns:1fr;gap:28px}
+body[data-mode=dual] .row{grid-template-columns:1fr 1fr;border-bottom:1px dashed var(--line);padding:4px 0}
+body[data-mode=en] .zh,body[data-mode=zh] .en{display:none}
+article{min-width:0;overflow-wrap:anywhere}
+h1,h2,h3,h4{line-height:1.35;font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+h1{font-size:1.6em}h2{font-size:1.3em;margin-top:1.6em}h3{font-size:1.12em}
+p{margin:.6em 0}.zh p{text-align:justify}.en p{hyphens:auto}
+img{max-width:100%;height:auto;display:block;margin:12px auto;border-radius:6px;background:#fff}
+table{border-collapse:collapse;margin:12px 0;font-size:.88em;display:block;overflow-x:auto;max-width:100%}
+td,th{border:1px solid var(--line);padding:4px 8px;vertical-align:top}
+blockquote{margin:.8em 0;padding:.2em 1em;border-left:3px solid var(--accent);color:var(--muted)}
+pre{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;font-size:.85em}
+code{font-family:ui-monospace,Consolas,monospace;font-size:.9em}
+.katex-display{overflow-x:auto;overflow-y:hidden;padding:4px 0}
+.math-raw{font-family:ui-monospace,monospace;color:var(--muted)}
+.foot{margin-top:40px;color:var(--muted);font-size:12px;font-family:system-ui,sans-serif}
+@media (max-width:760px){nav{display:none}body.showtoc nav{display:block;position:fixed;left:0;top:46px;bottom:0;z-index:6;background:var(--bg);width:80vw;max-height:none}main{padding:16px 14px 100px}body[data-mode=dual] .row{grid-template-columns:1fr;gap:6px}body[data-mode=dual] .zh{border-left:3px solid var(--accent);padding-left:10px}}
+@media print{.bar,nav{display:none}main{padding:0}}`;
+  const script = `(function(){var b=document.body;var ls={get:function(k){try{return localStorage.getItem(k)}catch(e){return null}},set:function(k,v){try{localStorage.setItem(k,v)}catch(e){}}};
+var hasZh=b.getAttribute('data-has-zh')==='1';var mode=ls.get('rw-ft-mode')||b.getAttribute('data-mode');if(!hasZh)mode='en';b.setAttribute('data-mode',mode);
+var fs=Number(ls.get('rw-ft-fs')||17);var th=ls.get('rw-ft-theme')||'auto';document.documentElement.setAttribute('data-theme',th);if(ls.get('rw-ft-sans')==='1')b.classList.add('sans');
+function apply(){document.documentElement.style.setProperty('--fs',fs+'px');document.querySelectorAll('[data-m]').forEach(function(x){x.classList.toggle('on',x.getAttribute('data-m')===b.getAttribute('data-mode'))});buildToc()}
+document.querySelectorAll('[data-m]').forEach(function(x){x.onclick=function(){b.setAttribute('data-mode',x.getAttribute('data-m'));ls.set('rw-ft-mode',x.getAttribute('data-m'));apply()}});
+document.getElementById('fs-').onclick=function(){fs=Math.max(12,fs-1);ls.set('rw-ft-fs',fs);apply()};document.getElementById('fs+').onclick=function(){fs=Math.min(28,fs+1);ls.set('rw-ft-fs',fs);apply()};
+document.getElementById('font').onclick=function(){b.classList.toggle('sans');ls.set('rw-ft-sans',b.classList.contains('sans')?'1':'0')};
+document.getElementById('theme').onclick=function(){th=th==='auto'?'dark':th==='dark'?'light':'auto';document.documentElement.setAttribute('data-theme',th);ls.set('rw-ft-theme',th);this.textContent={auto:'自动',dark:'深色',light:'浅色'}[th]};
+document.getElementById('theme').textContent={auto:'自动',dark:'深色',light:'浅色'}[th];
+document.getElementById('toc').onclick=function(){if(window.innerWidth<=760)b.classList.toggle('showtoc');else b.classList.toggle('notoc')};
+function buildToc(){var nav=document.querySelector('nav');nav.innerHTML='';var side=b.getAttribute('data-mode')==='zh'?'.zh':'.en';document.querySelectorAll(side+' h1,'+side+' h2,'+side+' h3').forEach(function(h){var a=document.createElement('a');a.textContent=h.textContent;a.href='#'+h.id;a.className='l'+h.tagName.slice(1);a.onclick=function(e){e.preventDefault();h.scrollIntoView({behavior:'smooth',block:'start'});b.classList.remove('showtoc')};nav.appendChild(a)});if(!nav.children.length)nav.innerHTML='<div style="color:var(--muted)">没有标题</div>'}
+apply();})();`;
+  return '<!DOCTYPE html>\n<html lang="zh-CN" data-theme="auto">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>' + esc(o.title) + '</title>\n<style>' + (o.katexCss || '') + '\n' + css + '</style>\n' +
+    (o.katexCss ? '' : '<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">\n') +
+    '</head>\n<body data-mode="' + (o.mode || 'en') + '" data-has-zh="' + (o.hasZh ? '1' : '0') + '">\n' +
+    '<div class="bar"><button id="toc" title="目录">☰</button><span class="t">' + esc(o.title) + '</span>' +
+    '<button data-m="en">英文</button><button data-m="zh"' + (o.hasZh ? '' : ' disabled title="还没有译文：在科研工作台里点「一键全文翻译」"') + '>中文</button><button data-m="dual"' + (o.hasZh ? '' : ' disabled') + '>对照</button>' +
+    '<button id="fs-" title="减小字号">A−</button><button id="fs+" title="增大字号">A+</button><button id="font" title="切换衬线 / 无衬线">字体</button><button id="theme" title="深浅色">自动</button></div>\n' +
+    '<div class="wrap"><nav></nav><main><div class="doc">\n' + o.body + '\n<div class="foot">由科研工作台生成 · ' + esc(o.meta || '') + '</div></div></main></div>\n' +
+    (o.katexCss ? '' : '<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"><\/script><script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"><\/script><script>try{document.querySelectorAll(".math-raw").forEach(function(x){x.outerHTML=x.textContent});renderMathInElement(document.body,{delimiters:[{left:"$$",right:"$$",display:true},{left:"$",right:"$",display:false}],throwOnError:false})}catch(e){}<\/script>\n') +
+    '<script>' + script + '<\/script>\n</body>\n</html>\n';
+}
+
+/* 在 Obsidian 里直接打开 .html：左边是页面（iframe 沙盒，不给页面访问 Obsidian 的权限），右边是和 PDF 阅读一样的 AI 问答 */
+const HTML_BRIDGE = '<script>(function(){var t=null,last="";function hov(){return window.matchMedia&&matchMedia("(hover: none)").matches}' +
+  'function send(){var s=window.getSelection();var tx=s&&!s.isCollapsed?String(s).replace(/\\s+/g," ").trim():"";if(tx.length<2){if(last){last="";parent.postMessage({rwHtml:"clear"},"*")}return}if(tx===last)return;last=tx;var r=s.getRangeAt(0).getBoundingClientRect();parent.postMessage({rwHtml:"sel",text:tx.slice(0,6000),rect:{left:r.left,top:r.top,right:r.right,bottom:r.bottom,width:r.width,height:r.height}},"*")}' +
+  'function later(d){clearTimeout(t);t=setTimeout(send,d)}' +
+  'document.addEventListener("mouseup",function(){later(30)});document.addEventListener("touchend",function(){later(450)});document.addEventListener("keyup",function(e){if(e.key==="Shift")later(30)});' +
+  'document.addEventListener("selectionchange",function(){later(hov()?450:700)});document.addEventListener("mousedown",function(){last="";parent.postMessage({rwHtml:"down"},"*")});' +
+  'window.addEventListener("scroll",function(){parent.postMessage({rwHtml:"scroll"},"*")},true);' +
+  'window.addEventListener("message",function(e){if(e.data&&e.data.rwHtml==="clearSel"){last="";try{getSelection().removeAllRanges()}catch(x){}}})})();<\/script>';
+const HtmlViewBase = obsidian.FileView || ItemView;
+class HtmlFileView extends HtmlViewBase {
+  constructor(leaf, plugin) { super(leaf); this.plugin = plugin; this.allowNavigation = true; this.ctx = null; }
+  getViewType() { return HTML_VIEW; }
+  getDisplayText() { return this.file ? this.file.basename : 'HTML'; }
+  getIcon() { return 'globe'; }
+  canAcceptExtension(ext) { return ext === 'html' || ext === 'htm'; }
+  async onLoadFile(file) { await this.renderFile(file); }
+  async onUnloadFile() { this.cleanup(); clear(this.contentEl); }
+  async onClose() { this.cleanup(); }
+  cleanup() {
+    if (this.mf) { try { this.mf.destroy(); } catch (e) { /* ignore */ } this.mf = null; }
+    if (this._blob) { try { URL.revokeObjectURL(this._blob); } catch (e) { /* ignore */ } this._blob = null; }
+    if (this._msg) { window.removeEventListener('message', this._msg); this._msg = null; }
+  }
+  /* 这个 HTML 是哪篇文献的：全文文件夹里的 full.html → 读「来源.json」找回 PDF / 文献笔记 */
+  async ctxFor(file) {
+    const pl = this.plugin;
+    const dir = file.path.split('/').slice(0, -1).join('/');
+    if (dir.startsWith(pl.ftRoot() + '/')) {
+      try {
+        const src = this.app.vault.getAbstractFileByPath(dir + '/来源.json');
+        const j = src instanceof TFile ? JSON.parse(await this.app.vault.read(src)) : null;
+        const pdf = j && j.pdf ? this.app.vault.getAbstractFileByPath(j.pdf) : null;
+        if (pdf instanceof TFile) { const c = pl.paperOf(pdf) || { pdf, note: null, noteObj: null }; return Object.assign({}, c, { html: file }); }
+      } catch (e) { /* ignore */ }
+    }
+    return { pdf: null, note: null, noteObj: null, html: file };
+  }
+  async renderFile(file) {
+    const pl = this.plugin;
+    this.cleanup();
+    const el = this.contentEl;
+    clear(el);
+    el.classList.add('rw-htmlview', 'rw-root', 'rw-paper');
+    el.classList.toggle('rw-mobile', IS_MOBILE);
+    el.classList.toggle('rw-touch', TOUCH);
+    pl.applyTheme(el);
+    this.ctx = await this.ctxFor(file);
+    const st = pl.settings;
+    const wrap = h(el, 'div', { cls: 'rw-pr rw-htmlpr' });
+    const narrow = (el.clientWidth || (el.ownerDocument.defaultView || window).innerWidth) < 700;
+    const sideKey = 'htmlSideHidden';
+    if (narrow) { wrap.classList.add('is-narrow'); if (!this._sideOpen) wrap.classList.add('is-side-hidden'); }
+    else if (st[sideKey] === true) wrap.classList.add('is-side-hidden');
+    const center = h(wrap, 'div', { cls: 'rw-pr-center' });
+    const split = h(wrap, 'div', { cls: 'rw-pr-split', title: '拖动调整宽度，双击恢复' });
+    const side = h(wrap, 'div', { cls: 'rw-pr-side' });
+    side.style.width = (Number(st.prSideWidth) || 420) + 'px';
+    split.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      const x0 = e.clientX, w0 = side.offsetWidth;
+      wrap.classList.add('is-dragging');
+      const mv = (ev) => { side.style.width = Math.max(280, Math.min(900, w0 + (x0 - ev.clientX))) + 'px'; };
+      const up = () => { wrap.classList.remove('is-dragging'); el.ownerDocument.removeEventListener('mousemove', mv); el.ownerDocument.removeEventListener('mouseup', up); st.prSideWidth = side.offsetWidth; pl.saveSettingsSoon(); };
+      el.ownerDocument.addEventListener('mousemove', mv); el.ownerDocument.addEventListener('mouseup', up);
+    });
+    split.addEventListener('dblclick', () => { side.style.width = '420px'; st.prSideWidth = 420; pl.saveSettingsSoon(); });
+    const setSide = (open) => {
+      if (narrow) { this._sideOpen = open; wrap.classList.toggle('is-side-hidden', !open); return; }
+      st[sideKey] = !open; pl.saveSettingsSoon(); wrap.classList.toggle('is-side-hidden', !open);
+    };
+    this.openSide = () => setSide(true);
+    this.toggleSide = () => setSide(wrap.classList.contains('is-side-hidden'));
+    // 工具栏
+    const bar = h(center, 'div', { cls: 'rw-pdfv-bar rw-htmlview-bar' });
+    const ttl = h(bar, 'div', { cls: 'rw-pdfv-title', text: this.ctx.noteObj || this.ctx.pdf ? pl.paperTitle(this.ctx) : file.basename, title: file.path });
+    if (this.ctx.noteObj && this.ctx.noteObj.projectName) ttl.style.setProperty('--pc', projectColor(this.ctx.noteObj.projectName));
+    h(bar, 'span', { cls: 'rw-tp-sp' });
+    const btn = (icon, title, fn) => { const b = h(bar, 'button', { cls: 'rw-tp-btn', title }); ic(b, icon); b.addEventListener('click', fn); return b; };
+    btn('refresh-cw', '重新载入', () => this.renderFile(file));
+    if (this.ctx.pdf) btn('book-open-text', '打开对应的 PDF（文献阅读视图）', () => pl.openPaperReader(this.ctx.pdf)).classList.add('rw-hide-narrow');
+    if (this.ctx.note) btn('file-text', '打开文献笔记', () => pl.openFile(this.ctx.note)).classList.add('rw-hide-narrow');
+    if (!IS_MOBILE) btn('external-link', '用系统浏览器打开', () => pl.openWithDefault(file));
+    const aiB = btn(narrow ? 'messages-square' : 'panel-right', narrow ? '切换到 AI 问答 / 回到页面' : '显示 / 隐藏右侧 AI 问答', () => this.toggleSide());
+    if (narrow) { aiB.classList.add('rw-pr-aibtn'); h(aiB, 'span', { text: 'AI' }); }
+    // 页面：插入一小段脚本，只把「选中了哪段文字」告诉工作台（用于划词翻译 / 问 AI）
+    const fr = h(center, 'iframe', { cls: 'rw-htmlview-frame', attr: { sandbox: 'allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads' } });
+    this.frame = fr;
+    const res = this.app.vault.getResourcePath(file);
+    try {
+      let html = await this.app.vault.read(file);
+      const base = String(res).replace(/[?#].*$/, '').replace(/[^/]*$/, '');
+      const inject = '<base href="' + base.replace(/"/g, '%22') + '">' + HTML_BRIDGE;
+      if (/<head[^>]*>/i.test(html)) html = html.replace(/<head[^>]*>/i, (m) => m + inject);
+      else html = inject + html;
+      this._blob = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+      fr.src = this._blob;
+    } catch (e) { console.warn('[科研工作台] HTML 注入失败，按原样打开', e); fr.src = res; }
+    this._msg = (e) => {
+      if (!this.frame || e.source !== this.frame.contentWindow || !e.data || !e.data.rwHtml) return;
+      const pop = pl.popupFor(document);
+      const d = e.data;
+      if (d.rwHtml === 'down' || d.rwHtml === 'scroll' || d.rwHtml === 'clear') { if (pop.isOpen() && !pop.isPinned() && pop.ctx && pop.ctx.htmlView === this) pop.hide(); return; }
+      if (d.rwHtml !== 'sel') return;
+      const trig = st.transTrigger || 'auto';
+      if (trig === 'off') return;
+      const fb = this.frame.getBoundingClientRect();
+      const r = d.rect || {};
+      const rect = { left: fb.left + (r.left || 0), top: fb.top + (r.top || 0), right: fb.left + (r.right || 0), bottom: fb.top + (r.bottom || 0), width: r.width || 0, height: r.height || 0 };
+      const text = String(d.text || '').trim();
+      if (text.length < 2) return;
+      if (pop.isOpen() && pop.ctx && pop.ctx.text === text) return;
+      const ctx = Object.assign({}, this.ctx, { text, rect, page: '', anchor: null, file: this.ctx.pdf || file, htmlView: this });
+      if (trig === 'button') pop.showBubble(rect, ctx); else pop.show(rect, ctx);
+    };
+    window.addEventListener('message', this._msg);
+    // AI 问答（和 PDF 阅读一样：基于全文回答，回答里划线能继续追问，形成问答树）
+    this.mf = new MindflowPanel(pl, side, this.ctx);
+    await this.mf.load();
+    if (IS_MOBILE) setTimeout(() => pl.updateNavInset(), 60);
+  }
+  clearSel() { try { if (this.frame && this.frame.contentWindow) this.frame.contentWindow.postMessage({ rwHtml: 'clearSel' }, '*'); } catch (e) { /* ignore */ } }
+}
+
+/* ======== MINDFLOW-BEGIN（原 canvas-mindflow 插件 v0.10.0，已合并进科研工作台；更新时整段替换） ======== */
+const __mf = { exports: {}, __host: null, loaded: false };
+function __loadMindflow(host) {
+  if (__mf.loaded) return __mf.exports;
+  __mf.__host = host;
+  (function (module, exports, require) {
+'use strict';
+/*
+ * Canvas Mindflow — 在 Obsidian Canvas 卡片里直接和 AI 对话
+ *
+ * 设计要点
+ * - 一张原生文字卡片 = 一轮问答：问题写在卡片正文，回答写在同一张卡片里的
+ *   可折叠 callout（> [!ai]+ 回答）。Markdown / LaTeX / 代码高亮全部交给
+ *   Obsidian 原生渲染；卡片大小可自由拖拽；数据就是普通 .canvas 文件。
+ * - 划选回答中的文字 → 按 Tab 或点「✦ 追问」→ 在右侧生成子卡片，带上原文
+ *   锚点（> [!excerpt] 原文）并立即回答。
+ * - 上下文 = 沿连线向上的所有祖先卡片（按拓扑顺序），较远的回答自动截断；
+ *   连到卡片上的笔记文件卡片也会作为资料送给 AI。
+ */
+
+const obsidian = require('obsidian');
+const __mfHost = module.__host;
+const { Plugin, PluginSettingTab, Setting, Notice, requestUrl } = obsidian;
+
+// ─────────────────────────────────────────────────────────────
+// 设置
+// ─────────────────────────────────────────────────────────────
+const DEFAULT_SETTINGS = {
+  apiBaseUrl: 'https://api.deepseek.com/v1',
+  apiKey: '',
+  model: 'deepseek-chat',
+  temperature: 0.7,
+  systemPrompt:
+    '你是一位耐心、严谨的学习伙伴。默认用简体中文回答，结构清晰，善用 Markdown（小标题、列表、表格、代码块、LaTeX 公式）。先用一两句话给出核心结论，再展开说明。',
+  answerTitle: '回答',
+  excerptTitle: '原文',
+  nodeWidth: 460,
+  maxAutoHeight: 640,
+  maxExpandHeight: 900,
+  expandWidth: 640,
+  maxExpandWidth: 960,
+  edgeLabel: false,
+  highlightExcerpt: true,
+  debug: false,
+  chatFolder: 'Mindflow',
+  fullContextDepth: 3,
+  truncateChars: 600,
+  maxAncestors: 20,
+  includeNoteFiles: true,
+  noteCharLimit: 6000,
+  enableTab: true,
+  maxTokens: 0,
+  // 对话视图
+  chatNavWidth: 210,
+  chatSideWidth: 320,
+  chatNavCollapsed: false,
+  chatSideCollapsed: false,
+  chatFontSize: 15,
+  chatSendKey: 'enter',
+  chatShowMeta: true,
+  defaultFollowUp: '请详细解释这段内容。',
+  noteFolder: '',
+  // 划线追问的预设问题（右键 / 追问小窗里一键选择）
+  presetQuestions: ['请详细解释这段内容。', '能举一个具体的例子吗？', '这个公式是怎么推导出来的？', '用通俗易懂的话再讲一遍。', '这和前面的内容有什么联系？'],
+  // 附件
+  visionModel: '',
+  attachMaxChars: 40000,
+};
+
+const DEFAULT_SYSTEM_PROMPT = DEFAULT_SETTINGS.systemPrompt;
+
+/** 常用 OpenAI 兼容服务商 */
+const PROVIDERS = [
+  { id: 'deepseek', name: 'DeepSeek', url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+  { id: 'openai', name: 'OpenAI', url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+  { id: 'moonshot', name: 'Kimi（Moonshot）', url: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k' },
+  { id: 'qwen', name: '通义千问（阿里云百炼）', url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+  { id: 'zhipu', name: '智谱 GLM', url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4-flash' },
+  { id: 'siliconflow', name: '硅基流动 SiliconFlow', url: 'https://api.siliconflow.cn/v1', model: 'deepseek-ai/DeepSeek-V3' },
+  { id: 'openrouter', name: 'OpenRouter', url: 'https://openrouter.ai/api/v1', model: 'openai/gpt-4o-mini' },
+  { id: 'ollama', name: 'Ollama（本地）', url: 'http://localhost:11434/v1', model: 'qwen2.5' },
+];
+
+
+// ─────────────────────────────────────────────────────────────
+// 划线文字 → 保留公式与符号的源码
+// Obsidian 渲染公式（MathJax）时符号是用 CSS 画的，DOM 里没有对应文字，
+// 直接 selection.toString() 会把公式和 ×、≥、上下标等符号全部丢掉。
+// 做法：渲染后给每个 .math 元素记下它的 LaTeX 源码，划线时再换回 $…$。
+// ─────────────────────────────────────────────────────────────
+/** 按出现顺序提取 Markdown 里的公式（跳过代码） */
+function extractMath(md) {
+  const src = String(md || '')
+    .replace(/^>\s?/gm, '')
+    .replace(/(```|~~~)[\s\S]*?\1/g, '')
+    .replace(/`[^`\n]*`/g, '');
+  const out = [];
+  const re = /\$\$([\s\S]+?)\$\$|\$(?!\s)([^$\n]*?[^\s$\\])\$(?!\d)|\$(?!\s)([^$\s\\])\$(?!\d)/g;
+  let m;
+  while ((m = re.exec(src))) {
+    if (m[1] !== undefined) out.push({ tex: m[1].trim(), display: true });
+    else out.push({ tex: (m[2] !== undefined ? m[2] : m[3]).trim(), display: false });
+  }
+  return out;
+}
+
+/** 给渲染好的公式元素标上源码；数量对不上时尽量按显示/行内分别对齐 */
+function annotateMath(root, md) {
+  if (!root) return;
+  const els = Array.from(root.querySelectorAll('.math'));
+  if (!els.length) return;
+  const list = extractMath(md);
+  if (list.length === els.length) {
+    els.forEach((el, i) => {
+      el.dataset.tex = list[i].tex;
+      el.dataset.display = list[i].display ? '1' : '';
+    });
+    return;
+  }
+  const blocks = list.filter((x) => x.display);
+  const inlines = list.filter((x) => !x.display);
+  let bi = 0;
+  let ii = 0;
+  for (const el of els) {
+    const isBlock = el.classList.contains('math-block');
+    const item = isBlock ? blocks[bi++] : inlines[ii++];
+    if (item) {
+      el.dataset.tex = item.tex;
+      el.dataset.display = isBlock ? '1' : '';
+    }
+  }
+}
+
+function blockText(node) {
+  let out = '';
+  node.childNodes.forEach((ch) => {
+    if (ch.nodeType === 3) {
+      out += ch.nodeValue;
+      return;
+    }
+    if (ch.nodeType !== 1) return;
+    const tag = ch.tagName;
+    if (tag === 'BR') {
+      out += '\n';
+      return;
+    }
+    const block = /^(P|DIV|LI|H[1-6]|TR|BLOCKQUOTE|PRE|UL|OL|TABLE|THEAD|TBODY)$/.test(tag);
+    if (block && out && !out.endsWith('\n')) out += '\n';
+    out += blockText(ch);
+    if (tag === 'TD' || tag === 'TH') out += ' ';
+    if (block && !out.endsWith('\n')) out += '\n';
+  });
+  return out;
+}
+
+/**
+ * 把一个选区转换成「源码文字」：公式换回 $LaTeX$；同时返回不含公式的纯文本（用于定位高亮）。
+ * 选区只覆盖公式的一部分时，自动扩展到整个公式。
+ */
+function selectionToSource(range) {
+  const r = range.cloneRange();
+  const mathOf = (n) => {
+    const e = n && (n.nodeType === 1 ? n : n.parentElement);
+    return e ? e.closest('.math') : null;
+  };
+  const sm = mathOf(r.startContainer);
+  if (sm) r.setStartBefore(sm);
+  const em = mathOf(r.endContainer);
+  if (em) r.setEndAfter(em);
+  const build = (withMath) => {
+    const div = document.createElement('div');
+    div.appendChild(r.cloneContents());
+    div.querySelectorAll('.copy-code-button, button, .cmf-typing').forEach((x) => x.remove());
+    div.querySelectorAll('.math').forEach((el) => {
+      let t = '';
+      if (withMath) {
+        const tex = el.dataset.tex;
+        if (tex != null && tex !== '') t = el.dataset.display ? `$$${tex}$$` : `$${tex}$`;
+        else {
+          const mml = el.querySelector('mjx-assistive-mml, math');
+          t = mml ? mml.textContent : '';
+        }
+      }
+      el.replaceWith(document.createTextNode(t));
+    });
+    return blockText(div)
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  };
+  return { text: build(true), plain: build(false), range: r };
+}
+
+// ─────────────────────────────────────────────────────────────
+// 卡片文本格式：解析 / 生成
+// ─────────────────────────────────────────────────────────────
+const AI_HEAD_RE = /^>\s?\[!ai\]([+-]?)(.*)$/i;
+const EXCERPT_HEAD_RE = /^>\s?\[!excerpt\][+-]?(.*)$/i;
+
+function quoteBlock(text) {
+  return String(text)
+    .split('\n')
+    .map((l) => (l.length ? '> ' + l : '>'))
+    .join('\n');
+}
+
+function unquote(line) {
+  return line.replace(/^>\s?/, '');
+}
+
+/** 把卡片文本拆成 { excerpt, question, answer, folded, trailing } */
+function parseNodeText(text) {
+  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+  let i = 0;
+  let excerpt = null;
+  let start = 0;
+  while (start < lines.length && !lines[start].trim()) start++;
+  if (start < lines.length && EXCERPT_HEAD_RE.test(lines[start])) {
+    const ex = [];
+    i = start + 1;
+    while (i < lines.length && /^>/.test(lines[i])) {
+      ex.push(unquote(lines[i]));
+      i++;
+    }
+    excerpt = ex.join('\n').trim();
+  }
+  let aiIdx = -1;
+  for (let k = i; k < lines.length; k++) {
+    if (AI_HEAD_RE.test(lines[k])) {
+      aiIdx = k;
+      break;
+    }
+  }
+  let question = lines.slice(i, aiIdx >= 0 ? aiIdx : lines.length).join('\n').trim();
+  // 新格式：原文与问题同一行 ——「==原文== 问题」
+  if (!excerpt) {
+    const m = /^==([^\n]+?)==\s*/.exec(question);
+    if (m) {
+      excerpt = m[1].trim();
+      question = question.slice(m[0].length).trim();
+    }
+  }
+  let answer = null;
+  let folded = false;
+  let trailing = '';
+  if (aiIdx >= 0) {
+    folded = AI_HEAD_RE.exec(lines[aiIdx])[1] === '-';
+    const a = [];
+    let j = aiIdx + 1;
+    while (j < lines.length && /^>/.test(lines[j])) {
+      a.push(unquote(lines[j]));
+      j++;
+    }
+    answer = a.join('\n').trim();
+    trailing = lines.slice(j).join('\n').trim();
+  }
+  return { excerpt, question, answer, folded, trailing };
+}
+
+/** 由结构生成卡片文本 */
+function buildNodeText(p, opts) {
+  const parts = [];
+  if (p.excerpt) {
+    const ex = String(p.excerpt).replace(/\s*\n\s*/g, ' ').replace(/==/g, '').trim();
+    parts.push(`==${ex}== ${p.question || ''}`.trim());
+  } else if (p.question) {
+    parts.push(p.question);
+  }
+  if (p.answer !== null && p.answer !== undefined) {
+    parts.push(`> [!ai]${p.folded ? '-' : '+'} ${opts.answerTitle}\n` + quoteBlock(p.answer || '…'));
+  }
+  if (p.trailing) parts.push(p.trailing);
+  return parts.join('\n\n');
+}
+
+/** 切换折叠标记；顺带清理旧版本残留的「· 生成中…」 */
+function setFoldedInText(text, folded) {
+  return String(text).replace(/^(>\s?\[!ai\])[+-]?([^\n]*)$/im, (m, head, title) => {
+    return `${head}${folded ? '-' : '+'}${title.replace(/\s*·\s*生成中…?\s*$/, '')}`;
+  });
+}
+
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * 在卡片源码中把划选的文字包上 ==高亮==。
+ * 划选到的是渲染后的文字，源码里可能夹着 **、`、_ 等标记，所以先精确匹配，
+ * 不行再做宽松匹配；代码块里的内容、已经高亮过的内容会跳过。
+ * 返回新文本；找不到时返回 null。
+ */
+function highlightInText(text, selection) {
+  const segs = String(selection)
+    .split(/\n+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 2);
+  let out = String(text);
+  let changed = false;
+  const inCodeOrMark = (src, idx) => {
+    const before = src.slice(0, idx);
+    const fences = (before.match(/^(>\s?)*\s*(```|~~~)/gm) || []).length;
+    const marks = (before.match(/==/g) || []).length;
+    return fences % 2 === 1 || marks % 2 === 1;
+  };
+  for (const seg of segs) {
+    const head = out.search(/^>\s?\[!ai\]/im);
+    const starts = head >= 0 ? [head, 0] : [0];
+    const exact = new RegExp(escapeRe(seg), 'g');
+    const loose = new RegExp(
+      Array.from(seg)
+        .map((ch) => (/\s/.test(ch) ? '\\s+' : escapeRe(ch)))
+        .join('[*_`~]*'),
+      'g'
+    );
+    let hit = null;
+    for (const re of [exact, loose]) {
+      for (const from of starts) {
+        re.lastIndex = from;
+        let m;
+        while ((m = re.exec(out))) {
+          if (!m[0].includes('==') && !m[0].includes('\n') && !inCodeOrMark(out, m.index)) {
+            hit = { index: m.index, len: m[0].length };
+            break;
+          }
+          re.lastIndex = m.index + 1;
+        }
+        if (hit) break;
+      }
+      if (hit) break;
+    }
+    if (!hit) continue;
+    // 向两侧吞掉紧挨着的格式符号，避免 ==…== 与 **…** 交叉
+    while (hit.index > 0 && /[*_`~]/.test(out[hit.index - 1])) {
+      hit.index--;
+      hit.len++;
+    }
+    while (/[*_`~]/.test(out[hit.index + hit.len] || '')) hit.len++;
+    out = out.slice(0, hit.index) + '==' + out.slice(hit.index, hit.index + hit.len) + '==' + out.slice(hit.index + hit.len);
+    changed = true;
+  }
+  return changed ? out : null;
+}
+
+function formatQuestion(p) {
+  const q = (p.question || '').trim();
+  if (p.excerpt) {
+    return `关于上文中的这段内容：\n「${p.excerpt}」\n\n${q || '请详细解释这段内容。'}`;
+  }
+  return q;
+}
+
+function truncate(s, n) {
+  s = String(s).replace(/\s+/g, ' ').trim();
+  return s.length > n ? s.slice(0, n) + '…' : s;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 上下文：沿连线收集祖先卡片
+// ─────────────────────────────────────────────────────────────
+/**
+ * 返回 [{node, dist}]，父先子后（拓扑序）。只保留距离最近的 maxN 个祖先。
+ * data 为 canvas.getData() 的结果：{ nodes: [...], edges: [...] }
+ */
+function collectAncestors(data, targetId, maxN) {
+  const byId = new Map(data.nodes.map((n) => [n.id, n]));
+  const parentsOf = (id) => data.edges.filter((e) => e.toNode === id).map((e) => e.fromNode);
+  const pos = (id) => byId.get(id) || { x: 0, y: 0 };
+  const byPos = (a, b) => pos(a).y - pos(b).y || pos(a).x - pos(b).x;
+
+  const dist = new Map();
+  const queue = [];
+  for (const p of parentsOf(targetId)) {
+    if (p !== targetId && !dist.has(p)) {
+      dist.set(p, 1);
+      queue.push(p);
+    }
+  }
+  while (queue.length) {
+    const c = queue.shift();
+    for (const p of parentsOf(c)) {
+      if (p === targetId || dist.has(p)) continue;
+      dist.set(p, dist.get(c) + 1);
+      queue.push(p);
+    }
+  }
+  const kept = new Set(
+    [...dist.entries()].sort((a, b) => a[1] - b[1]).slice(0, maxN).map((e) => e[0])
+  );
+  const order = [];
+  const seen = new Set();
+  const visit = (id) => {
+    if (seen.has(id) || !kept.has(id)) return;
+    seen.add(id);
+    for (const p of parentsOf(id).filter((x) => kept.has(x)).sort(byPos)) visit(p);
+    order.push(id);
+  };
+  for (const p of parentsOf(targetId).filter((x) => kept.has(x)).sort(byPos)) visit(p);
+  return order.map((id) => ({ node: byId.get(id), dist: dist.get(id) })).filter((x) => x.node);
+}
+
+function mergeSameRole(msgs) {
+  const out = [];
+  for (const m of msgs) {
+    const last = out[out.length - 1];
+    if (last && last.role === m.role && m.role !== 'system') {
+      last.content += '\n\n' + m.content;
+      if (m._images) last._images = (last._images || []).concat(m._images);
+    } else {
+      const o = { role: m.role, content: m.content };
+      if (m._images) o._images = m._images.slice();
+      out.push(o);
+    }
+  }
+  return out;
+}
+
+/** readNote(path) → Promise<{name, content}|null>，用于读取笔记文件卡片 */
+async function buildMessages(settings, data, targetId, targetText, readNote) {
+  const msgs = [];
+  if (settings.systemPrompt && settings.systemPrompt.trim()) {
+    msgs.push({ role: 'system', content: settings.systemPrompt.trim() });
+  }
+  for (const { node, dist } of collectAncestors(data, targetId, settings.maxAncestors)) {
+    if (node.type === 'text') {
+      const p = parseNodeText(node.text);
+      if (p.answer !== null) {
+        const q = formatQuestion(p);
+        if (q) msgs.push({ role: 'user', content: q });
+        if (p.answer) {
+          let a = p.answer;
+          if (dist > settings.fullContextDepth && a.length > settings.truncateChars) {
+            a = a.slice(0, settings.truncateChars) + '\n…（较早的回答，已截断）';
+          }
+          msgs.push({ role: 'assistant', content: a });
+        }
+      } else if ((node.text || '').trim()) {
+        msgs.push({ role: 'user', content: `【背景资料】\n${node.text.trim()}` });
+      }
+    } else if (node.type === 'file' && settings.includeNoteFiles && readNote) {
+      const note = await readNote(node.file);
+      if (note && note.content.trim()) {
+        let c = note.content;
+        if (c.length > settings.noteCharLimit) c = c.slice(0, settings.noteCharLimit) + '\n…（已截断）';
+        msgs.push({ role: 'user', content: `【笔记《${note.name}》】\n${c}` });
+      }
+    } else if (node.type === 'link' && node.url) {
+      msgs.push({ role: 'user', content: `【参考链接】${node.url}` });
+    }
+  }
+  msgs.push({ role: 'user', content: formatQuestion(parseNodeText(targetText)) });
+  // 保证 system 之后第一条是 user
+  const merged = mergeSameRole(msgs);
+  const firstNonSys = merged.findIndex((m) => m.role !== 'system');
+  if (firstNonSys >= 0 && merged[firstNonSys].role === 'assistant') {
+    merged.splice(firstNonSys, 0, { role: 'user', content: '（继续之前的讨论）' });
+  }
+  return merged;
+}
+
+// ─────────────────────────────────────────────────────────────
+// OpenAI 兼容接口（流式）
+// ─────────────────────────────────────────────────────────────
+function chatUrl(settings) {
+  return settings.apiBaseUrl.trim().replace(/\/+$/, '') + '/chat/completions';
+}
+
+function headers(settings) {
+  return { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.apiKey.trim()}` };
+}
+
+function requestBody(settings, messages, stream) {
+  const body = { model: settings.model, messages, temperature: Number(settings.temperature), stream };
+  const mt = parseInt(settings.maxTokens, 10);
+  if (mt > 0) body.max_tokens = mt;
+  return body;
+}
+
+/** 读取服务商的模型列表（GET /models） */
+async function fetchModels(settings) {
+  const res = await requestUrl({
+    url: settings.apiBaseUrl.trim().replace(/\/+$/, '') + '/models',
+    method: 'GET',
+    headers: headers(settings),
+    throw: false,
+  });
+  if (res.status >= 400) throw new Error(`HTTP ${res.status} ${String(res.text || '').slice(0, 200)}`);
+  const list = (res.json && (res.json.data || res.json.models)) || [];
+  return list.map((m) => (typeof m === 'string' ? m : m.id || m.name)).filter(Boolean).sort();
+}
+
+async function completeOnce(settings, messages, extra) {
+  if (__mfHost.useHost(settings)) return __mfHost.once(messages);
+  const res = await requestUrl({
+    url: chatUrl(settings),
+    method: 'POST',
+    headers: headers(settings),
+    body: JSON.stringify(Object.assign(requestBody(settings, messages, false), extra || {})),
+    throw: false,
+  });
+  if (res.status >= 400) throw new Error(`HTTP ${res.status} ${String(res.text || '').slice(0, 300)}`);
+  const j = res.json;
+  return (j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
+}
+
+async function streamChat(settings, messages, onDelta, signal) {
+  if (__mfHost.useHost(settings)) { await __mfHost.stream(messages, onDelta, signal); return; }
+  const body = requestBody(settings, messages, true);
+  let res;
+  try {
+    res = await fetch(chatUrl(settings), { method: 'POST', headers: headers(settings), body: JSON.stringify(body), signal });
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw e;
+    // 某些接口不允许浏览器跨域：退回非流式请求
+    onDelta(await completeOnce(settings, messages));
+    return;
+  }
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`HTTP ${res.status} ${t.slice(0, 300)}`);
+  }
+  if (!res.body) {
+    onDelta(await completeOnce(settings, messages));
+    return;
+  }
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (!line.startsWith('data:')) continue;
+      const d = line.slice(5).trim();
+      if (d === '[DONE]') return;
+      try {
+        const j = JSON.parse(d);
+        const c = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
+        if (c) onDelta(c);
+      } catch (_) {
+        /* 忽略不完整行 */
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Canvas 内部 API 小工具（Obsidian 未公开，做了防御式调用）
+//
+// 重要：canvas.setData() 之后 Obsidian 可能会用新的对象替换卡片，
+// 所以所有异步流程都只记卡片 id，每次操作前用 liveNode() 重新取。
+// ─────────────────────────────────────────────────────────────
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
+
+function genId() {
+  let s = '';
+  const c = 'abcdef0123456789';
+  for (let i = 0; i < 16; i++) s += c[Math.floor(Math.random() * c.length)];
+  return s;
+}
+
+function liveNode(canvas, id) {
+  return (canvas && canvas.nodes && canvas.nodes.get && canvas.nodes.get(id)) || null;
+}
+
+function nodeData(node) {
+  try {
+    return node.getData() || {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function isTextNode(node) {
+  const d = nodeData(node);
+  return d.type === 'text' || (d.type === undefined && typeof node.text === 'string');
+}
+
+function getNodeText(node) {
+  if (typeof node.text === 'string') return node.text;
+  return nodeData(node).text || '';
+}
+
+function setNodeText(node, text) {
+  if (typeof node.setText === 'function') node.setText(text);
+  else patchNode(node, { text });
+}
+
+/** 修改卡片数据（尺寸 / 自定义字段），文本以 node.text 为准，避免被旧数据覆盖 */
+function patchNode(node, patch) {
+  const next = Object.assign({}, nodeData(node));
+  if (typeof node.text === 'string' && !('text' in patch)) next.text = node.text;
+  for (const k of Object.keys(patch)) {
+    if (patch[k] === undefined) delete next[k];
+    else next[k] = patch[k];
+  }
+  if (next.width) next.width = Math.round(next.width);
+  if (next.height) next.height = Math.round(next.height);
+  node.setData(next);
+}
+
+function isEditing(node) {
+  return !!(node.isEditing || (node.nodeEl && node.nodeEl.querySelector('.cm-editor')));
+}
+
+function selectedNodes(canvas) {
+  const out = [];
+  if (!canvas || !canvas.selection) return out;
+  for (const item of canvas.selection) {
+    if (item && liveNode(canvas, item.id) === item) out.push(item);
+  }
+  return out;
+}
+
+function addEdges(canvas, fromIds, toId, label) {
+  const data = canvas.getData();
+  for (const fromId of fromIds) {
+    data.edges.push({
+      id: genId(),
+      fromNode: fromId,
+      fromSide: 'right',
+      toNode: toId,
+      toSide: 'left',
+      toEnd: 'arrow',
+      label: label || undefined,
+    });
+  }
+  canvas.setData(data);
+}
+
+function answerBlockOf(node) {
+  const content = node.contentEl || (node.nodeEl && node.nodeEl.querySelector('.canvas-node-content'));
+  if (!content) return null;
+  const callout = content.querySelector('.callout[data-callout="ai"]');
+  if (!callout) return null;
+  const sizer = content.querySelector('.markdown-preview-sizer');
+  let block = callout;
+  while (block.parentElement && block.parentElement !== sizer) block = block.parentElement;
+  return block.parentElement === sizer ? block : callout;
+}
+
+/** 回答里横向放不下的内容（表格、代码块、公式、图片）还差多少宽度（画布坐标） */
+function measureOverflowX(node) {
+  const block = answerBlockOf(node);
+  if (!block) return 0;
+  let extra = Math.max(0, block.scrollWidth - block.clientWidth);
+  for (const el of block.querySelectorAll('table, pre, .math-block, mjx-container[display="true"], img, .table-wrapper')) {
+    extra = Math.max(extra, el.scrollWidth - el.clientWidth);
+    const parent = el.parentElement;
+    if (parent) extra = Math.max(extra, el.scrollWidth - parent.clientWidth);
+  }
+  return extra;
+}
+
+/**
+ * 测量卡片内容完整显示需要的高度（画布坐标，不受缩放影响）。
+ * 回答区在卡片内单独滚动，所以用 问题区高度 + 回答区 scrollHeight 计算。
+ */
+function measureNodeHeight(node) {
+  const nodeEl = node.nodeEl;
+  const content = node.contentEl || (nodeEl && nodeEl.querySelector('.canvas-node-content'));
+  if (!nodeEl || !content) return null;
+  const nodeRect = nodeEl.getBoundingClientRect();
+  const scale = node.height ? nodeRect.height / node.height : 1;
+  if (!scale || !isFinite(scale)) return null;
+  const view = content.querySelector('.markdown-preview-view') || content;
+  const sizer = content.querySelector('.markdown-preview-sizer') || view;
+  const scrolled = (view.scrollTop || 0) * scale;
+  const padB = parseFloat(getComputedStyle(view).paddingBottom) || 0;
+  const block = answerBlockOf(node);
+  let bottom = 0; // 相对卡片顶部、画布坐标
+  if (block && block.parentElement === sizer) {
+    // 回答块被 flex 拉伸占满剩余空间，所以不能用它的高度，要量里面 callout 的真实高度
+    const callout = block.querySelector('.callout[data-callout="ai"]') || block;
+    const cr = callout.getBoundingClientRect();
+    const cs = getComputedStyle(callout);
+    const bs = getComputedStyle(block);
+    bottom =
+      (cr.top - nodeRect.top + scrolled + (block.scrollTop || 0) * scale + cr.height) / scale +
+      (parseFloat(cs.marginBottom) || 0) +
+      (parseFloat(bs.paddingBottom) || 0);
+    let sib = block.nextElementSibling;
+    while (sib) {
+      bottom += sib.getBoundingClientRect().height / scale;
+      sib = sib.nextElementSibling;
+    }
+  } else {
+    for (const child of Array.from(sizer.children)) {
+      const r = child.getBoundingClientRect();
+      if (r.height > 0) bottom = Math.max(bottom, (r.bottom - nodeRect.top + scrolled) / scale);
+    }
+  }
+  if (!bottom) return null;
+  return bottom + padB + 14;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 插件主体
+// ─────────────────────────────────────────────────────────────
+class CanvasMindflowPlugin extends Plugin {
+  async onload() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.running = new Map(); // nodeId -> AbortController
+    this.prevSizes = new Map(); // nodeId -> 展开前的尺寸
+    this.selInfo = null;
+    this.selBtn = null;
+    this.popover = null;
+
+    this.addSettingTab(new MindflowSettingTab(this.app, this));
+    this.registerCommands();
+    this.registerMenus();
+    this.chat = new MindflowChat(this);
+    this.chat.load();
+
+    this.registerDomEvent(document, 'selectionchange', () => this.onSelectionChange());
+    this.registerDomEvent(window, 'keydown', (e) => this.onKeyDown(e), { capture: true });
+    this.registerDomEvent(window, 'pointerdown', (e) => this.onPointerDown(e), { capture: true });
+    this.registerDomEvent(window, 'mousedown', (e) => this.onPointerDown(e), { capture: true });
+    this.registerDomEvent(window, 'click', (e) => this.onClick(e), { capture: true });
+    this.registerDomEvent(window, 'wheel', (e) => this.onWheel(e), { capture: true, passive: true });
+    this.registerEvent(
+      this.app.workspace.on('active-leaf-change', () => {
+        this.closeAll();
+        setTimeout(() => this.migrateAll(), 300);
+      })
+    );
+    this.app.workspace.onLayoutReady(() => setTimeout(() => this.migrateAll(), 500));
+    this.dbg('load', { version: this.manifest.version });
+  }
+
+  onunload() {
+    if (this.chat) this.chat.unload();
+    for (const c of this.running.values()) c.abort();
+    this.closeAll();
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
+  }
+
+  // ── 调试日志（写到插件目录 debug.log）──────────────────────
+  dbg(tag, obj) {
+    if (!this.settings.debug) return;
+    try {
+      const line = JSON.stringify({ t: new Date().toISOString().slice(11, 23), tag, ...(obj || {}) }) + '\n';
+      const path = `${this.app.vault.configDir}/plugins/${this.manifest.id}/debug.log`;
+      this._dbgQueue = (this._dbgQueue || Promise.resolve()).then(() => this.app.vault.adapter.append(path, line)).catch(() => {});
+    } catch (_) {}
+  }
+
+  elPath(el) {
+    const out = [];
+    let e = el;
+    for (let i = 0; e && i < 12; i++, e = e.parentElement) {
+      out.push(e.tagName.toLowerCase() + (e.className && typeof e.className === 'string' ? '.' + e.className.trim().split(/\s+/).join('.') : '') + (e.dataset && e.dataset.callout ? `[callout=${e.dataset.callout}]` : ''));
+      if (e.classList && e.classList.contains('canvas-node')) break;
+    }
+    return out;
+  }
+
+  inspect(canvas, node) {
+    const protoNames = (o) => {
+      const names = new Set();
+      let p = o;
+      for (let i = 0; p && i < 4; i++, p = Object.getPrototypeOf(p)) Object.getOwnPropertyNames(p).forEach((n) => names.add(n));
+      return Array.from(names).sort();
+    };
+    const d = node ? nodeData(node) : null;
+    this.dbg('inspect', {
+      canvasMethods: protoNames(canvas),
+      nodeMethods: node ? protoNames(node) : null,
+      nodeKeys: node ? Object.keys(node) : null,
+      nodeData: d,
+      nodeText: node ? getNodeText(node) : null,
+      html: node && node.nodeEl ? node.nodeEl.outerHTML.slice(0, 6000) : null,
+      measure: node ? measureNodeHeight(node) : null,
+      height: node ? node.height : null,
+    });
+    new Notice('Mindflow：已写入调试信息');
+  }
+
+  get fmt() {
+    return { answerTitle: this.settings.answerTitle || '回答', excerptTitle: this.settings.excerptTitle || '原文' };
+  }
+
+  // ── 视图定位 ──────────────────────────────────────────────
+  canvasViewFromEl(el) {
+    if (!el) return null;
+    for (const leaf of this.app.workspace.getLeavesOfType('canvas')) {
+      const v = leaf.view;
+      if (v && v.containerEl && v.containerEl.contains(el) && v.canvas) return v;
+    }
+    return null;
+  }
+
+  activeCanvasView() {
+    const ws = this.app.workspace;
+    const leaf = ws.activeLeaf || (ws.getMostRecentLeaf && ws.getMostRecentLeaf());
+    const v = leaf && leaf.view;
+    return v && v.getViewType && v.getViewType() === 'canvas' && v.canvas ? v : null;
+  }
+
+  nodeFromEl(canvas, el) {
+    if (!canvas || !el || !canvas.nodes) return null;
+    for (const n of canvas.nodes.values()) if (n.nodeEl && n.nodeEl.contains(el)) return n;
+    return null;
+  }
+
+  /** 把旧格式卡片（灰色「原文」块、残留的「生成中…」）转换成新格式 */
+  migrateCanvas(canvas) {
+    if (!canvas || !canvas.nodes) return;
+    let changed = 0;
+    for (const n of canvas.nodes.values()) {
+      if (this.running.has(n.id) || !isTextNode(n) || isEditing(n)) continue;
+      const text = getNodeText(n);
+      const oldExcerpt = /^\s*>\s?\[!excerpt\]/i.test(text);
+      const staleTitle = /^>\s?\[!ai\][+-]?[^\n]*生成中/im.test(text);
+      if (!oldExcerpt && !staleTitle) continue;
+      const p = parseNodeText(text);
+      const next = buildNodeText(p, this.fmt);
+      if (next !== text) {
+        setNodeText(n, next);
+        changed++;
+      }
+    }
+    // 旧版本遗留：连线上的原文标签、原卡片里没高亮的原文
+    try {
+      const data = canvas.getData();
+      const byId = new Map(data.nodes.map((n) => [n.id, n]));
+      let edgeChanged = false;
+      for (const e of data.edges) {
+        const child = byId.get(e.toNode);
+        const parent = byId.get(e.fromNode);
+        if (!child || child.type !== 'text' || !parent) continue;
+        const cp = parseNodeText(child.text);
+        if (!cp.excerpt) continue;
+        if (!this.settings.edgeLabel && e.label && cp.excerpt.startsWith(e.label.replace(/…$/, ''))) {
+          delete e.label;
+          edgeChanged = true;
+        }
+        if (this.settings.highlightExcerpt && parent.type === 'text' && !this.running.has(parent.id)) {
+          const flat = cp.excerpt.replace(/\s+/g, '');
+          const marks = (parent.text.match(/==([^=\n]+)==/g) || []).map((m) => m.replace(/=|\s|[*_`~]/g, ''));
+          if (!marks.some((m) => m.includes(flat) || flat.includes(m))) {
+            const hl = highlightInText(parent.text, cp.excerpt);
+            const live = liveNode(canvas, parent.id);
+            if (hl && live && !isEditing(live)) {
+              setNodeText(live, hl);
+              parent.text = hl;
+              changed++;
+            }
+          }
+        }
+      }
+      if (edgeChanged) {
+        const fresh = canvas.getData();
+        const keep = new Map(data.edges.map((e) => [e.id, e]));
+        fresh.edges = fresh.edges.map((e) => (keep.has(e.id) ? Object.assign({}, e, { label: keep.get(e.id).label }) : e));
+        for (const e of fresh.edges) if (e.label === undefined) delete e.label;
+        canvas.setData(fresh);
+        changed++;
+      }
+    } catch (err) {
+      this.dbg('migrateErr', { msg: String(err) });
+    }
+    if (changed) {
+      canvas.requestSave();
+      this.dbg('migrate', { changed });
+    }
+  }
+
+  migrateAll() {
+    for (const leaf of this.app.workspace.getLeavesOfType('canvas')) {
+      if (leaf.view && leaf.view.canvas) this.migrateCanvas(leaf.view.canvas);
+    }
+  }
+
+  setStreamingClass(canvas, id, on) {
+    const n = liveNode(canvas, id);
+    if (n && n.nodeEl) n.nodeEl.toggleClass('cmf-streaming', on);
+  }
+
+  // ── 核心：在卡片内回答 ────────────────────────────────────
+  async ask(canvas, id) {
+    if (!this.settings.apiKey.trim()) {
+      new Notice('Canvas Mindflow：请先在设置里填写 API Key');
+      return;
+    }
+    let node = liveNode(canvas, id);
+    if (!node) return;
+    if (!isTextNode(node)) {
+      new Notice('只能对文字卡片提问');
+      return;
+    }
+    if (this.running.has(id)) return;
+    const text = getNodeText(node);
+    const p = parseNodeText(text);
+    if (!p.question.trim() && !p.excerpt) {
+      new Notice('卡片里还没有问题');
+      return;
+    }
+
+    const readNote = async (path) => {
+      const f = this.app.vault.getAbstractFileByPath(path);
+      if (!f || f.extension !== 'md') return null;
+      return { name: f.basename, content: await this.app.vault.cachedRead(f) };
+    };
+    const messages = await buildMessages(this.settings, canvas.getData(), id, text, readNote);
+
+    node = liveNode(canvas, id);
+    if (!node) return;
+    if (p.answer === null && node.width < this.settings.nodeWidth) patchNode(node, { width: this.settings.nodeWidth });
+    this.prevSizes.delete(id);
+    patchNode(node, { cmfPrevSize: undefined });
+
+    const ctrl = new AbortController();
+    this.running.set(id, ctrl);
+    let answer = '';
+    let lastRender = 0;
+    let timer = null;
+    let finalText = '';
+    const render = () => {
+      const n = liveNode(canvas, id);
+      if (!n) return;
+      finalText = buildNodeText(Object.assign({}, p, { answer: normalizeMath(answer), folded: false }), this.fmt);
+      setNodeText(n, finalText);
+      if (n.nodeEl) n.nodeEl.addClass('cmf-streaming');
+      this.fitSoon(canvas, id, 'grow');
+    };
+    const flush = () => {
+      timer = null;
+      lastRender = Date.now();
+      render();
+    };
+    render();
+    try {
+      await streamChat(
+        this.settings,
+        messages,
+        (delta) => {
+          answer += delta;
+          const wait = 120 - (Date.now() - lastRender);
+          if (wait <= 0) flush();
+          else if (!timer) timer = setTimeout(flush, wait);
+        },
+        ctrl.signal
+      );
+      if (!answer.trim()) answer = '（AI 返回为空）';
+    } catch (e) {
+      if (e && e.name === 'AbortError') answer += '\n\n*（已停止生成）*';
+      else answer = (answer ? answer + '\n\n' : '') + `❌ 请求失败：${(e && e.message) || e}`;
+    } finally {
+      if (timer) clearTimeout(timer);
+      this.running.delete(id);
+      render();
+      this.setStreamingClass(canvas, id, false);
+      canvas.requestSave();
+    }
+    // 兜底：如果卡片在生成期间被替换过，把最终文本再写一次
+    await sleep(400);
+    const n = liveNode(canvas, id);
+    if (n) {
+      n.nodeEl && n.nodeEl.removeClass('cmf-streaming');
+      const cur = parseNodeText(getNodeText(n));
+      if (cur.answer !== null && cur.answer !== answer.trim() && answer.trim().startsWith(cur.answer.replace(/…$/, ''))) {
+        setNodeText(n, finalText);
+        canvas.requestSave();
+      }
+    }
+  }
+
+  /** 编辑状态下先退出编辑，让文字写回卡片，再提问 */
+  async askAfterCommit(canvas, id) {
+    const node = liveNode(canvas, id);
+    if (!node) return;
+    if (isEditing(node)) {
+      try {
+        if (typeof node.blur === 'function') node.blur();
+      } catch (_) {}
+      try {
+        if (typeof canvas.deselectAll === 'function') canvas.deselectAll();
+      } catch (_) {}
+      await sleep(80);
+      try {
+        const n = liveNode(canvas, id);
+        if (n && typeof canvas.selectOnly === 'function') canvas.selectOnly(n);
+      } catch (_) {}
+    }
+    await this.ask(canvas, id);
+  }
+
+  /**
+   * 渲染完成后调整高度
+   * grow   ：只增不减，上限 maxAutoHeight（流式生成时）
+   * expand ：展开到完整显示，上限 maxExpandHeight
+   * exact  ：正好包住内容（折叠后）
+   */
+  async fitSoon(canvas, id, mode) {
+    await sleep(60);
+    await nextFrame();
+    const node = liveNode(canvas, id);
+    if (!node) return;
+    const h = measureNodeHeight(node);
+    this.dbg('fit', { mode, measured: h, height: node.height });
+    if (!h) return;
+    if (mode === 'exact') {
+      patchNode(node, { height: Math.max(60, h) });
+    } else {
+      const cap = mode === 'expand' ? this.settings.maxExpandHeight : this.settings.maxAutoHeight;
+      const target = Math.min(h, cap);
+      if (target > node.height + 2) patchNode(node, { height: target });
+    }
+  }
+
+  // ── 折叠 / 展开 ──────────────────────────────────────────
+  /**
+   * 展开：记下当前尺寸，然后把卡片放大到能完整显示回答（有上限）。
+   * 折叠：恢复到展开前的尺寸；没有记录时收紧到正好包住问题。
+   */
+  async setFold(canvas, id, folded) {
+    const node = liveNode(canvas, id);
+    if (!node) return;
+    const text = getNodeText(node);
+    const p = parseNodeText(text);
+    if (p.answer === null) return;
+    const newText = setFoldedInText(text, folded);
+    this.dbg('setFold', { folded, wasFolded: p.folded, w: node.width, h: node.height });
+    if (p.folded === folded && newText === text) return;
+
+    if (!folded) {
+      const prev = { width: node.width, height: node.height };
+      this.prevSizes.set(id, prev);
+      setNodeText(node, newText);
+      const n = liveNode(canvas, id);
+      if (n) {
+        const patch = { cmfPrevSize: prev };
+        const target = Math.max(n.width, Math.min(this.settings.expandWidth, this.settings.maxExpandWidth));
+        if (target > n.width) patch.width = target;
+        patchNode(n, patch);
+      }
+      await sleep(40);
+      await nextFrame();
+      // 表格、代码块、公式等宽内容：继续加宽到能完整显示（不超过上限）
+      const n2 = liveNode(canvas, id);
+      if (n2) {
+        const extra = measureOverflowX(n2);
+        if (extra > 4) {
+          const w = Math.min(n2.width + extra + 8, this.settings.maxExpandWidth);
+          if (w > n2.width) patchNode(n2, { width: w });
+        }
+      }
+      await this.fitSoon(canvas, id, 'expand');
+    } else {
+      const n0 = liveNode(canvas, id);
+      const prev = this.prevSizes.get(id) || (n0 && nodeData(n0).cmfPrevSize);
+      setNodeText(node, newText);
+      const n = liveNode(canvas, id);
+      if (prev && prev.height) {
+        if (n) patchNode(n, { width: prev.width, height: prev.height, cmfPrevSize: undefined });
+      } else {
+        if (n) patchNode(n, { cmfPrevSize: undefined });
+        await this.fitSoon(canvas, id, 'exact');
+      }
+      this.prevSizes.delete(id);
+    }
+    canvas.requestSave();
+  }
+
+  toggleFold(canvas, id) {
+    const node = liveNode(canvas, id);
+    if (!node) return;
+    const p = parseNodeText(getNodeText(node));
+    if (p.answer !== null) this.setFold(canvas, id, !p.folded);
+  }
+
+  async foldAll(canvas, folded) {
+    const ids = [];
+    for (const n of canvas.nodes.values()) {
+      if (isTextNode(n) && parseNodeText(getNodeText(n)).answer !== null) ids.push(n.id);
+    }
+    for (const id of ids) await this.setFold(canvas, id, folded);
+  }
+
+  // ── 新建卡片 ─────────────────────────────────────────────
+  /** 在 parent 右侧找一个不与其它卡片重叠的位置 */
+  placeRightOf(canvas, parent, preferY, width, height) {
+    const x = parent.x + parent.width + 100;
+    let y = preferY != null ? preferY : parent.y;
+    const others = Array.from(canvas.nodes.values())
+      .filter((n) => n !== parent && nodeData(n).type !== 'group')
+      .filter((n) => n.x < x + width && n.x + n.width > x)
+      .sort((a, b) => a.y - b.y);
+    for (let guard = 0; guard < 3; guard++) {
+      let moved = false;
+      for (const n of others) {
+        if (y < n.y + n.height + 40 && y + height + 40 > n.y) {
+          y = n.y + n.height + 40;
+          moved = true;
+        }
+      }
+      if (!moved) break;
+    }
+    return { x, y };
+  }
+
+  /** 新建文字卡片，返回 id */
+  createNode(canvas, pos, text, height, focus) {
+    const node = canvas.createTextNode({
+      pos,
+      size: { width: this.settings.nodeWidth, height: height || 100 },
+      text: text || '',
+      focus: !!focus,
+    });
+    return node.id;
+  }
+
+  focusEdit(canvas, id) {
+    setTimeout(() => {
+      try {
+        const n = liveNode(canvas, id);
+        if (!n) return;
+        if (typeof canvas.selectOnly === 'function') canvas.selectOnly(n);
+        if (!isEditing(n) && typeof n.startEditing === 'function') n.startEditing();
+      } catch (_) {}
+    }, 60);
+  }
+
+  /** Tab：在右侧新建一张空白追问卡片 */
+  createFollowUp(canvas, parentId) {
+    const parent = liveNode(canvas, parentId);
+    if (!parent) return;
+    const pos = this.placeRightOf(canvas, parent, parent.y, this.settings.nodeWidth, 100);
+    const id = this.createNode(canvas, pos, '', 100, true);
+    addEdges(canvas, [parentId], id);
+    canvas.requestSave();
+    this.focusEdit(canvas, id);
+  }
+
+  /** 划词追问：高亮原卡片里的原文，新建带原文锚点的子卡片并立即回答 */
+  async createFromSelection(canvas, parentId, excerpt, question, rect) {
+    let parent = liveNode(canvas, parentId);
+    if (!parent) return;
+    let preferY = parent.y;
+    if (rect && parent.nodeEl) {
+      const nr = parent.nodeEl.getBoundingClientRect();
+      const scale = parent.height ? nr.height / parent.height : 1;
+      if (scale > 0) preferY = parent.y + Math.max(0, (rect.top - nr.top) / scale - 20);
+    }
+    if (this.settings.highlightExcerpt) {
+      const before = getNodeText(parent);
+      const hl = highlightInText(before, excerpt);
+      this.dbg('highlight', { excerpt, found: !!hl, before: before.slice(0, 800) });
+      if (hl) setNodeText(parent, hl);
+      parent = liveNode(canvas, parentId);
+      if (!parent) return;
+    }
+    const q = question.trim() || '请详细解释这段内容。';
+    const text = buildNodeText({ excerpt, question: q, answer: null }, this.fmt);
+    const pos = this.placeRightOf(canvas, parent, preferY, this.settings.nodeWidth, 140);
+    const id = this.createNode(canvas, pos, text, 140, false);
+    addEdges(canvas, [parentId], id, this.settings.edgeLabel ? truncate(excerpt, 16) : undefined);
+    canvas.requestSave();
+    {
+      const pd = canvas.getData().nodes.find((n) => n.id === parentId);
+      const pl = liveNode(canvas, parentId);
+      this.dbg('afterEdge', { dataText: pd && pd.text.slice(0, 300), liveText: pl && getNodeText(pl).slice(0, 300), sameObj: pl === parent });
+    }
+    await sleep(50);
+    await this.ask(canvas, id);
+  }
+
+  /** 视口中央新建问题卡片 */
+  createQuestionAtCenter(canvas) {
+    let x = 0;
+    let y = 0;
+    try {
+      const bb = canvas.getViewportBBox();
+      x = (bb.minX + bb.maxX) / 2 - this.settings.nodeWidth / 2;
+      y = (bb.minY + bb.maxY) / 2 - 60;
+    } catch (_) {
+      x = (canvas.x || 0) - this.settings.nodeWidth / 2;
+      y = canvas.y || 0;
+    }
+    const id = this.createNode(canvas, { x, y }, '', 100, true);
+    canvas.requestSave();
+    this.focusEdit(canvas, id);
+  }
+
+  /** 多选：新建一张连接所有选中卡片的汇总提问卡片 */
+  createMergeQuestion(canvas, nodes) {
+    const x = Math.max(...nodes.map((n) => n.x + n.width)) + 100;
+    const y = Math.min(...nodes.map((n) => n.y));
+    const ids = nodes.map((n) => n.id);
+    const id = this.createNode(canvas, { x, y }, '', 100, true);
+    addEdges(canvas, ids, id);
+    canvas.requestSave();
+    this.focusEdit(canvas, id);
+  }
+
+  stopAll() {
+    for (const c of this.running.values()) c.abort();
+  }
+
+  // ── 键盘 / 鼠标 ──────────────────────────────────────────
+  onKeyDown(evt) {
+    if (this.popover) return; // 弹窗自己处理
+    const t = evt.target instanceof Element ? evt.target : null;
+    const inCanvasView = t && this.canvasViewFromEl(t);
+    const view = inCanvasView || this.activeCanvasView();
+    if (!view) return;
+    const editable = t && t.closest('.cm-editor, input, textarea, [contenteditable="true"]');
+    if (editable && !inCanvasView) return; // 焦点在别处（搜索框等）
+    const canvas = view.canvas;
+
+    // Ctrl/Cmd + Enter：让 AI 回答当前卡片
+    if (evt.key === 'Enter' && (evt.ctrlKey || evt.metaKey) && !evt.shiftKey && !evt.altKey && !evt.isComposing) {
+      const sel = selectedNodes(canvas);
+      const node = (t && this.nodeFromEl(canvas, t)) || (sel.length === 1 ? sel[0] : null);
+      if (!node || !isTextNode(node)) return;
+      evt.preventDefault();
+      evt.stopPropagation();
+      this.askAfterCommit(canvas, node.id);
+      return;
+    }
+
+    // Tab：有划选文字 → 追问弹窗；否则 → 新建空白子卡片
+    if (evt.key === 'Tab' && this.settings.enableTab && !evt.ctrlKey && !evt.metaKey && !evt.altKey && !evt.shiftKey) {
+      if (editable) return; // 编辑卡片时保留原生缩进
+      if (this.selInfo && this.selInfo.canvas === canvas) {
+        evt.preventDefault();
+        evt.stopPropagation();
+        this.openPopover();
+        return;
+      }
+      const sel = selectedNodes(canvas);
+      if (sel.length === 1) {
+        evt.preventDefault();
+        evt.stopPropagation();
+        this.createFollowUp(canvas, sel[0].id);
+      }
+    }
+  }
+
+  /** 找到事件所在的、已选中且未在编辑的卡片 */
+  selectedNodeAt(el) {
+    const nodeEl = el.closest('.canvas-node');
+    if (!nodeEl || nodeEl.querySelector('.cm-editor')) return null;
+    const view = this.canvasViewFromEl(nodeEl);
+    if (!view) return null;
+    const node = this.nodeFromEl(view.canvas, nodeEl);
+    if (!node || !view.canvas.selection || !view.canvas.selection.has(node)) return null;
+    return { view, node };
+  }
+
+  /** 已选中的卡片里，按住回答区域拖动 = 划选文字（而不是移动卡片） */
+  onPointerDown(evt) {
+    if (evt.button !== 0) return;
+    const t = evt.target instanceof Element ? evt.target : null;
+    if (!t) return;
+    if (this.popover && !this.popover.contains(t)) this.closePopover();
+    if (t.closest('.cmf-sel-btn, .cmf-popover')) return;
+    const title = t.closest('.callout[data-callout="ai"] > .callout-title');
+    if (title) {
+      if (evt.type === 'pointerdown') this.handleTitlePress(evt, title);
+      else {
+        evt.preventDefault();
+        evt.stopPropagation();
+      }
+      return;
+    }
+    const content = t.closest(
+      '.callout[data-callout="ai"] > .callout-content, .callout[data-callout="excerpt"] > .callout-content'
+    );
+    if (!content) return;
+    if (!this.selectedNodeAt(t)) return;
+    evt.stopPropagation();
+  }
+
+  /** 已选中卡片的回答区可以滚动时，滚轮用来滚动回答而不是缩放画布 */
+  onWheel(evt) {
+    this.hideSelButton();
+    const t = evt.target instanceof Element ? evt.target : null;
+    if (!t || evt.ctrlKey || evt.metaKey) return;
+    const hit = this.selectedNodeAt(t);
+    if (!hit) return;
+    const block = answerBlockOf(hit.node);
+    if (!block || !block.contains(t)) return;
+    const canDown = block.scrollTop + block.clientHeight < block.scrollHeight - 1;
+    const canUp = block.scrollTop > 0;
+    if ((evt.deltaY > 0 && canDown) || (evt.deltaY < 0 && canUp)) evt.stopPropagation();
+  }
+
+  /** 按下「回答」标题 → 折叠/展开（在按下时处理，不依赖 click，避免卡片重绘后丢失点击） */
+  handleTitlePress(evt, title) {
+    const nodeEl = title.closest('.canvas-node');
+    if (!nodeEl || nodeEl.querySelector('.cm-editor')) return;
+    const view = this.canvasViewFromEl(nodeEl);
+    if (!view) return;
+    const node = this.nodeFromEl(view.canvas, nodeEl);
+    if (!node) return;
+    evt.preventDefault();
+    evt.stopPropagation();
+    this.dbg('titlePress', { id: node.id });
+    this.swallowClickUntil = Date.now() + 600;
+    this.toggleFold(view.canvas, node.id);
+  }
+
+  /** 吞掉标题上的 click，防止 Obsidian 自己再折叠一次 */
+  onClick(evt) {
+    const t = evt.target instanceof Element ? evt.target : null;
+    if (!t) return;
+    const onTitle = t.closest('.canvas-node .callout[data-callout="ai"] > .callout-title');
+    if (onTitle || (this.swallowClickUntil && Date.now() < this.swallowClickUntil && t.closest('.canvas-node'))) {
+      evt.preventDefault();
+      evt.stopPropagation();
+    }
+  }
+
+  // ── 划词浮动按钮 & 追问弹窗 ──────────────────────────────
+  onSelectionChange() {
+    // 拖选经过公式时，给公式加选中底色
+    try {
+      const sel = document.getSelection();
+      const r = sel && sel.rangeCount && !sel.isCollapsed ? sel.getRangeAt(0) : null;
+      let el = r && r.commonAncestorContainer;
+      if (el && el.nodeType !== 1) el = el.parentElement;
+      const nodeEl = el && el.closest('.canvas-node');
+      if (this._mathSelScope && this._mathSelScope !== nodeEl) markSelectedMath(this._mathSelScope, null);
+      if (nodeEl) markSelectedMath(nodeEl, r);
+      this._mathSelScope = nodeEl || null;
+    } catch (_) {}
+    if (this.popover) return;
+    clearTimeout(this.selTimer);
+    this.selTimer = setTimeout(() => this.updateSelection(), 120);
+  }
+
+  updateSelection() {
+    if (this.popover) return;
+    const sel = document.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return this.clearSelection();
+    const range = sel.getRangeAt(0);
+    let el = range.commonAncestorContainer;
+    if (el && el.nodeType !== 1) el = el.parentElement;
+    if (!el || el.closest('.cm-editor')) return this.clearSelection();
+    const nodeEl = el.closest('.canvas-node');
+    if (!nodeEl) return this.clearSelection();
+    const view = this.canvasViewFromEl(nodeEl);
+    if (!view) return this.clearSelection();
+    const node = this.nodeFromEl(view.canvas, nodeEl);
+    if (!node) return this.clearSelection();
+    annotateMath(nodeEl, getNodeText(node));
+    const text = selectionToSource(range).text;
+    if (!text) return this.clearSelection();
+    const rect = range.getBoundingClientRect();
+    this.selInfo = { canvas: view.canvas, nodeId: node.id, text, rect };
+    this.showSelButton(rect);
+  }
+
+  clearSelection() {
+    this.selInfo = null;
+    this.hideSelButton();
+  }
+
+  showSelButton(rect) {
+    this.hideSelButton();
+    const btn = document.body.createDiv({ cls: 'cmf-sel-btn', text: '✦ 追问' });
+    btn.setAttr('aria-label', '针对选中内容追问（Tab）');
+    const top = rect.top > 44 ? rect.top - 38 : rect.bottom + 8;
+    btn.style.top = `${top}px`;
+    btn.style.left = `${rect.left + rect.width / 2}px`;
+    btn.addEventListener('mousedown', (e) => e.preventDefault());
+    btn.addEventListener('pointerdown', (e) => e.preventDefault());
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.openPopover();
+    });
+    this.selBtn = btn;
+  }
+
+  hideSelButton() {
+    if (this.selBtn) {
+      this.selBtn.remove();
+      this.selBtn = null;
+    }
+  }
+
+  openPopover() {
+    const info = this.selInfo;
+    if (!info) return;
+    this.hideSelButton();
+    this.closePopover();
+    const pop = document.body.createDiv({ cls: 'cmf-popover' });
+    pop.createDiv({ cls: 'cmf-pop-excerpt', text: `「${truncate(info.text, 90)}」` });
+    const ta = pop.createEl('textarea', {
+      cls: 'cmf-pop-input',
+      attr: { rows: '2', placeholder: '想追问什么？留空=详细解释这段' },
+    });
+    pop.createDiv({ cls: 'cmf-pop-hint', text: 'Enter 发送　Shift+Enter 换行　Esc 取消' });
+    const r = info.rect;
+    const w = 340;
+    const left = Math.min(Math.max(8, r.left + r.width / 2 - w / 2), window.innerWidth - w - 8);
+    const below = r.bottom + 10;
+    const top = below + 130 < window.innerHeight ? below : Math.max(8, r.top - 140);
+    pop.style.left = `${left}px`;
+    pop.style.top = `${top}px`;
+    pop.style.width = `${w}px`;
+    ta.addEventListener('keydown', (e) => {
+      if (e.isComposing) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        this.closePopover();
+      } else if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        const q = ta.value;
+        this.closePopover();
+        this.selInfo = null;
+        const s = document.getSelection();
+        if (s) s.removeAllRanges();
+        this.createFromSelection(info.canvas, info.nodeId, info.text, q, info.rect);
+      }
+    });
+    this.popover = pop;
+    setTimeout(() => ta.focus(), 20);
+  }
+
+  closePopover() {
+    if (this.popover) {
+      this.popover.remove();
+      this.popover = null;
+    }
+  }
+
+  closeAll() {
+    this.closePopover();
+    this.clearSelection();
+  }
+
+  // ── 命令 & 右键菜单 ──────────────────────────────────────
+  withCanvas(checking, fn) {
+    const view = this.activeCanvasView();
+    if (!view) return false;
+    const r = fn(view.canvas, true);
+    if (r === false) return false;
+    if (!checking) fn(view.canvas, false);
+    return true;
+  }
+
+  registerCommands() {
+    const single = (canvas) => {
+      const s = selectedNodes(canvas);
+      return s.length === 1 ? s[0] : null;
+    };
+    const withNode = (checking, run) =>
+      this.withCanvas(checking, (canvas, dry) => {
+        const n = single(canvas);
+        if (!n) return false;
+        if (!dry) run(canvas, n.id);
+      });
+    this.addCommand({
+      id: 'new-question',
+      name: '在画布中央新建问题卡片',
+      checkCallback: (checking) =>
+        this.withCanvas(checking, (canvas, dry) => {
+          if (!dry) this.createQuestionAtCenter(canvas);
+        }),
+    });
+    this.addCommand({
+      id: 'ask',
+      name: '让 AI 回答选中的卡片（Ctrl/Cmd+Enter）',
+      checkCallback: (checking) => withNode(checking, (c, id) => this.askAfterCommit(c, id)),
+    });
+    this.addCommand({
+      id: 'follow-up',
+      name: '新建追问子卡片（Tab）',
+      checkCallback: (checking) => withNode(checking, (c, id) => this.createFollowUp(c, id)),
+    });
+    this.addCommand({
+      id: 'toggle-fold',
+      name: '折叠/展开选中卡片的回答',
+      checkCallback: (checking) => withNode(checking, (c, id) => this.toggleFold(c, id)),
+    });
+    this.addCommand({
+      id: 'fold-all',
+      name: '折叠画布上所有回答',
+      checkCallback: (checking) =>
+        this.withCanvas(checking, (canvas, dry) => {
+          if (!dry) this.foldAll(canvas, true);
+        }),
+    });
+    this.addCommand({
+      id: 'expand-all',
+      name: '展开画布上所有回答',
+      checkCallback: (checking) =>
+        this.withCanvas(checking, (canvas, dry) => {
+          if (!dry) this.foldAll(canvas, false);
+        }),
+    });
+    this.addCommand({ id: 'stop', name: '停止所有生成', callback: () => this.stopAll() });
+    this.addCommand({
+      id: 'debug-inspect',
+      name: '调试：导出选中卡片结构',
+      checkCallback: (checking) =>
+        this.withCanvas(checking, (canvas, dry) => {
+          if (!dry) this.inspect(canvas, single(canvas));
+        }),
+    });
+  }
+
+  registerMenus() {
+    this.registerEvent(
+      this.app.workspace.on('canvas:node-menu', (menu, node) => {
+        const canvas = node.canvas;
+        if (!canvas || !isTextNode(node)) return;
+        const id = node.id;
+        const p = parseNodeText(getNodeText(node));
+        if (this.running.has(id)) {
+          menu.addItem((i) =>
+            i.setTitle('停止生成').setIcon('square').onClick(() => this.running.get(id) && this.running.get(id).abort())
+          );
+        } else {
+          menu.addItem((i) =>
+            i
+              .setTitle(p.answer === null ? '让 AI 回答' : '重新回答')
+              .setIcon(p.answer === null ? 'sparkles' : 'refresh-cw')
+              .onClick(() => this.askAfterCommit(canvas, id))
+          );
+        }
+        menu.addItem((i) => i.setTitle('追问（新建子卡片）').setIcon('corner-down-right').onClick(() => this.createFollowUp(canvas, id)));
+        if (p.answer !== null) {
+          menu.addItem((i) =>
+            i
+              .setTitle(p.folded ? '展开回答' : '折叠回答')
+              .setIcon(p.folded ? 'chevrons-up-down' : 'chevrons-down-up')
+              .onClick(() => this.setFold(canvas, id, !p.folded))
+          );
+        }
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on('canvas:selection-menu', (menu, canvas) => {
+        const nodes = selectedNodes(canvas);
+        if (nodes.length < 2) return;
+        menu.addItem((i) =>
+          i.setTitle(`汇总提问（连接 ${nodes.length} 张卡片）`).setIcon('git-merge').onClick(() => this.createMergeQuestion(canvas, nodes))
+        );
+      })
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// 设置页
+// ─────────────────────────────────────────────────────────────
+class MindflowSettingTab extends PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+    this.models = null;
+  }
+
+  display() {
+    const { containerEl } = this;
+    const s = this.plugin.settings;
+    const save = async () => {
+      await this.plugin.saveSettings();
+      if (this.plugin.chat) this.plugin.chat.applyLayoutSettings();
+    };
+    containerEl.empty();
+    containerEl.addClass('cmf-settings');
+
+    const section = (title, desc) => {
+      new Setting(containerEl).setName(title).setHeading();
+      if (desc) containerEl.createDiv({ cls: 'setting-item-description cmf-settings-desc', text: desc });
+    };
+    const num = (name, desc, key, min, max) =>
+      new Setting(containerEl)
+        .setName(name)
+        .setDesc(desc)
+        .addText((t) => {
+          t.inputEl.type = 'number';
+          t.inputEl.style.width = '90px';
+          t.setValue(String(s[key])).onChange(async (v) => {
+            const n = parseInt(v, 10);
+            if (!isNaN(n) && n >= min && (max == null || n <= max)) {
+              s[key] = n;
+              await save();
+            }
+          });
+        });
+    const toggle = (name, desc, key) =>
+      new Setting(containerEl)
+        .setName(name)
+        .setDesc(desc)
+        .addToggle((t) => t.setValue(!!s[key]).onChange(async (v) => ((s[key] = v), await save())));
+
+    // ── AI 服务 ────────────────────────────────────────────
+    section('AI 服务', '支持所有 OpenAI 兼容接口。选一个服务商会自动填好 API 地址和推荐模型。');
+    const current = PROVIDERS.find((p) => s.apiBaseUrl.trim().replace(/\/+$/, '') === p.url);
+    new Setting(containerEl)
+      .setName('服务商')
+      .addDropdown((d) => {
+        d.addOption('custom', '自定义');
+        for (const p of PROVIDERS) d.addOption(p.id, p.name);
+        d.setValue(current ? current.id : 'custom');
+        d.onChange(async (v) => {
+          const p = PROVIDERS.find((x) => x.id === v);
+          if (!p) return;
+          s.apiBaseUrl = p.url;
+          s.model = p.model;
+          this.models = null;
+          await save();
+          this.display();
+        });
+      });
+    new Setting(containerEl)
+      .setName('API 地址')
+      .setDesc('基础地址，通常以 /v1 结尾')
+      .addText((t) => {
+        t.inputEl.style.width = '280px';
+        t.setValue(s.apiBaseUrl).onChange(async (v) => ((s.apiBaseUrl = v.trim()), await save()));
+      });
+    new Setting(containerEl)
+      .setName('API Key')
+      .setDesc('保存在本库的插件数据里，会随库同步到你的其他设备')
+      .addText((t) => {
+        t.inputEl.type = 'password';
+        t.inputEl.style.width = '280px';
+        t.setValue(s.apiKey).onChange(async (v) => ((s.apiKey = v.trim()), await save()));
+      })
+      .addExtraButton((b) =>
+        b
+          .setIcon('eye')
+          .setTooltip('显示 / 隐藏')
+          .onClick(() => {
+            const input = b.extraSettingsEl.parentElement.querySelector('input');
+            if (input) input.type = input.type === 'password' ? 'text' : 'password';
+          })
+      );
+    const modelSetting = new Setting(containerEl).setName('模型').setDesc('可以手动填写，或点「获取列表」从服务商读取可用模型');
+    if (this.models && this.models.length) {
+      modelSetting.addDropdown((d) => {
+        for (const m of this.models) d.addOption(m, m);
+        if (!this.models.includes(s.model)) d.addOption(s.model, `${s.model}（当前）`);
+        d.setValue(s.model).onChange(async (v) => ((s.model = v), await save()));
+      });
+    } else {
+      modelSetting.addText((t) => {
+        t.inputEl.style.width = '220px';
+        t.setValue(s.model).onChange(async (v) => ((s.model = v.trim()), await save()));
+      });
+    }
+    modelSetting.addButton((b) =>
+      b.setButtonText('获取列表').onClick(async () => {
+        b.setDisabled(true);
+        try {
+          this.models = await fetchModels(s);
+          if (!this.models.length) new Notice('服务商没有返回模型列表，请手动填写');
+          this.display();
+        } catch (e) {
+          new Notice(`获取失败：${(e && e.message) || e}`, 8000);
+        } finally {
+          b.setDisabled(false);
+        }
+      })
+    );
+    new Setting(containerEl)
+      .setName('测试连接')
+      .setDesc('用当前配置发一条很短的请求')
+      .addButton((b) =>
+        b.setButtonText('测试').onClick(async () => {
+          b.setDisabled(true);
+          try {
+            const r = await completeOnce(s, [{ role: 'user', content: '只回复“好”' }], { max_tokens: 8 });
+            new Notice(`连接成功：${truncate(r, 30)}`);
+          } catch (e) {
+            new Notice(`连接失败：${(e && e.message) || e}`, 8000);
+          } finally {
+            b.setDisabled(false);
+          }
+        })
+      );
+    new Setting(containerEl)
+      .setName('Temperature')
+      .setDesc('越低越严谨，越高越发散（默认 0.7）')
+      .addSlider((sl) =>
+        sl.setLimits(0, 2, 0.1).setValue(Number(s.temperature)).setDynamicTooltip().onChange(async (v) => ((s.temperature = v), await save()))
+      );
+    num('最大回复长度', '单次回答最多多少 token，0 表示不限制（由服务商决定）', 'maxTokens', 0);
+    new Setting(containerEl)
+      .setName('系统提示词')
+      .setDesc('AI 的角色与回答风格，对话视图和 Canvas 卡片共用')
+      .addExtraButton((b) =>
+        b
+          .setIcon('rotate-ccw')
+          .setTooltip('恢复默认')
+          .onClick(async () => {
+            s.systemPrompt = DEFAULT_SYSTEM_PROMPT;
+            await save();
+            this.display();
+          })
+      );
+    const sp = containerEl.createEl('textarea', { cls: 'cmf-settings-textarea' });
+    sp.rows = 5;
+    sp.value = s.systemPrompt;
+    sp.addEventListener('change', async () => {
+      s.systemPrompt = sp.value;
+      await save();
+    });
+
+    // ── 对话视图 ──────────────────────────────────────────
+    section('对话视图', '划线追问的对话窗口。');
+    new Setting(containerEl)
+      .setName('打开对话视图')
+      .addButton((b) => b.setButtonText('打开').onClick(() => this.plugin.chat && this.plugin.chat.openView()));
+    new Setting(containerEl)
+      .setName('发送方式')
+      .addDropdown((d) =>
+        d
+          .addOption('enter', 'Enter 发送，Shift+Enter 换行')
+          .addOption('mod-enter', 'Ctrl/Cmd+Enter 发送，Enter 换行')
+          .setValue(s.chatSendKey)
+          .onChange(async (v) => ((s.chatSendKey = v), await save()))
+      );
+    new Setting(containerEl)
+      .setName('回答字号')
+      .addSlider((sl) =>
+        sl.setLimits(12, 20, 1).setValue(Number(s.chatFontSize)).setDynamicTooltip().onChange(async (v) => ((s.chatFontSize = v), await save()))
+      );
+    toggle('显示回答信息', '在每条回答下方显示时间和所用模型', 'chatShowMeta');
+    new Setting(containerEl)
+      .setName('划线追问的默认问题')
+      .setDesc('划线后不输入问题直接发送时使用')
+      .addText((t) => {
+        t.inputEl.style.width = '240px';
+        t.setValue(s.defaultFollowUp).onChange(async (v) => ((s.defaultFollowUp = v.trim() || '请详细解释这段内容。'), await save()));
+      });
+    // 预设追问
+    new Setting(containerEl)
+      .setName('划线追问的预设问题')
+      .setDesc('划线后右键或在追问小窗里一键选用，不用每次手打。可以增删、调整顺序。')
+      .addButton((b) =>
+        b.setButtonText('添加问题').onClick(async () => {
+          s.presetQuestions = (s.presetQuestions || []).concat(['']);
+          await save();
+          this.display();
+          setTimeout(() => {
+            const inputs = containerEl.querySelectorAll('.cmf-preset-input');
+            const last = inputs[inputs.length - 1];
+            if (last) last.focus();
+          }, 30);
+        })
+      )
+      .addExtraButton((b) =>
+        b
+          .setIcon('rotate-ccw')
+          .setTooltip('恢复默认预设')
+          .onClick(async () => {
+            s.presetQuestions = DEFAULT_SETTINGS.presetQuestions.slice();
+            await save();
+            this.display();
+          })
+      );
+    const presetBox = containerEl.createDiv({ cls: 'cmf-preset-list' });
+    const presets = Array.isArray(s.presetQuestions) ? s.presetQuestions : [];
+    if (!presets.length) presetBox.createDiv({ cls: 'cmf-preset-empty', text: '还没有预设问题，点「添加问题」' });
+    presets.forEach((q, i) => {
+      const row = presetBox.createDiv({ cls: 'cmf-preset-row' });
+      row.createSpan({ cls: 'cmf-preset-num', text: String(i + 1) });
+      const input = row.createEl('input', { cls: 'cmf-preset-input', attr: { type: 'text', placeholder: '例如：这个概念的直观理解是什么？' } });
+      input.value = q;
+      input.addEventListener('change', async () => {
+        s.presetQuestions[i] = input.value.trim();
+        await save();
+      });
+      const btn = (icon, tip, fn, disabled) => {
+        const b = row.createDiv({ cls: 'clickable-icon cmf-preset-btn' + (disabled ? ' is-disabled' : ''), attr: { 'aria-label': tip } });
+        obsidian.setIcon(b, icon);
+        if (!disabled) b.addEventListener('click', fn);
+      };
+      const move = async (d) => {
+        const arr = s.presetQuestions;
+        [arr[i], arr[i + d]] = [arr[i + d], arr[i]];
+        await save();
+        this.display();
+      };
+      btn('arrow-up', '上移', () => move(-1), i === 0);
+      btn('arrow-down', '下移', () => move(1), i === presets.length - 1);
+      btn('trash-2', '删除', async () => {
+        s.presetQuestions.splice(i, 1);
+        await save();
+        this.display();
+      });
+    });
+    num('左侧栏宽度', '也可以直接拖动侧栏边缘调整', 'chatNavWidth', 140, 480);
+    num('右侧栏宽度', '也可以直接拖动侧栏边缘调整', 'chatSideWidth', 220, 720);
+    new Setting(containerEl)
+      .setName('恢复默认布局')
+      .setDesc('两侧栏都展开，宽度恢复默认')
+      .addButton((b) =>
+        b.setButtonText('恢复').onClick(async () => {
+          s.chatNavWidth = DEFAULT_SETTINGS.chatNavWidth;
+          s.chatSideWidth = DEFAULT_SETTINGS.chatSideWidth;
+          s.chatNavCollapsed = false;
+          s.chatSideCollapsed = false;
+          await save();
+          this.display();
+        })
+      );
+    new Setting(containerEl)
+      .setName('对话保存位置')
+      .setDesc('对话数据、总览图都保存在库里的这个文件夹，会随库一起同步')
+      .addText((t) => t.setValue(s.chatFolder).onChange(async (v) => ((s.chatFolder = v.trim() || 'Mindflow'), await save())));
+    new Setting(containerEl)
+      .setName('图片识别模型（可选）')
+      .setDesc('发送图片时改用这个模型（需要支持图片输入，例如 gpt-4o、qwen-vl-max、glm-4v）。留空则用上面的模型；DeepSeek 目前不支持图片。')
+      .addText((t) => {
+        t.inputEl.style.width = '200px';
+        t.setPlaceholder('留空 = 使用默认模型').setValue(s.visionModel || '').onChange(async (v) => ((s.visionModel = v.trim()), await save()));
+      });
+    num('附件文字上限', 'PDF / 文本文件最多发送多少个字，超出部分截断', 'attachMaxChars', 2000);
+    new Setting(containerEl)
+      .setName('「保存为笔记」的位置')
+      .setDesc('留空则保存到「对话保存位置/笔记」')
+      .addText((t) => t.setValue(s.noteFolder).onChange(async (v) => ((s.noteFolder = v.trim()), await save())));
+
+    // ── 上下文 ────────────────────────────────────────────
+    section('上下文', '追问时，AI 会看到上层窗口的对话；越远的回答截得越短，节省 token。');
+    num('完整保留的层数', '离当前窗口几层以内的回答发送全文', 'fullContextDepth', 0);
+    num('远端回答截取字数', '更远的回答只发送前 N 个字', 'truncateChars', 50);
+    num('最多祖先卡片数', 'Canvas 卡片对话：沿连线向上最多带多少张卡片', 'maxAncestors', 1);
+    toggle('读取连接的笔记', 'Canvas 卡片对话：把连到问题上的笔记文件卡片内容作为资料发送', 'includeNoteFiles');
+
+    // ── Canvas 卡片 ───────────────────────────────────────
+    section('Canvas 卡片对话', '在 .canvas 里，选中卡片按 Ctrl/Cmd+Enter 让 AI 直接在卡片里回答。');
+    num('卡片宽度', '新建卡片和首次回答时的宽度', 'nodeWidth', 200);
+    num('自动增高上限', '生成回答时卡片最多自动长到多高', 'maxAutoHeight', 150);
+    num('展开时最大高度', '点「回答」标题展开时最多放大到多高', 'maxExpandHeight', 150);
+    num('展开时宽度', '展开时卡片至少放宽到这个宽度', 'expandWidth', 200);
+    num('展开时最大宽度', '有宽表格、代码块时最多加宽到这个宽度', 'maxExpandWidth', 200);
+    new Setting(containerEl)
+      .setName('回答标题')
+      .addText((t) => t.setValue(s.answerTitle).onChange(async (v) => ((s.answerTitle = v || '回答'), await save())));
+    toggle('Tab 追问', '选中卡片按 Tab 新建追问卡片；划选文字后按 Tab 打开追问框', 'enableTab');
+    toggle('连线上显示原文', '划词追问时在连线上标出原文的前几个字', 'edgeLabel');
+    toggle('高亮原文', '划词追问后把原卡片里被追问的文字标成高亮', 'highlightExcerpt');
+
+    // ── 高级 ──────────────────────────────────────────────
+    section('高级');
+    toggle('调试日志', '把调试信息写到插件目录的 debug.log，排查问题时再打开', 'debug');
+  }
+}
+
+module.exports = CanvasMindflowPlugin;
+module.exports.default = CanvasMindflowPlugin;
+// 供测试使用
+module.exports._internals = {
+  parseNodeText,
+  buildNodeText,
+  setFoldedInText,
+  highlightInText,
+  extractMath,
+  formatQuestion,
+  collectAncestors,
+  buildMessages,
+  DEFAULT_SETTINGS,
+};
+
+// ═════════════════════════════════════════════════════════════
+// 对话视图：主窗口 + 右侧追问卡片 / 问答树 + Canvas 总览图
+//
+// 数据模型（每个会话一个 JSON 文件，放在 <chatFolder>/对话数据/）
+//   session = { id, title, createdAt, updatedAt, rootId, nodes: { [id]: node } }
+//   node    = { id, parentId, anchor: {text, msgId} | null, title, createdAt,
+//               messages: [{ id, role: 'user'|'assistant', content, createdAt, pending? }] }
+// 一个 node 就是一个「对话窗口」，可以多轮对话；划线追问 = 新建子 node。
+// ═════════════════════════════════════════════════════════════
+
+const CHAT_VIEW = 'canvas-mindflow-chat';
+const URI_ACTION = 'canvas-mindflow';
+
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+function fmtTime(ts) {
+  const d = new Date(ts);
+  const now = new Date();
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  if (d.toDateString() === now.toDateString()) return `今天 ${hm}`;
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
+}
+
+/** 把 \[…\] / \(…\) 公式写法转换成 Obsidian 能渲染的 $$…$$ / $…$ */
+function normalizeMath(md) {
+  return String(md || '')
+    .replace(/\\\[([\s\S]+?)\\\]/g, (m, x) => `$$${x.trim()}$$`)
+    .replace(/\\\(([\s\S]+?)\\\)/g, (m, x) => `$${x.trim()}$`);
+}
+
+function plainExcerpt(md, n) {
+  const lines = String(md || '')
+    .replace(/```[\s\S]*?```/g, '')
+    .split('\n')
+    .filter((l) => !/^\s*\|/.test(l) && !/^\s*\$\$/.test(l));
+  const t = lines.join(' ').replace(/[#>*_`]/g, '').replace(/\s+/g, ' ').trim();
+  return t.length > n ? t.slice(0, n) + '…' : t;
+}
+
+// ── 会话树工具 ─────────────────────────────────────────────
+function chainOf(s, nodeId) {
+  const out = [];
+  let n = s && s.nodes[nodeId];
+  const seen = new Set();
+  while (n && !seen.has(n.id)) {
+    seen.add(n.id);
+    out.unshift(n);
+    n = n.parentId ? s.nodes[n.parentId] : null;
+  }
+  return out;
+}
+
+function childrenOf(s, id) {
+  return Object.values(s.nodes)
+    .filter((n) => n.parentId === id)
+    .sort((a, b) => a.createdAt - b.createdAt);
+}
+
+function subtreeIds(s, id) {
+  const out = [id];
+  for (const c of childrenOf(s, id)) out.push(...subtreeIds(s, c.id));
+  return out;
+}
+
+function lastAnswer(node) {
+  for (let i = node.messages.length - 1; i >= 0; i--) {
+    if (node.messages[i].role === 'assistant') return node.messages[i];
+  }
+  return null;
+}
+
+/** 组装发给 AI 的消息：祖先窗口的对话（远的截断）+ 当前窗口的对话 */
+function buildThreadMessages(settings, s, nodeId, uptoMsgId) {
+  const chain = chainOf(s, nodeId);
+  const msgs = [];
+  if (settings.systemPrompt && settings.systemPrompt.trim()) msgs.push({ role: 'system', content: settings.systemPrompt.trim() });
+  chain.forEach((node, idx) => {
+    const dist = chain.length - 1 - idx;
+    let firstUser = true;
+    for (const m of node.messages) {
+      if (uptoMsgId && node.id === nodeId && m.id === uptoMsgId) break;
+      if (m.pending || !m.content) continue;
+      let c = m.content;
+      let images = null;
+      if (m.role === 'user') {
+        if (firstUser && node.anchor && node.anchor.text) {
+          c = `关于你上面回答中的这段内容：\n「${node.anchor.text}」\n\n${c}`;
+        }
+        firstUser = false;
+        if (m.attachments && m.attachments.length) {
+          c += attachmentsAsText(m.attachments);
+          const imgs = m.attachments.filter((a) => a.kind === 'image');
+          // 只给当前窗口里的图片发原图，上层窗口的图片用文字代替，避免请求过大
+          if (imgs.length) {
+            if (node.id === nodeId) images = imgs.map((a) => ({ path: a.path, mime: a.mime, name: a.name }));
+            else c += `\n（这条提问附带了 ${imgs.length} 张图片：${imgs.map((a) => a.name).join('、')}）`;
+          }
+        }
+      } else if (dist > settings.fullContextDepth && c.length > settings.truncateChars) {
+        c = c.slice(0, settings.truncateChars) + '\n…（较早的回答，已截断）';
+      }
+      const o = { role: m.role, content: c };
+      if (images) o._images = images;
+      msgs.push(o);
+    }
+  });
+  const merged = mergeSameRole(msgs);
+  const firstNonSys = merged.findIndex((m) => m.role !== 'system');
+  if (firstNonSys >= 0 && merged[firstNonSys].role === 'assistant') {
+    merged.splice(firstNonSys, 0, { role: 'user', content: '（继续之前的讨论）' });
+  }
+  return merged;
+}
+
+/**
+ * 在渲染好的 DOM 里找到一段文字（忽略空白差异），用 <mark> 包起来。
+ * 返回生成的 mark 元素数组；找不到返回 []。
+ */
+function highlightInEl(root, text, childId, cls = 'cmf-anchor') {
+  const target = String(text || '').replace(/\s+/g, '');
+  if (!target) return [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) =>
+      n.parentElement && n.parentElement.closest(`mark.${cls}, mjx-container, .math, button`)
+        ? NodeFilter.FILTER_REJECT
+        : NodeFilter.FILTER_ACCEPT,
+  });
+  const chars = [];
+  let joined = '';
+  let tn;
+  while ((tn = walker.nextNode())) {
+    const t = tn.nodeValue;
+    for (let i = 0; i < t.length; i++) {
+      if (!/\s/.test(t[i])) {
+        joined += t[i];
+        chars.push([tn, i]);
+      }
+    }
+  }
+  const idx = joined.indexOf(target);
+  if (idx < 0) return [];
+  const start = chars[idx];
+  const end = chars[idx + target.length - 1];
+  const nodes = [];
+  let inRange = false;
+  let last = null;
+  for (const [n] of chars) {
+    if (n === last) continue;
+    last = n;
+    if (n === start[0]) inRange = true;
+    if (inRange) nodes.push(n);
+    if (n === end[0]) break;
+  }
+  const marks = [];
+  for (const n of nodes) {
+    const s0 = n === start[0] ? start[1] : 0;
+    const e0 = n === end[0] ? end[1] + 1 : n.nodeValue.length;
+    if (e0 <= s0) continue;
+    try {
+      const range = document.createRange();
+      range.setStart(n, s0);
+      range.setEnd(n, e0);
+      const mark = document.createElement('mark');
+      mark.className = cls;
+      mark.dataset[cls === 'cmf-note' ? 'note' : 'child'] = childId;
+      range.surroundContents(mark);
+      marks.push(mark);
+    } catch (_) {
+      /* 跨元素边界时放弃这一段 */
+    }
+  }
+  return marks;
+}
+
+/**
+ * 高亮一处划线原文：文字部分用 <mark>，其中（以及首尾紧挨着）的公式整体加高亮类。
+ * anchor = { text: 含 $LaTeX$ 的原文, plain?: 去掉公式的纯文本 }
+ * 返回所有被高亮的元素（用于绑定点击）。
+ */
+function highlightAnchor(root, anchor, childId, kind = 'anchor') {
+  const full = String(anchor.text || '');
+  const plain = anchor.plain != null ? anchor.plain : full;
+  const texes = extractMath(full).map((x) => x.tex);
+  const cls = kind === 'note' ? 'cmf-note' : 'cmf-anchor';
+  const mathCls = `${cls}-math`;
+  const textMarks = plain.replace(/\s+/g, '') ? highlightInEl(root, plain, childId, cls) : [];
+  const out = [];
+  const markMath = (el) => {
+    if (el.classList.contains(mathCls)) return;
+    el.classList.add(mathCls);
+    el.dataset[kind === 'note' ? 'note' : 'child'] = childId;
+    if (!(kind === 'note' && el.classList.contains('cmf-anchor-math'))) paintMath(el, kind);
+    out.push(el);
+  };
+  const mathEls = Array.from(root.querySelectorAll('.math'));
+  if (texes.length && mathEls.length) {
+    if (textMarks.length) {
+      const first = textMarks[0];
+      const last = textMarks[textMarks.length - 1];
+      const range = document.createRange();
+      range.setStartBefore(first);
+      range.setEndAfter(last);
+      // 选区以公式开头 / 结尾时，把紧挨着的那个公式也包进来
+      if (/^\s*\$/.test(full)) {
+        const before = mathEls.filter(
+          (el) => first.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_PRECEDING && el.dataset.tex === texes[0]
+        );
+        if (before.length) range.setStartBefore(before[before.length - 1]);
+      }
+      if (/\$\s*$/.test(full)) {
+        const after = mathEls.find(
+          (el) => last.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING && el.dataset.tex === texes[texes.length - 1]
+        );
+        if (after) range.setEndAfter(after);
+      }
+      for (const el of mathEls) if (range.intersectsNode(el)) markMath(el);
+    } else {
+      // 只划了公式：按 LaTeX 源码找到对应的公式
+      for (let i = 0; i < mathEls.length; i++) {
+        if (mathEls[i].dataset.tex !== texes[0]) continue;
+        for (let k = 0; k < texes.length && i + k < mathEls.length; k++) {
+          if (mathEls[i + k].dataset.tex === texes[k]) markMath(mathEls[i + k]);
+        }
+        break;
+      }
+    }
+  }
+  return textMarks.concat(out);
+}
+
+/**
+ * 给公式上色。MathJax 的外层 span / mjx-container 是行内元素且 line-height 为 0，
+ * 背景画不出来；真正有尺寸的是里面 inline-block 的 <mjx-math>，所以直接给它写行内样式（!important）。
+ * kind: 'sel' 选中中 | 'anchor' 已划线 | null 清除
+ */
+const MATH_PAINT = {
+  sel: 'var(--text-selection, rgba(80, 140, 255, 0.35))',
+  anchor: 'rgba(var(--color-yellow-rgb, 230, 200, 60), 0.4)',
+  note: 'rgba(var(--color-blue-rgb, 80, 140, 230), 0.22)',
+};
+function paintMath(el, kind) {
+  const targets = el.querySelectorAll('mjx-math');
+  const list = targets.length ? Array.from(targets) : [el];
+  for (const t of list) {
+    if (!kind) {
+      if (t.dataset.cmfPaint) {
+        // 已划线的公式取消选中后恢复黄色
+        const back = el.classList.contains('cmf-anchor-math') ? 'anchor' : el.classList.contains('cmf-note-math') ? 'note' : null;
+        delete t.dataset.cmfPaint;
+        for (const k of ['background-color', 'border-radius', 'box-shadow']) t.style.removeProperty(k);
+        if (back) paintMath(el, back);
+      }
+      continue;
+    }
+    const c = MATH_PAINT[kind];
+    t.dataset.cmfPaint = kind;
+    t.style.setProperty('background-color', c, 'important');
+    t.style.setProperty('border-radius', '3px', 'important');
+    t.style.setProperty('box-shadow', `0 0 0 2px ${c}`, 'important');
+  }
+}
+
+/** 拖选时给选区里的公式加上选中底色（公式的符号是样式画的，浏览器自带的选中色盖不到） */
+function markSelectedMath(scope, range) {
+  if (!scope) return;
+  const now = new Set();
+  if (range && !range.collapsed) {
+    scope.querySelectorAll('.math').forEach((el) => {
+      try {
+        if (range.intersectsNode(el)) now.add(el);
+      } catch (_) {}
+    });
+  }
+  scope.querySelectorAll('.math.cmf-math-selected').forEach((el) => {
+    if (now.has(el)) return;
+    el.classList.remove('cmf-math-selected');
+    paintMath(el, null);
+  });
+  for (const el of now) {
+    if (el.classList.contains('cmf-math-selected')) continue;
+    el.classList.add('cmf-math-selected');
+    paintMath(el, 'sel');
+  }
+}
+
+/** 弹出追问框后输入框会抢走焦点、选区消失；用 CSS Highlight 把选中的文字继续标出来 */
+function setPendingHighlight(range) {
+  try {
+    if (!window.CSS || !CSS.highlights) return;
+    if (range) CSS.highlights.set('cmf-pending', new Highlight(range.cloneRange()));
+    else CSS.highlights.delete('cmf-pending');
+  } catch (_) {}
+}
+
+/** 复制到剪贴板；安卓 WebView 不支持 navigator.clipboard 时退回 execCommand */
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    const ta = document.body.createEl('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    ta.select();
+    let ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } catch (e) {}
+    ta.remove();
+    return ok;
+  }
+}
+
+function confirmModal(app, title, message, okText) {
+  return new Promise((resolve) => {
+    const m = new obsidian.Modal(app);
+    let ok = false;
+    m.titleEl.setText(title);
+    m.contentEl.createEl('p', { text: message });
+    const row = m.contentEl.createDiv({ cls: 'modal-button-container' });
+    row.createEl('button', { text: '取消' }).addEventListener('click', () => m.close());
+    const b = row.createEl('button', { text: okText || '确定', cls: 'mod-warning' });
+    b.addEventListener('click', () => {
+      ok = true;
+      m.close();
+    });
+    m.onClose = () => resolve(ok);
+    m.open();
+  });
+}
+
+// ── 存储 ───────────────────────────────────────────────────
+class ChatStore {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.cache = new Map();
+    this.timers = new Map();
+  }
+
+  get adapter() {
+    return this.plugin.app.vault.adapter;
+  }
+
+  folder() {
+    return obsidian.normalizePath((this.plugin.settings.chatFolder || 'Mindflow').trim() || 'Mindflow');
+  }
+
+  dir() {
+    return `${this.folder()}/对话数据`;
+  }
+
+  path(id) {
+    return `${this.dir()}/${id}.json`;
+  }
+
+  async ensureDir(p) {
+    let cur = '';
+    for (const part of p.split('/')) {
+      cur = cur ? `${cur}/${part}` : part;
+      if (!(await this.adapter.exists(cur))) await this.adapter.mkdir(cur);
+    }
+  }
+
+  async list() {
+    const dir = this.dir();
+    if (!(await this.adapter.exists(dir))) return [];
+    const r = await this.adapter.list(dir);
+    for (const f of r.files) {
+      if (!f.endsWith('.json')) continue;
+      const id = f.split('/').pop().replace(/\.json$/, '');
+      if (this.cache.has(id)) continue;
+      try {
+        const s = JSON.parse(await this.adapter.read(f));
+        if (s && s.id && s.nodes) this.cache.set(s.id, s);
+      } catch (_) {}
+    }
+    return Array.from(this.cache.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  async get(id) {
+    if (!id) return null;
+    if (this.cache.has(id)) return this.cache.get(id);
+    try {
+      const s = JSON.parse(await this.adapter.read(this.path(id)));
+      this.cache.set(s.id, s);
+      return s;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  create(question) {
+    const now = Date.now();
+    const root = { id: uid(), parentId: null, anchor: null, title: truncate(question, 40), createdAt: now, messages: [] };
+    const s = { id: uid(), version: 1, title: root.title, createdAt: now, updatedAt: now, rootId: root.id, nodes: { [root.id]: root } };
+    this.cache.set(s.id, s);
+    return s;
+  }
+
+  save(s, immediate) {
+    s.updatedAt = Date.now();
+    clearTimeout(this.timers.get(s.id));
+    const write = async () => {
+      this.timers.delete(s.id);
+      try {
+        await this.ensureDir(this.dir());
+        await this.adapter.write(this.path(s.id), JSON.stringify(s, null, 1));
+      } catch (e) {
+        console.error('Canvas Mindflow: 保存对话失败', e);
+      }
+    };
+    if (immediate) return write();
+    this.timers.set(s.id, setTimeout(write, 400));
+  }
+
+  async flush() {
+    for (const [id, t] of this.timers) {
+      clearTimeout(t);
+      const s = this.cache.get(id);
+      if (s) await this.save(s, true);
+    }
+  }
+
+  async remove(id) {
+    clearTimeout(this.timers.get(id));
+    this.cache.delete(id);
+    try {
+      if (await this.adapter.exists(this.path(id))) await this.adapter.remove(this.path(id));
+    } catch (_) {}
+  }
+}
+
+// ── 功能入口：存储、流式生成、总览图、视图注册 ──────────────
+class MindflowChat {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.store = new ChatStore(plugin);
+    this.fav = new FavStore(this);
+    this.notes = new NoteStore(this);
+    this.running = new Map(); // `${sessionId}:${msgId}` -> AbortController
+    this.listeners = new Set();
+  }
+
+  load() {
+    const p = this.plugin;
+    p.registerView(CHAT_VIEW, (leaf) => new MindflowChatView(leaf, this));
+    p.addRibbonIcon('messages-square', 'Mindflow 对话', () => this.openView());
+    p.addCommand({ id: 'chat-open', name: '打开对话视图', callback: () => this.openView() });
+    p.addCommand({ id: 'chat-new', name: '新建对话', callback: () => this.openView(null, null, true) });
+    p.addCommand({
+      id: 'chat-overview',
+      name: '为当前对话生成 Canvas 总览图',
+      checkCallback: (checking) => {
+        const v = this.activeView();
+        if (!v || !v.session) return false;
+        if (!checking) this.generateOverview(v.session);
+        return true;
+      },
+    });
+    try {
+      p.registerObsidianProtocolHandler(URI_ACTION, (params) => this.openView(params.session, params.node, false, params.msg));
+    } catch (e) {
+      console.warn('Canvas Mindflow: 当前平台不支持 obsidian:// 链接跳转', e);
+    }
+  }
+
+  unload() {
+    for (const c of this.running.values()) c.abort();
+    this.store.flush();
+    this.fav.flush();
+    this.notes.flush();
+  }
+
+  on(fn) {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  emit(evt) {
+    for (const fn of this.listeners) {
+      try {
+        fn(evt);
+      } catch (e) {
+        console.error(e);
+      }
+    }
+  }
+
+  activeView() {
+    const leaf = this.app.workspace.activeLeaf;
+    return leaf && leaf.view instanceof MindflowChatView ? leaf.view : null;
+  }
+
+  async openView(sessionId, nodeId, fresh, msgId) {
+    let leaf = this.app.workspace.getLeavesOfType(CHAT_VIEW)[0];
+    if (!leaf) {
+      leaf = this.app.workspace.getLeaf('tab');
+      await leaf.setViewState({ type: CHAT_VIEW, active: true, state: {} });
+    }
+    this.app.workspace.revealLeaf(leaf);
+    const view = leaf.view;
+    if (!(view instanceof MindflowChatView)) return;
+    if (fresh) view.newChat();
+    else if (sessionId) {
+      if (msgId) view.pendingFocusMsg = msgId;
+      await view.openSession(sessionId, nodeId);
+    }
+    else if (!view.session) {
+      const list = await this.store.list();
+      if (list.length) await view.openSession(list[0].id);
+      else view.newChat();
+    }
+  }
+
+  isRunning(s, msgId) {
+    return this.running.has(`${s.id}:${msgId}`);
+  }
+
+  isNodeRunning(s, node) {
+    return node.messages.some((m) => this.isRunning(s, m.id));
+  }
+
+  stop(s, node) {
+    for (const m of node.messages) {
+      const c = this.running.get(`${s.id}:${m.id}`);
+      if (c) c.abort();
+    }
+  }
+
+  /** 在某个窗口里提问：加入用户消息 + 空的 AI 消息，然后流式生成 */
+  async ask(s, nodeId, question, attachments) {
+    const node = s.nodes[nodeId];
+    if (!node) return;
+    const settings = this.plugin.settings;
+    if (!settings.apiKey.trim()) {
+      new Notice('Canvas Mindflow：请先在设置里填写 API Key');
+      return;
+    }
+    const now = Date.now();
+    const atts = attachments && attachments.length ? attachments : null;
+    if (!question && atts) question = atts.some((a) => a.kind === 'image') ? '请分析这张图片。' : '请分析这个文件。';
+    const um = { id: uid(), role: 'user', content: question, createdAt: now };
+    if (atts) um.attachments = atts;
+    node.messages.push(um);
+    if (!node.title) node.title = truncate(question, 40);
+    const msg = { id: uid(), role: 'assistant', content: '', createdAt: now + 1, pending: true };
+    node.messages.push(msg);
+    this.store.save(s);
+    this.emit({ type: 'structure', sessionId: s.id, nodeId });
+
+    await this.runAssistant(s, nodeId, msg, buildThreadMessages(settings, s, nodeId));
+  }
+
+  /** 流式生成一条 AI 消息 */
+  async runAssistant(s, nodeId, msg, messages) {
+    let settings = this.plugin.settings;
+    const hasImages = messages.some((m) => m._images && m._images.length);
+    if (hasImages && (settings.visionModel || '').trim()) settings = Object.assign({}, settings, { model: settings.visionModel.trim() });
+    msg.model = settings.model;
+    try {
+      messages = await materializeImages(this.app, messages);
+    } catch (e) {
+      console.error('Canvas Mindflow: 读取图片失败', e);
+    }
+    const key = `${s.id}:${msg.id}`;
+    const ctrl = new AbortController();
+    this.running.set(key, ctrl);
+    let last = 0;
+    let timer = null;
+    const flush = () => {
+      timer = null;
+      last = Date.now();
+      this.emit({ type: 'delta', sessionId: s.id, nodeId, msgId: msg.id });
+    };
+    try {
+      await streamChat(
+        settings,
+        messages,
+        (d) => {
+          msg.content += d;
+          const wait = 120 - (Date.now() - last);
+          if (wait <= 0) flush();
+          else if (!timer) timer = setTimeout(flush, wait);
+        },
+        ctrl.signal
+      );
+      if (!msg.content.trim()) msg.content = '（AI 返回为空）';
+    } catch (e) {
+      if (e && e.name === 'AbortError') msg.content += '\n\n*（已停止生成）*';
+      else {
+        msg.content = (msg.content ? msg.content + '\n\n' : '') + `❌ 请求失败：${(e && e.message) || e}`;
+        if (hasImages)
+          msg.content += `\n\n> 这次提问带了图片。如果当前模型（${settings.model}）不支持图片，请在设置 →「图片识别模型」里填一个支持图片的模型。`;
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+      this.running.delete(key);
+      delete msg.pending;
+      msg.doneAt = Date.now();
+      this.store.save(s);
+      this.emit({ type: 'done', sessionId: s.id, nodeId, msgId: msg.id });
+    }
+  }
+
+  /** 重新回答：清空这条回答，用它之前的对话重新生成 */
+  async regenerate(s, nodeId, msgId) {
+    const node = s.nodes[nodeId];
+    const msg = node && node.messages.find((m) => m.id === msgId);
+    if (!msg || msg.role !== 'assistant' || this.isRunning(s, msgId)) return;
+    if (!this.plugin.settings.apiKey.trim()) {
+      new Notice('Canvas Mindflow：请先在设置里填写 API Key');
+      return;
+    }
+    msg.content = '';
+    msg.pending = true;
+    msg.createdAt = Date.now();
+    delete msg.editedAt;
+    delete msg.originalContent;
+    this.emit({ type: 'delta', sessionId: s.id, nodeId, msgId });
+    await this.runAssistant(s, nodeId, msg, buildThreadMessages(this.plugin.settings, s, nodeId, msgId));
+  }
+
+  /** 修改一条消息的内容（例如在 AI 回答里补充自己的理解）；之后的追问会以修改后的内容为上下文 */
+  editMessage(s, nodeId, msgId, content) {
+    const node = s.nodes[nodeId];
+    const msg = node && node.messages.find((m) => m.id === msgId);
+    if (!msg || msg.pending) return;
+    if (msg.content === content) return;
+    if (msg.originalContent === undefined) msg.originalContent = msg.content;
+    msg.content = content;
+    msg.editedAt = Date.now();
+    this.store.save(s);
+    this.emit({ type: 'done', sessionId: s.id, nodeId, msgId });
+  }
+
+  /** 删除一轮问答（这条回答和它前面的提问）；基于它的追问保留 */
+  deleteRound(s, nodeId, msgId) {
+    const node = s.nodes[nodeId];
+    if (!node) return;
+    const i = node.messages.findIndex((m) => m.id === msgId);
+    if (i < 0) return;
+    const c = this.running.get(`${s.id}:${msgId}`);
+    if (c) c.abort();
+    const start = i > 0 && node.messages[i - 1].role === 'user' ? i - 1 : i;
+    node.messages.splice(start, i - start + 1);
+    this.store.save(s);
+    this.emit({ type: 'structure', sessionId: s.id, nodeId: '__round__' });
+  }
+
+  /** 把一条回答保存为 Markdown 笔记 */
+  async saveAsNote(s, nodeId, msgId) {
+    const node = s.nodes[nodeId];
+    const i = node ? node.messages.findIndex((m) => m.id === msgId) : -1;
+    if (i < 0) return;
+    const msg = node.messages[i];
+    const q = i > 0 && node.messages[i - 1].role === 'user' ? node.messages[i - 1].content : node.title;
+    const folder = obsidian.normalizePath(this.plugin.settings.noteFolder || `${this.store.folder()}/笔记`);
+    await this.store.ensureDir(folder);
+    const base = (truncate(q || node.title || '回答', 40) || '回答').replace(/[\\/:*?"<>|#^[\]]/g, ' ').trim();
+    let path = `${folder}/${base}.md`;
+    for (let k = 2; this.app.vault.getAbstractFileByPath(path); k++) path = `${folder}/${base} ${k}.md`;
+    const chain = chainOf(s, nodeId)
+      .map((n) => n.title)
+      .join(' → ');
+    const lines = [
+      '---',
+      `source: Mindflow 对话`,
+      `created: ${new Date().toISOString().slice(0, 10)}`,
+      msg.model ? `model: ${msg.model}` : null,
+      '---',
+      '',
+      `> 来自对话：${chain}`,
+      node.anchor && node.anchor.text ? `> 原文：==${node.anchor.text}==` : null,
+      '',
+      `## ${q}`,
+      '',
+      normalizeMath(msg.content),
+      '',
+      `[回到对话](obsidian://${URI_ACTION}?session=${encodeURIComponent(s.id)}&node=${encodeURIComponent(nodeId)})`,
+    ].filter((l) => l !== null);
+    const file = await this.app.vault.create(path, lines.join('\n'));
+    new Notice(`已保存为笔记：${path}`);
+    await this.app.workspace.getLeaf('tab').openFile(file);
+  }
+
+  /** 设置变化后刷新所有对话视图的布局 */
+  applyLayoutSettings() {
+    for (const leaf of this.app.workspace.getLeavesOfType(CHAT_VIEW)) {
+      if (leaf.view instanceof MindflowChatView) leaf.view.applyLayout();
+    }
+  }
+
+  /** 划线追问：新建子窗口并提问，返回子窗口 id */
+  branch(s, parentId, anchor, question, attachments) {
+    const q = (question || '').trim() || this.plugin.settings.defaultFollowUp || '请详细解释这段内容。';
+    const child = {
+      id: uid(),
+      parentId,
+      anchor,
+      title: (question || '').trim() ? truncate(question, 40) : `「${truncate(anchor.text, 18)}」是什么意思？`,
+      createdAt: Date.now(),
+      messages: [],
+    };
+    s.nodes[child.id] = child;
+    this.store.save(s);
+    this.ask(s, child.id, q, attachments);
+    return child.id;
+  }
+
+  async deleteNode(s, nodeId) {
+    for (const id of subtreeIds(s, nodeId)) {
+      const n = s.nodes[id];
+      if (n) this.stop(s, n);
+      delete s.nodes[id];
+    }
+    this.store.save(s);
+    this.emit({ type: 'structure', sessionId: s.id, nodeId });
+  }
+
+  // ── Canvas 总览图 ──────────────────────────────────────
+  /** 把一个对话的问答树排成 Canvas 节点（左上角在 ox, oy），返回 { nodes, edges, w, h } */
+  layoutSession(s, ox = 0, oy = 0, idPrefix = '') {
+    const W = 380;
+    const H = 260;
+    const GX = 140;
+    const GY = 50;
+    const pos = {};
+    let row = 0;
+    const place = (id, depth) => {
+      const kids = childrenOf(s, id);
+      let y;
+      if (!kids.length) {
+        y = row * (H + GY);
+        row++;
+      } else {
+        const ys = kids.map((k) => place(k.id, depth + 1));
+        y = (Math.min(...ys) + Math.max(...ys)) / 2;
+      }
+      pos[id] = { x: depth * (W + GX), y };
+      return y;
+    };
+    if (s.nodes[s.rootId]) place(s.rootId, 0);
+
+    const nodes = [];
+    const edges = [];
+    let w = 0;
+    let h = 0;
+    for (const n of Object.values(s.nodes)) {
+      if (!pos[n.id]) continue;
+      const ans = lastAnswer(n);
+      const link = `obsidian://${URI_ACTION}?session=${encodeURIComponent(s.id)}&node=${encodeURIComponent(n.id)}`;
+      const parts = [`### [${(n.title || '未命名问题').replace(/[[\]]/g, '')}](${link})`];
+      if (n.anchor && n.anchor.text) parts.push(`==${truncate(n.anchor.text, 40)}==`);
+      if (ans && ans.content) parts.push(plainExcerpt(ans.content, 260));
+      parts.push(`[打开对话 →](${link})`);
+      const nw = n.id === s.rootId ? W + 20 : W;
+      const node = {
+        id: idPrefix + n.id,
+        type: 'text',
+        text: parts.join('\n\n'),
+        x: Math.round(ox + pos[n.id].x),
+        y: Math.round(oy + pos[n.id].y),
+        width: nw,
+        height: H,
+      };
+      if (n.id === s.rootId) node.color = '6';
+      nodes.push(node);
+      w = Math.max(w, pos[n.id].x + nw);
+      h = Math.max(h, pos[n.id].y + H);
+      if (n.parentId && pos[n.parentId]) {
+        edges.push({ id: uid(), fromNode: idPrefix + n.parentId, fromSide: 'right', toNode: idPrefix + n.id, toSide: 'left', toEnd: 'arrow' });
+      }
+    }
+    return { nodes, edges, w, h };
+  }
+
+  /** 写入（或覆盖）一个 .canvas 文件并打开 */
+  async writeCanvas(dir, name, data) {
+    await this.store.ensureDir(dir);
+    const safe = (name || '未命名').replace(/[\\/:*?"<>|#^[\]]/g, ' ').trim().slice(0, 60) || '未命名';
+    const path = `${dir}/${safe}.canvas`;
+    const content = JSON.stringify(data, null, 1);
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    let file;
+    if (existing) {
+      await this.app.vault.modify(existing, content);
+      file = existing;
+    } else {
+      file = await this.app.vault.create(path, content);
+    }
+    await this.app.workspace.getLeaf('tab').openFile(file, { active: true });
+    return path;
+  }
+
+  // ── 收藏夹 ─────────────────────────────────────────────
+  /** 选一个收藏夹并加入条目。item = { type: 'qa'|'session', sessionId, nodeId?, msgId?, title } */
+  async addToFavorites(item) {
+    const fav = this.fav;
+    await fav.load();
+    const folderId = await pickFolder(this.app, fav, {
+      title: item.type === 'qa' ? '收藏这轮问答' : '收藏这个对话',
+      subtitle: `「${truncate(item.title || '', 40)}」`,
+      selected: this.lastFavFolder,
+    });
+    if (!folderId) return;
+    this.lastFavFolder = folderId;
+    const r = fav.addItem(folderId, item);
+    new Notice(r.existed ? `已经在「${fav.pathName(folderId)}」里了` : `已加入收藏夹「${fav.pathName(folderId)}」`);
+    this.emit({ type: 'fav' });
+  }
+
+  /** 把一个收藏夹（含子收藏夹）放进 Canvas；folderId 为空 = 全部收藏夹 */
+  async exportFolderCanvas(folderId) {
+    const fav = this.fav;
+    await fav.load();
+    await this.store.flush();
+    const data = await buildFolderCanvas(this, fav, folderId);
+    const name = folderId ? `收藏夹 - ${fav.pathName(folderId).replace(/ \/ /g, '-')}` : '收藏夹 - 全部';
+    const path = await this.writeCanvas(`${this.store.folder()}/总览图`, name, data);
+    new Notice(`已生成 Canvas：${path}`);
+    return path;
+  }
+
+  async generateOverview(s) {
+    await this.store.save(s, true);
+    const { nodes, edges } = this.layoutSession(s);
+    const path = await this.writeCanvas(`${this.store.folder()}/总览图`, `${(s.title || '对话').slice(0, 40)} - 总览`, { nodes, edges });
+    new Notice(`已生成总览图：${path}`);
+    return path;
+  }
+}
+
+// ── 视图 ───────────────────────────────────────────────────
+class MindflowChatView extends obsidian.ItemView {
+  constructor(leaf, chat) {
+    super(leaf);
+    this.chat = chat;
+    this.plugin = chat.plugin;
+    this.session = null;
+    this.nodeId = null;
+    this.sideTab = 'follow';
+    this.expanded = new Set();
+    this.mdComps = [];
+    this.msgEls = new Map();
+    this.cardEls = new Map();
+    this.renderTimers = new Map();
+  }
+
+  getViewType() {
+    return CHAT_VIEW;
+  }
+
+  getDisplayText() {
+    return this.session ? `追问 · ${this.session.title}` : 'Mindflow 对话';
+  }
+
+  getIcon() {
+    return 'messages-square';
+  }
+
+  getState() {
+    return Object.assign(super.getState(), { sessionId: this.session && this.session.id, nodeId: this.nodeId, navMode: this.navMode || 'history' });
+  }
+
+  async setState(state, result) {
+    if (state && (state.navMode === 'fav' || state.navMode === 'history') && state.navMode !== this.navMode) {
+      this.navMode = state.navMode;
+      this.renderNav();
+    }
+    if (state && state.sessionId && (!this.session || state.sessionId !== this.session.id)) {
+      await this.openSession(state.sessionId, state.nodeId);
+    }
+    return super.setState(state, result);
+  }
+
+  get node() {
+    return this.session && this.nodeId ? this.session.nodes[this.nodeId] : null;
+  }
+
+  get settings() {
+    return this.plugin.settings;
+  }
+
+  // ── 布局：两侧栏宽度 / 展开收起 / 字号 ─────────────────
+  /** 手机或窗口宽度 < 700 时切换为单栏 + 抽屉 */
+  /** 手机：避开 Obsidian 底部悬浮工具栏（.mobile-navbar），把输入框等往上让 */
+  updateBottomGap() {
+    const root = this.contentEl;
+    let gap = 0;
+    const nav = document.querySelector('.mobile-navbar');
+    if (nav) {
+      const r = nav.getBoundingClientRect();
+      const v = root.getBoundingClientRect();
+      const visible = r.height > 0 && getComputedStyle(nav).display !== 'none' && getComputedStyle(nav).visibility !== 'hidden';
+      if (visible && r.top < v.bottom && r.bottom > v.top) gap = Math.ceil(v.bottom - r.top) + 6;
+    }
+    if (gap !== this.bottomGap) {
+      this.bottomGap = gap;
+      root.style.setProperty('--cmf-bottom-gap', `${gap}px`);
+    }
+  }
+
+  updateCompact() {
+    const root = this.contentEl;
+    this.updateBottomGap();
+    const compact = !!(obsidian.Platform && obsidian.Platform.isMobile) || (root.clientWidth > 0 && root.clientWidth < 700);
+    if (compact === this.compact) return;
+    this.compact = compact;
+    root.toggleClass('is-compact', compact);
+    this.drawer = null;
+    this.applyLayout();
+  }
+
+  openDrawer(which) {
+    if (!this.compact) return;
+    this.drawer = which;
+    this.applyLayout();
+  }
+
+  closeDrawers() {
+    if (!this.drawer) return;
+    this.drawer = null;
+    this.applyLayout();
+  }
+
+  applyLayout() {
+    const st = this.settings;
+    if (!this.navEl) return;
+    this.contentEl.style.setProperty('--cmf-font-size', `${st.chatFontSize || 15}px`);
+    if (this.compact) {
+      this.navEl.style.width = '';
+      this.sideEl.style.width = '';
+      this.navEl.removeClass('is-collapsed');
+      this.sideEl.removeClass('is-collapsed');
+      this.navEl.toggleClass('is-open', this.drawer === 'nav');
+      this.sideEl.toggleClass('is-open', this.drawer === 'side');
+      this.backdrop.toggleClass('is-open', !!this.drawer);
+      if (this.navToggleEl) this.navToggleEl.toggleClass('is-active', this.drawer === 'nav');
+      if (this.sideToggleEl) this.sideToggleEl.toggleClass('is-active', this.drawer === 'side');
+      return;
+    }
+    this.navEl.removeClass('is-open');
+    this.sideEl.removeClass('is-open');
+    this.backdrop.removeClass('is-open');
+    this.navEl.style.width = `${st.chatNavWidth}px`;
+    this.sideEl.style.width = `${st.chatSideWidth}px`;
+    this.navEl.toggleClass('is-collapsed', !!st.chatNavCollapsed);
+    this.sideEl.toggleClass('is-collapsed', !!st.chatSideCollapsed);
+    this.navResizer.toggleClass('is-hidden', !!st.chatNavCollapsed);
+    this.sideResizer.toggleClass('is-hidden', !!st.chatSideCollapsed);
+    if (this.navToggleEl) this.navToggleEl.toggleClass('is-active', !st.chatNavCollapsed);
+    if (this.sideToggleEl) this.sideToggleEl.toggleClass('is-active', !st.chatSideCollapsed);
+  }
+
+  async togglePanel(which) {
+    if (this.compact) {
+      this.drawer = this.drawer === which ? null : which;
+      this.applyLayout();
+      return;
+    }
+    const key = which === 'nav' ? 'chatNavCollapsed' : 'chatSideCollapsed';
+    this.settings[key] = !this.settings[key];
+    await this.plugin.saveSettings();
+    this.chat.applyLayoutSettings();
+  }
+
+  bindResizer(handle, key, dir, min, max) {
+    handle.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      const startX = e.clientX;
+      const startW = this.settings[key];
+      handle.setPointerCapture(e.pointerId);
+      handle.addClass('is-dragging');
+      this.contentEl.addClass('is-resizing');
+      const move = (ev) => {
+        const w = Math.max(min, Math.min(max, startW + dir * (ev.clientX - startX)));
+        this.settings[key] = Math.round(w);
+        this.applyLayout();
+      };
+      const up = async () => {
+        handle.removeEventListener('pointermove', move);
+        handle.removeEventListener('pointerup', up);
+        handle.removeEventListener('pointercancel', up);
+        handle.removeClass('is-dragging');
+        this.contentEl.removeClass('is-resizing');
+        await this.plugin.saveSettings();
+        this.chat.applyLayoutSettings();
+      };
+      handle.addEventListener('pointermove', move);
+      handle.addEventListener('pointerup', up);
+      handle.addEventListener('pointercancel', up);
+    });
+    handle.addEventListener('dblclick', async () => {
+      this.settings[key] = DEFAULT_SETTINGS[key];
+      await this.plugin.saveSettings();
+      this.chat.applyLayoutSettings();
+    });
+  }
+
+  openSettings() {
+    const setting = this.app.setting;
+    if (setting && setting.open) {
+      setting.open();
+      if (setting.openTabById) setting.openTabById(this.plugin.manifest.id);
+    }
+  }
+
+  async onOpen() {
+    const root = this.contentEl;
+    root.empty();
+    root.addClass('cmf-chat');
+    this.navEl = root.createDiv({ cls: 'cmf-nav' });
+    this.navResizer = root.createDiv({ cls: 'cmf-resizer', attr: { 'aria-label': '拖动调整左侧栏宽度' } });
+    this.mainEl = root.createDiv({ cls: 'cmf-main' });
+    this.sideResizer = root.createDiv({ cls: 'cmf-resizer', attr: { 'aria-label': '拖动调整右侧栏宽度' } });
+    this.sideEl = root.createDiv({ cls: 'cmf-side' });
+    this.backdrop = root.createDiv({ cls: 'cmf-backdrop' });
+    this.backdrop.addEventListener('click', () => this.closeDrawers());
+    this.drawer = null; // 窄屏 / 手机：当前滑出的抽屉 'nav' | 'side'
+    this.compact = false;
+    this.updateCompact();
+    if (window.ResizeObserver) {
+      const ro = new ResizeObserver(() => this.updateCompact());
+      ro.observe(root);
+      this.register(() => ro.disconnect());
+    }
+    this.registerDomEvent(document, 'selectionchange', () => this.onSelectionChange());
+    // Ctrl+C / 系统复制：带上公式的 LaTeX 源码（默认复制会把公式丢掉）
+    this.registerDomEvent(document, 'copy', (e) => {
+      const r = this.readSelection();
+      if (!r || !e.clipboardData) return;
+      e.clipboardData.setData('text/plain', r.anchor.text);
+      e.preventDefault();
+    });
+    this.registerDomEvent(window, 'resize', () => this.updateBottomGap());
+    if (window.visualViewport) this.registerDomEvent(window.visualViewport, 'resize', () => this.updateBottomGap());
+    // 工具栏会随滚动 / 键盘显示隐藏，手机上定时校正一次
+    if (obsidian.Platform && obsidian.Platform.isMobile) this.registerInterval(window.setInterval(() => this.updateBottomGap(), 800));
+    this.bindResizer(this.navResizer, 'chatNavWidth', 1, 140, 480);
+    this.bindResizer(this.sideResizer, 'chatSideWidth', -1, 220, 720);
+    this.applyLayout();
+    this.unsub = this.chat.on((e) => this.onChatEvent(e));
+    this.register(() => this.unsub && this.unsub());
+    this.registerDomEvent(document, 'pointerdown', (e) => {
+      // 右键时先别关追问框：右键菜单要用到弹窗里那段选区
+      if (this.popEl && !this.popEl.contains(e.target) && e.button !== 2) this.closePop();
+    });
+    try {
+      await this.chat.notes.load();
+    } catch (_) {}
+    await this.renderNav();
+    this.renderMain();
+    this.renderSide();
+  }
+
+  async onClose() {
+    this.closePop();
+    this.unloadMd();
+  }
+
+  // ── 打开 / 切换 ────────────────────────────────────────
+  async openSession(sessionId, nodeId) {
+    const s = await this.chat.store.get(sessionId);
+    if (!s) {
+      new Notice('没有找到这个对话');
+      return;
+    }
+    this.session = s;
+    this.mode = 'chat';
+    this.nodeId = nodeId && s.nodes[nodeId] ? nodeId : s.rootId;
+    this.expanded.clear();
+    this.refreshAll('top');
+  }
+
+  openNode(nodeId) {
+    if (!this.session || !this.session.nodes[nodeId]) return;
+    const wasNotes = this.mode === 'notes';
+    this.mode = 'chat';
+    if (wasNotes) this.renderNav();
+    this.nodeId = nodeId;
+    this.expanded.clear();
+    this.sideTab = 'follow';
+    this.closePop();
+    this.closeDrawers();
+    this.replyAnchor = null;
+    this.setPending(null);
+    this.renderMain('top');
+    this.renderSide();
+    this.app.workspace.requestSaveLayout();
+  }
+
+  newChat() {
+    this.mode = 'chat';
+    this.closeDrawers();
+    this.session = null;
+    this.nodeId = null;
+    this.refreshAll();
+    setTimeout(() => this.inputEl && this.inputEl.focus(), 50);
+  }
+
+  refreshAll(scrollMode) {
+    this.renderNav();
+    this.renderMain(scrollMode);
+    this.renderSide();
+    this.leaf.updateHeader && this.leaf.updateHeader();
+    this.app.workspace.requestSaveLayout();
+  }
+
+  onChatEvent(e) {
+    if (e.type === 'fav') {
+      if (this.mode !== 'notes') this.renderNav();
+      return;
+    }
+    if (e.type === 'notes') {
+      if (this.mode === 'notes') {
+        this.renderNav();
+        this.renderMain();
+      } else if (this.session && e.sessionId === this.session.id && e.nodeId === this.nodeId) this.renderMain(true);
+      return;
+    }
+    if (this.mode === 'notes') {
+      if (e.type === 'done' || e.type === 'structure') this.renderNav();
+      return;
+    }
+    if (!this.session || e.sessionId !== this.session.id) {
+      if (e.type === 'done' || e.type === 'structure') this.renderNav();
+      return;
+    }
+    const node = this.node;
+    if (!node) return;
+    const isMain = e.nodeId === this.nodeId;
+    const isChild = this.session.nodes[e.nodeId] && this.session.nodes[e.nodeId].parentId === this.nodeId;
+    if (e.type === 'structure') {
+      if (!this.session.nodes[this.nodeId]) this.nodeId = this.session.rootId;
+      this.renderMain(e.nodeId !== this.nodeId);
+      this.renderSide();
+      this.renderNav();
+      return;
+    }
+    if (isMain) this.updateMessage(e.msgId, e.type === 'done');
+    if (isChild || this.sideTab === 'tree') this.scheduleSide();
+    if (e.type === 'done') {
+      this.renderNav();
+      if (isMain) this.renderComposerState();
+    }
+  }
+
+  // ── 左侧导航 ───────────────────────────────────────────
+  async renderNav() {
+    const el = this.navEl;
+    if (!el) return;
+    const tok = (this.navTok = (this.navTok || 0) + 1);
+    el.empty();
+    const btn = (icon, text, onClick, cls) => {
+      const b = el.createDiv({ cls: 'cmf-nav-btn' + (cls ? ' ' + cls : '') });
+      obsidian.setIcon(b.createSpan({ cls: 'cmf-nav-icon' }), icon);
+      b.createSpan({ text, cls: 'cmf-nav-text' });
+      b.setAttr('aria-label', text);
+      b.addEventListener('click', onClick);
+      return b;
+    };
+    btn('square-pen', '新建对话', () => this.newChat());
+    const cur = this.mode === 'notes' ? 'notes' : this.navMode === 'fav' ? 'fav' : 'history';
+    btn('history', '历史', () => this.switchNav('history'), cur === 'history' ? 'is-active' : '');
+    btn('star', '收藏夹', () => this.switchNav('fav'), cur === 'fav' ? 'is-active is-fav' : '');
+    btn('notebook-pen', '笔记', () => this.switchNav('notes'), cur === 'notes' ? 'is-active' : '');
+    btn('layout-dashboard', '生成总览图', () => {
+      if (this.session) this.chat.generateOverview(this.session);
+      else new Notice('先开始一个对话');
+    });
+    btn('settings', '设置', () => this.openSettings());
+    if (this.mode === 'notes') return this.renderNoteNav(el, tok);
+    if (this.navMode === 'fav') return this.renderFavs(el, tok);
+    el.createDiv({ cls: 'cmf-nav-label', text: '历史' });
+    const listEl = el.createDiv({ cls: 'cmf-hist' });
+    const list = await this.chat.store.list();
+    const fav = this.chat.fav;
+    await fav.load();
+    if (tok !== this.navTok) return;
+    const starred = new Set(fav.data.items.map((i) => i.sessionId));
+    if (!list.length) listEl.createDiv({ cls: 'cmf-hist-empty', text: '还没有对话' });
+    for (const s of list) {
+      const item = listEl.createDiv({ cls: 'cmf-hist-item' + (this.session && this.session.id === s.id ? ' is-active' : '') });
+      item.createDiv({ cls: 'cmf-hist-title', text: s.title || '未命名对话' });
+      const meta = item.createDiv({ cls: 'cmf-hist-time' });
+      if (starred.has(s.id)) {
+        const st = meta.createSpan({ cls: 'cmf-hist-star', attr: { 'aria-label': '已收藏' } });
+        obsidian.setIcon(st, 'star');
+      }
+      meta.createSpan({ text: `${fmtTime(s.updatedAt)} · ${Object.keys(s.nodes).length} 个窗口` });
+      item.addEventListener('click', () => {
+        this.closeDrawers();
+        this.openSession(s.id);
+      });
+      item.addEventListener('contextmenu', (evt) => {
+        const menu = new obsidian.Menu();
+        menu.addItem((i) =>
+          i
+            .setTitle('加入收藏夹…')
+            .setIcon('star')
+            .onClick(() => this.chat.addToFavorites({ type: 'session', sessionId: s.id, title: s.title || '未命名对话' }))
+        );
+        menu.addItem((i) => i.setTitle('生成总览图').setIcon('layout-dashboard').onClick(() => this.chat.generateOverview(s)));
+        menu.addItem((i) =>
+          i
+            .setTitle('删除对话')
+            .setIcon('trash')
+            .onClick(async () => {
+              if (!(await confirmModal(this.app, '删除对话', `确认删除「${s.title}」及其所有追问？此操作不可撤销。`, '删除'))) return;
+              await this.chat.store.remove(s.id);
+              await this.chat.fav.forgetSession(s.id);
+              if (this.session && this.session.id === s.id) this.newChat();
+              else this.renderNav();
+            })
+        );
+        menu.showAtMouseEvent(evt);
+      });
+    }
+  }
+
+  // ── 主窗口 ─────────────────────────────────────────────
+  unloadMd() {
+    for (const c of this.mdComps) c.unload();
+    this.mdComps = [];
+    for (const c of this.notesComps || []) c.unload();
+    this.notesComps = [];
+  }
+
+  async renderMarkdown(el, md) {
+    if (el._cmfComp) {
+      el._cmfComp.unload();
+      this.mdComps = this.mdComps.filter((c) => c !== el._cmfComp);
+    }
+    const comp = new obsidian.Component();
+    el._cmfComp = comp;
+    comp.load();
+    this.mdComps.push(comp);
+    el.empty();
+    const norm = normalizeMath(md);
+    await obsidian.MarkdownRenderer.render(this.app, norm, el, '', comp);
+    // 公式渲染（MathJax）可能稍后才完成，给公式元素标上 LaTeX 源码，划线时用
+    annotateMath(el, norm);
+    // 公式稍后才画好时，把已划线 / 选中的公式重新上色
+    const repaint = () => {
+      annotateMath(el, norm);
+      el.querySelectorAll('.math.cmf-note-math').forEach((m) => paintMath(m, 'note'));
+      el.querySelectorAll('.math.cmf-anchor-math').forEach((m) => paintMath(m, 'anchor'));
+      el.querySelectorAll('.math.cmf-math-selected').forEach((m) => paintMath(m, 'sel'));
+    };
+    setTimeout(repaint, 300);
+    setTimeout(repaint, 1200);
+    return comp;
+  }
+
+  renderMain(keepScroll) {
+    const el = this.mainEl;
+    if (!el) return;
+    const prevScroll = keepScroll === 'top' ? 0 : keepScroll && this.msgsEl ? this.msgsEl.scrollTop : null;
+    this.unloadMd();
+    this.msgEls.clear();
+    el.empty();
+    if (this.mode === 'notes') return this.renderNotesPage(el);
+    const node = this.node;
+
+    const head = el.createDiv({ cls: 'cmf-head' });
+    const navToggle = head.createDiv({ cls: 'cmf-icon-btn cmf-panel-toggle', attr: { 'aria-label': '展开 / 收起左侧栏' } });
+    obsidian.setIcon(navToggle, 'panel-left');
+    navToggle.addEventListener('click', () => this.togglePanel('nav'));
+    this.navToggleEl = navToggle;
+    if (node && node.parentId) {
+      const back = head.createDiv({ cls: 'cmf-icon-btn', attr: { 'aria-label': '返回上一层' } });
+      obsidian.setIcon(back, 'chevron-left');
+      back.addEventListener('click', () => this.openNode(node.parentId));
+    }
+    const titleEl = head.createDiv({ cls: 'cmf-head-title' });
+    if (node) {
+      const chain = chainOf(this.session, node.id);
+      if (chain.length > 1) titleEl.createDiv({ cls: 'cmf-head-path', text: chain.slice(0, -1).map((n) => truncate(n.title, 12)).join(' › ') });
+      titleEl.createDiv({ cls: 'cmf-head-main', text: node.title || '未命名问题' });
+    } else {
+      titleEl.createDiv({ cls: 'cmf-head-main', text: '新对话' });
+    }
+    const sideToggle = head.createDiv({ cls: 'cmf-icon-btn cmf-panel-toggle', attr: { 'aria-label': '展开 / 收起右侧栏' } });
+    obsidian.setIcon(sideToggle, 'panel-right');
+    sideToggle.addEventListener('click', () => this.togglePanel('side'));
+    this.sideToggleEl = sideToggle;
+    this.applyLayout();
+
+    this.msgsEl = el.createDiv({ cls: 'cmf-msgs' });
+    if (!node) {
+      const empty = this.msgsEl.createDiv({ cls: 'cmf-empty' });
+      empty.createDiv({ cls: 'cmf-empty-title', text: '从一个问题开始' });
+      empty.createDiv({ cls: 'cmf-empty-sub', text: '读回答时，划选看不懂的句子就能追问；追问会出现在右侧，并可以无限展开下去。' });
+    } else {
+      if (node.anchor && node.anchor.text) {
+        const a = this.msgsEl.createDiv({ cls: 'cmf-anchor-quote' });
+        a.createSpan({ cls: 'cmf-anchor-label', text: '追问自' });
+        const q = a.createDiv({ cls: 'cmf-anchor-text markdown-rendered' });
+        q.setAttr('aria-label', '回到上一层');
+        this.renderMarkdown(q, node.anchor.text.length > 400 ? node.anchor.text.slice(0, 400) + '…' : node.anchor.text);
+        q.addEventListener('click', () => this.openNode(node.parentId));
+      }
+      for (const m of node.messages) this.renderMessage(m);
+    }
+    this.msgsEl.addEventListener('mouseup', (e) => {
+      if (e.button !== 0 || this.compact) return;
+      if (e.target instanceof Element && e.target.closest('.is-editing')) return;
+      setTimeout(() => this.onSelect(), 10);
+    });
+    this.msgsEl.addEventListener('scroll', () => {
+      if (!this.compact) this.closePop();
+    });
+
+    const compWrap = el.createDiv({ cls: 'cmf-composer-wrap' });
+    this.replyEl = compWrap.createDiv({ cls: 'cmf-reply' });
+    this.attTrayEl = compWrap.createDiv({ cls: 'cmf-att-tray' });
+    const comp = compWrap.createDiv({ cls: 'cmf-composer' });
+    const attBtn = comp.createDiv({ cls: 'cmf-attach-btn', attr: { 'aria-label': '添加图片或文件（也可以直接粘贴 / 拖进来）' } });
+    obsidian.setIcon(attBtn, 'paperclip');
+    const fileInput = comp.createEl('input', {
+      attr: { type: 'file', multiple: '', accept: 'image/*,.pdf,.txt,.md,.markdown,.csv,.tsv,.json,.xml,.yaml,.yml,.html,.css,.js,.ts,.py,.java,.c,.cpp,.h,.go,.rs,.sql,.tex,.log,.ipynb,.sh,text/*' },
+    });
+    fileInput.style.display = 'none';
+    attBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      const files = Array.from(fileInput.files || []);
+      fileInput.value = '';
+      this.addFiles(files);
+    });
+    this.inputEl = comp.createEl('textarea', {
+      cls: 'cmf-input',
+      attr: {
+        rows: '1',
+        placeholder: node
+          ? '继续追问…（也可以在回答里划线追问）'
+          : `输入你的问题，${this.settings.chatSendKey === 'mod-enter' ? 'Ctrl/Cmd+Enter' : 'Enter'} 发送`,
+      },
+    });
+    this.sendBtn = comp.createDiv({ cls: 'cmf-send' });
+    this.inputEl.addEventListener('input', () => this.autoGrow());
+    this.inputEl.addEventListener('paste', (e) => {
+      const files = e.clipboardData ? Array.from(e.clipboardData.files || []) : [];
+      if (!files.length) return;
+      e.preventDefault();
+      this.addFiles(files);
+    });
+    el.addEventListener('dragover', (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+      e.preventDefault();
+      el.addClass('is-dragover');
+    });
+    el.addEventListener('dragleave', (e) => {
+      if (e.target === el || !el.contains(e.relatedTarget)) el.removeClass('is-dragover');
+    });
+    el.addEventListener('drop', (e) => {
+      el.removeClass('is-dragover');
+      const files = e.dataTransfer ? Array.from(e.dataTransfer.files || []) : [];
+      if (!files.length) return;
+      e.preventDefault();
+      this.addFiles(files);
+    });
+    this.inputEl.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' || e.isComposing) return;
+      const modEnter = this.settings.chatSendKey === 'mod-enter';
+      const send = modEnter ? e.ctrlKey || e.metaKey : !e.shiftKey && !e.ctrlKey && !e.metaKey;
+      if (send) {
+        e.preventDefault();
+        this.submit();
+      }
+    });
+    this.sendBtn.addEventListener('click', () => {
+      if (this.session && this.node && this.chat.isNodeRunning(this.session, this.node)) this.chat.stop(this.session, this.node);
+      else this.submit();
+    });
+    this.renderComposerState();
+    this.renderReply();
+    this.renderAttTray();
+    if (this.pendingFocusMsg) {
+      this.applyPendingFocus();
+    } else if (prevScroll !== null) {
+      const m = this.msgsEl;
+      m.scrollTop = prevScroll;
+      setTimeout(() => (m.scrollTop = prevScroll), 60);
+      setTimeout(() => (m.scrollTop = prevScroll), 300);
+    } else this.scrollToBottom(true);
+  }
+
+  renderComposerState() {
+    if (!this.sendBtn) return;
+    const running = this.session && this.node && this.chat.isNodeRunning(this.session, this.node);
+    this.sendBtn.empty();
+    obsidian.setIcon(this.sendBtn, running ? 'square' : 'arrow-up');
+    this.sendBtn.setAttr('aria-label', running ? '停止生成' : '发送');
+    this.sendBtn.toggleClass('is-running', !!running);
+  }
+
+  autoGrow() {
+    const t = this.inputEl;
+    t.style.height = 'auto';
+    t.style.height = Math.min(t.scrollHeight, 200) + 'px';
+  }
+
+  renderMessage(m) {
+    const wrap = this.msgsEl.createDiv({ cls: `cmf-msg cmf-msg-${m.role}` });
+    wrap.dataset.msg = m.id;
+    if (m.role === 'assistant') wrap.createDiv({ cls: 'cmf-ai-badge', text: 'AI' });
+    const col = wrap.createDiv({ cls: 'cmf-msg-col' });
+    if (m.role === 'user' && m.attachments && m.attachments.length) this.renderMsgAtts(col, m);
+    const body = col.createDiv({ cls: 'cmf-msg-body markdown-rendered' });
+    body.dataset.msg = m.id;
+    body._cmfActions = col.createDiv({ cls: 'cmf-msg-actions' });
+    this.msgEls.set(m.id, body);
+    wrap.addEventListener('contextmenu', (evt) => this.showMsgMenu(evt, m, body));
+    this.fillMessage(m, body);
+  }
+
+  /** 消息右键菜单 */
+  showMsgMenu(evt, m, body) {
+    if (m.pending || body.hasClass('is-editing')) return;
+    evt.preventDefault();
+    evt.stopPropagation();
+    // 划线后追问框会抢走焦点、选区消失，这时用追问框里记着的那段
+    const popSel = this.popEl && this.popAnchor ? { anchor: this.popAnchor, rect: this.popRect } : null;
+    const sel = this.readSelection() || popSel;
+    this.closePop();
+    const s = this.session;
+    const nodeId = this.nodeId;
+    const selInThis = sel && sel.anchor.msgId === m.id ? sel : null;
+    const menu = new obsidian.Menu();
+    if (selInThis) {
+      menu.addItem((i) =>
+        i
+          .setTitle('追问选中内容')
+          .setIcon('message-square-plus')
+          .onClick(() => (this.compact ? this.startReply(selInThis.anchor) : this.openPop(selInThis.rect, selInThis.anchor)))
+      );
+      for (const q of this.presetQuestions()) {
+        menu.addItem((i) => i.setTitle(`追问：${truncate(q, 24)}`).setIcon('zap').onClick(() => this.doBranch(selInThis.anchor, q)));
+      }
+      menu.addSeparator();
+      menu.addItem((i) => i.setTitle('记笔记…').setIcon('notebook-pen').onClick(() => this.takeNote(selInThis.anchor)));
+      menu.addItem((i) =>
+        i
+          .setTitle('复制选中内容')
+          .setIcon('clipboard-copy')
+          .onClick(async () => new Notice((await copyText(selInThis.anchor.text)) ? '已复制' : '复制失败'))
+      );
+      menu.addSeparator();
+    }
+    if (m.role === 'assistant') {
+      menu.addItem((i) => i.setTitle('编辑回答').setIcon('pencil').onClick(() => this.startEdit(m, body)));
+      if (m.originalContent !== undefined && m.originalContent !== m.content) {
+        menu.addItem((i) =>
+          i
+            .setTitle('恢复 AI 原始回答')
+            .setIcon('undo-2')
+            .onClick(async () => {
+              if (await confirmModal(this.app, '恢复原始回答', '放弃你对这条回答的修改，恢复成 AI 最初的回答？', '恢复'))
+                this.chat.editMessage(s, nodeId, m.id, m.originalContent);
+            })
+        );
+      }
+      menu.addItem((i) =>
+        i.setTitle('复制回答（Markdown）').setIcon('copy').onClick(async () => new Notice((await copyText(normalizeMath(m.content))) ? '已复制' : '复制失败'))
+      );
+      menu.addItem((i) =>
+        i
+          .setTitle('重新回答')
+          .setIcon('refresh-cw')
+          .onClick(async () => {
+            const msg =
+              m.originalContent !== undefined
+                ? '重新回答会覆盖你修改过的内容。继续吗？'
+                : '用这条之前的对话重新生成这条回答？';
+            if (await confirmModal(this.app, '重新回答', msg, '重新回答')) this.chat.regenerate(s, nodeId, m.id);
+          })
+      );
+      menu.addItem((i) => i.setTitle('保存为笔记').setIcon('file-plus').onClick(() => this.chat.saveAsNote(s, nodeId, m.id)));
+      menu.addItem((i) => i.setTitle('加入收藏夹…').setIcon('star').onClick(() => this.favoriteRound(m.id)));
+      menu.addSeparator();
+      menu.addItem((i) =>
+        i
+          .setTitle('删除这一轮问答')
+          .setIcon('trash-2')
+          .onClick(async () => {
+            if (await confirmModal(this.app, '删除这一轮', '删除这条回答和它前面的提问？基于它的追问卡片会保留。', '删除'))
+              this.chat.deleteRound(s, nodeId, m.id);
+          })
+      );
+    } else {
+      menu.addItem((i) => i.setTitle('复制问题').setIcon('copy').onClick(async () => new Notice((await copyText(m.content)) ? '已复制' : '复制失败')));
+      menu.addItem((i) =>
+        i
+          .setTitle('编辑后重新发送')
+          .setIcon('pencil')
+          .onClick(() => {
+            this.inputEl.value = m.content;
+            this.autoGrow();
+            if (m.attachments && m.attachments.length) {
+              this.clearAtts();
+              this.pendingAtts = m.attachments.map((a) => ({ key: uid(), name: a.name, kind: a.kind === 'image' ? 'image' : 'text', att: a }));
+              this.renderAttTray();
+            }
+            this.inputEl.focus();
+          })
+      );
+      const node = this.node;
+      const k = node ? node.messages.findIndex((x) => x.id === m.id) : -1;
+      const next = k >= 0 ? node.messages[k + 1] : null;
+      if (next && next.role === 'assistant' && !next.pending) {
+        menu.addItem((i) => i.setTitle('加入收藏夹…').setIcon('star').onClick(() => this.favoriteRound(next.id)));
+      }
+    }
+    menu.showAtMouseEvent(evt);
+  }
+
+  /** 原地编辑一条 AI 回答（Markdown 源码） */
+  startEdit(m, body) {
+    if (m.pending || body.hasClass('is-editing')) return;
+    const s = this.session;
+    const nodeId = this.nodeId;
+    body.addClass('is-editing');
+    if (body._cmfActions) body._cmfActions.empty();
+    body.empty();
+    const ta = body.createEl('textarea', { cls: 'cmf-edit-input' });
+    ta.value = m.content || '';
+    const fit = () => {
+      ta.style.height = 'auto';
+      ta.style.height = Math.min(ta.scrollHeight + 4, Math.max(240, window.innerHeight * 0.6)) + 'px';
+    };
+    const bar = body.createDiv({ cls: 'cmf-edit-bar' });
+    bar.createSpan({ cls: 'cmf-edit-hint', text: this.compact ? '支持 Markdown' : '支持 Markdown · Ctrl/Cmd+Enter 保存 · Esc 取消' });
+    const cancel = bar.createEl('button', { text: '取消' });
+    const save = bar.createEl('button', { cls: 'mod-cta', text: '保存' });
+    const finish = (commit) => {
+      body.removeClass('is-editing');
+      if (commit && ta.value !== m.content) {
+        this.chat.editMessage(s, nodeId, m.id, ta.value);
+        new Notice('已保存修改');
+      } else {
+        this.fillMessage(m, body);
+      }
+    };
+    ta.addEventListener('input', fit);
+    ta.addEventListener('keydown', (e) => {
+      if (e.isComposing) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        finish(false);
+      } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        finish(true);
+      }
+    });
+    cancel.addEventListener('click', () => finish(false));
+    save.addEventListener('click', () => finish(true));
+    setTimeout(() => {
+      fit();
+      ta.focus();
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+    }, 20);
+  }
+
+  /** 每条消息下方的操作栏 */
+  renderActions(m, bar) {
+    if (!bar) return;
+    bar.empty();
+    if (m.pending) return;
+    const s = this.session;
+    const nodeId = this.nodeId;
+    const act = (icon, label, fn, cls) => {
+      const b = bar.createDiv({ cls: 'cmf-act' + (cls ? ' ' + cls : ''), attr: { 'aria-label': label } });
+      obsidian.setIcon(b, icon);
+      b.addEventListener('click', (e) => {
+        e.stopPropagation();
+        fn(b);
+      });
+      return b;
+    };
+    const copy = async (b) => {
+      const ok = await copyText(m.role === 'assistant' ? normalizeMath(m.content) : m.content);
+      if (!ok) {
+        new Notice('复制失败');
+        return;
+      }
+      obsidian.setIcon(b, 'check');
+      setTimeout(() => obsidian.setIcon(b, 'copy'), 1200);
+      new Notice('已复制');
+    };
+    if (m.role === 'user') {
+      act('copy', '复制', copy);
+      act('pencil', '编辑后重新发送（放回输入框）', () => {
+        this.inputEl.value = m.content;
+        this.autoGrow();
+        if (m.attachments && m.attachments.length) {
+          this.clearAtts();
+          this.pendingAtts = m.attachments.map((a) => ({ key: uid(), name: a.name, kind: a.kind === 'image' ? 'image' : 'text', att: a }));
+          this.renderAttTray();
+        }
+        this.inputEl.focus();
+      });
+      return;
+    }
+    act('copy', '复制（Markdown）', copy);
+    act('pencil', '编辑回答（加入自己的理解）', () => this.startEdit(m, bar.parentElement.querySelector('.cmf-msg-body')));
+    act('refresh-cw', '重新回答', async () => {
+      const kids = childrenOf(s, nodeId).filter((c) => c.anchor && c.anchor.msgId === m.id);
+      if (kids.length) {
+        const ok = await confirmModal(
+          this.app,
+          '重新回答',
+          `这条回答上有 ${kids.length} 个划线追问。重新回答后追问卡片会保留，但原文高亮可能对不上。继续吗？`,
+          '重新回答'
+        );
+        if (!ok) return;
+      }
+      this.chat.regenerate(s, nodeId, m.id);
+    });
+    act('file-plus', '保存为笔记', () => this.chat.saveAsNote(s, nodeId, m.id));
+    act('message-square-plus', '继续追问', () => this.inputEl && this.inputEl.focus());
+    act(
+      'trash-2',
+      '删除这一轮问答',
+      async () => {
+        if (await confirmModal(this.app, '删除这一轮', '删除这条回答和它前面的提问？基于它的追问卡片会保留。', '删除'))
+          this.chat.deleteRound(s, nodeId, m.id);
+      },
+      'is-danger'
+    );
+    if (this.settings.chatShowMeta) {
+      const t = m.doneAt || m.createdAt;
+      const chars = (m.content || '').length;
+      bar.createSpan({ cls: 'cmf-act-meta', text: [fmtTime(t), m.model, `${chars} 字`].filter(Boolean).join(' · ') });
+    }
+    if (m.editedAt) {
+      const tag = bar.createSpan({ cls: 'cmf-edited-tag', text: '已编辑' });
+      tag.setAttr('aria-label', `你在 ${fmtTime(m.editedAt)} 修改过这条回答`);
+    }
+  }
+
+  async fillMessage(m, body) {
+    if (m.role === 'user') {
+      body.empty();
+      body.createDiv({ text: m.content });
+    } else {
+      await this.renderMarkdown(body, m.content || '');
+      if (m.pending) body.createDiv({ cls: 'cmf-typing', text: m.content ? '' : '思考中…' });
+    }
+    this.applyHighlights(m.id, body);
+    this.renderActions(m, body._cmfActions);
+  }
+
+  applyHighlights(msgId, body) {
+    if (!this.session || !this.node) return;
+    for (const n of this.chat.notes.notesOn(this.session.id, this.node.id, msgId)) {
+      for (const mk of highlightAnchor(body, n.anchor, n.id, 'note')) {
+        mk.setAttr('aria-label', n.content ? `笔记：${truncate(n.content, 60)}` : '笔记');
+        mk.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this.editNote(n);
+        });
+      }
+    }
+    for (const c of childrenOf(this.session, this.node.id)) {
+      if (!c.anchor || c.anchor.msgId !== msgId) continue;
+      for (const mk of highlightAnchor(body, c.anchor, c.id)) {
+        mk.setAttr('aria-label', `追问：${c.title}`);
+        mk.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this.revealCard(c.id);
+        });
+      }
+    }
+  }
+
+  updateMessage(msgId, done) {
+    const node = this.node;
+    if (!node) return;
+    const m = node.messages.find((x) => x.id === msgId);
+    if (!m) return;
+    let body = this.msgEls.get(msgId);
+    if (!body) {
+      this.renderMessage(m);
+      body = this.msgEls.get(msgId);
+    }
+    const nearBottom = this.isNearBottom();
+    this.fillMessage(m, body).then(() => {
+      if (nearBottom) this.scrollToBottom();
+    });
+    if (done) this.renderComposerState();
+  }
+
+  isNearBottom() {
+    const el = this.msgsEl;
+    return !el || el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  }
+
+  scrollToBottom(force) {
+    const el = this.msgsEl;
+    if (!el) return;
+    if (force || this.isNearBottom()) setTimeout(() => (el.scrollTop = el.scrollHeight), 0);
+  }
+
+  async submit() {
+    const text = this.inputEl.value.trim();
+    if ((this.pendingAtts || []).some((a) => a.loading)) {
+      new Notice('附件还在处理中，请稍等一下');
+      return;
+    }
+    const atts = (this.pendingAtts || []).filter((a) => a.att).map((a) => a.att);
+    if (this.replyAnchor && this.session && this.node) {
+      const anchor = this.replyAnchor;
+      this.replyAnchor = null;
+      this.setPending(null);
+      this.inputEl.value = '';
+      this.autoGrow();
+      this.renderReply();
+      this.clearAtts();
+      this.doBranch(anchor, text, atts);
+      return;
+    }
+    if (!text && !atts.length) return;
+    if (this.session && this.node && this.chat.isNodeRunning(this.session, this.node)) return;
+    this.inputEl.value = '';
+    this.autoGrow();
+    this.clearAtts();
+    if (!this.session) {
+      const s = this.chat.store.create(text || (atts[0] && atts[0].name) || '附件分析');
+      this.session = s;
+      this.nodeId = s.rootId;
+      this.refreshAll();
+    }
+    this.chat.ask(this.session, this.nodeId, text, atts);
+    this.scrollToBottom(true);
+  }
+
+  // ── 附件 ───────────────────────────────────────────────
+  async addFiles(files) {
+    if (!files || !files.length) return;
+    if (this.mode === 'notes') return;
+    this.pendingAtts = this.pendingAtts || [];
+    for (const file of files) {
+      const kind = attKind(file);
+      if (!kind) {
+        new Notice(`暂不支持「${file.name}」这种文件（支持图片、PDF、文本 / Markdown / 代码 / CSV 等）`, 6000);
+        continue;
+      }
+      const item = { key: uid(), name: file.name || (kind === 'image' ? '图片' : '文件'), kind, loading: true };
+      if (kind === 'image') {
+        try {
+          item.preview = URL.createObjectURL(file);
+        } catch (_) {}
+      }
+      this.pendingAtts.push(item);
+      this.renderAttTray();
+      processUpload(this.chat, file)
+        .then((att) => {
+          item.att = att;
+          item.loading = false;
+          this.renderAttTray();
+        })
+        .catch((e) => {
+          new Notice(`「${item.name}」添加失败：${(e && e.message) || e}`, 8000);
+          this.removeAtt(item.key);
+        });
+    }
+    if (this.inputEl) this.inputEl.focus();
+  }
+
+  removeAtt(key) {
+    const it = (this.pendingAtts || []).find((a) => a.key === key);
+    if (it && it.preview) URL.revokeObjectURL(it.preview);
+    this.pendingAtts = (this.pendingAtts || []).filter((a) => a.key !== key);
+    this.renderAttTray();
+  }
+
+  clearAtts() {
+    for (const a of this.pendingAtts || []) if (a.preview) URL.revokeObjectURL(a.preview);
+    this.pendingAtts = [];
+    this.renderAttTray();
+  }
+
+  renderAttTray() {
+    const el = this.attTrayEl;
+    if (!el) return;
+    el.empty();
+    const list = this.pendingAtts || [];
+    el.toggleClass('is-active', list.length > 0);
+    for (const a of list) {
+      const chip = el.createDiv({ cls: 'cmf-att-chip' + (a.loading ? ' is-loading' : '') + (a.kind === 'image' ? ' is-image' : '') });
+      if (a.kind === 'image') {
+        const src = a.preview || (a.att && this.app.vault.adapter.getResourcePath(a.att.path));
+        if (src) chip.createEl('img', { attr: { src, alt: a.name } });
+      } else {
+        const ic = chip.createSpan({ cls: 'cmf-att-icon' });
+        obsidian.setIcon(ic, a.kind === 'pdf' || (a.att && a.att.mime === 'application/pdf') ? 'file-text' : 'file-code');
+        const info = chip.createDiv({ cls: 'cmf-att-info' });
+        info.createDiv({ cls: 'cmf-att-name', text: a.name });
+        const sub = a.loading
+          ? '正在读取…'
+          : [a.att.pages ? `${a.att.pages} 页` : null, `${(a.att.text || '').length} 字`, a.att.truncated ? '已截断' : null].filter(Boolean).join(' · ');
+        info.createDiv({ cls: 'cmf-att-sub', text: sub });
+      }
+      if (a.loading && a.kind === 'image') chip.createDiv({ cls: 'cmf-att-spin', text: '…' });
+      const x = chip.createDiv({ cls: 'cmf-att-x', attr: { 'aria-label': '移除' } });
+      obsidian.setIcon(x, 'x');
+      x.addEventListener('click', () => this.removeAtt(a.key));
+    }
+  }
+
+  /** 用户消息里显示的附件（缩略图 / 文件卡片），点击在 Obsidian 里打开 */
+  renderMsgAtts(parent, m) {
+    const box = parent.createDiv({ cls: 'cmf-msg-atts' });
+    const open = (path) => {
+      const f = this.app.vault.getAbstractFileByPath(path);
+      if (f) this.app.workspace.getLeaf('tab').openFile(f);
+      else new Notice('附件文件已经不在了');
+    };
+    for (const a of m.attachments) {
+      if (a.kind === 'image') {
+        const img = box.createEl('img', { cls: 'cmf-msg-img', attr: { src: this.app.vault.adapter.getResourcePath(a.path), alt: a.name, 'aria-label': a.name } });
+        img.addEventListener('click', () => open(a.path));
+      } else {
+        const chip = box.createDiv({ cls: 'cmf-att-chip is-sent', attr: { 'aria-label': '在 Obsidian 里打开' } });
+        obsidian.setIcon(chip.createSpan({ cls: 'cmf-att-icon' }), a.mime === 'application/pdf' ? 'file-text' : 'file-code');
+        const info = chip.createDiv({ cls: 'cmf-att-info' });
+        info.createDiv({ cls: 'cmf-att-name', text: a.name });
+        info.createDiv({ cls: 'cmf-att-sub', text: [a.pages ? `${a.pages} 页` : null, fmtSize(a.size), a.truncated ? '内容过长已截断' : null].filter(Boolean).join(' · ') });
+        chip.addEventListener('click', () => open(a.path));
+      }
+    }
+  }
+
+  // ── 划线追问 ───────────────────────────────────────────
+  /** 读取当前选区；在主窗口某条消息里时返回 {anchor, rect} */
+  readSelection() {
+    if (!this.node || !this.msgsEl) return null;
+    const sel = document.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+    const range = sel.getRangeAt(0);
+    let el = range.commonAncestorContainer;
+    if (el.nodeType !== 1) el = el.parentElement;
+    const body = el && el.closest('.cmf-msg-body');
+    if (!body || !this.msgsEl.contains(body) || body.hasClass('is-editing')) return null;
+    const src = selectionToSource(range);
+    if (!src.text) return null;
+    const anchor = { text: src.text, msgId: body.dataset.msg };
+    if (src.plain && src.plain !== src.text) anchor.plain = src.plain;
+    return { anchor, range, rect: range.getBoundingClientRect() };
+  }
+
+  onSelect() {
+    const r = this.readSelection();
+    if (!r) return;
+    this.openPop(r.rect, r.anchor);
+    this.setPending(r.range);
+  }
+
+  /** 手机 / 窄屏：长按选字后，在底部显示「追问选中内容」按钮（不挡系统的复制菜单） */
+  onSelectionChange() {
+    this.updateMathSelection();
+    if (!this.compact || this.popEl) return;
+    clearTimeout(this.selTimer);
+    this.selTimer = setTimeout(() => {
+      const r = this.readSelection();
+      if (r) {
+        this.pendingSelRange = r.range.cloneRange();
+        this.showPill(r.anchor);
+      }
+      else this.hidePill();
+    }, 300);
+  }
+
+  updateMathSelection() {
+    if (!this.msgsEl) return;
+    const sel = document.getSelection();
+    let range = null;
+    if (sel && sel.rangeCount && !sel.isCollapsed) {
+      const r = sel.getRangeAt(0);
+      if (this.msgsEl.contains(r.commonAncestorContainer) || r.intersectsNode(this.msgsEl)) range = r;
+    }
+    if (!range && this.pendingRange && this.msgsEl.contains(this.pendingRange.commonAncestorContainer)) range = this.pendingRange;
+    markSelectedMath(this.msgsEl, range);
+  }
+
+  /** 记住正在追问的那段选区（弹窗 / 引用打开期间保持高亮） */
+  setPending(range) {
+    this.pendingRange = range ? range.cloneRange() : null;
+    setPendingHighlight(this.pendingRange);
+    this.updateMathSelection();
+  }
+
+  showPill(anchor) {
+    this.pendingAnchor = anchor;
+    if (!this.pillEl) {
+      this.pillEl = this.mainEl.createDiv({ cls: 'cmf-pill' });
+      const part = (icon, text, fn) => {
+        const b = this.pillEl.createDiv({ cls: 'cmf-pill-btn' });
+        obsidian.setIcon(b.createSpan(), icon);
+        b.createSpan({ text });
+        b.addEventListener('pointerdown', (e) => e.preventDefault());
+        b.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const a = this.pendingAnchor;
+          if (a) fn(a);
+        });
+      };
+      part('message-square-plus', '追问', (a) => {
+        this.hidePill();
+        this.startReply(a);
+      });
+      this.pillEl.createDiv({ cls: 'cmf-pill-sep' });
+      part('notebook-pen', '笔记', (a) => {
+        this.hidePill();
+        this.takeNote(a);
+      });
+      this.pillEl.createDiv({ cls: 'cmf-pill-sep' });
+      part('copy', '复制', async (a) => {
+        new Notice((await copyText(a.text)) ? '已复制' : '复制失败');
+        this.hidePill();
+        const sel = document.getSelection();
+        if (sel) sel.removeAllRanges();
+      });
+    }
+  }
+
+  hidePill() {
+    if (this.pillEl) {
+      this.pillEl.remove();
+      this.pillEl = null;
+    }
+  }
+
+  openPop(rect, anchor) {
+    this.closePop();
+    this.popAnchor = anchor;
+    this.popRect = rect;
+    const pop = document.body.createDiv({ cls: 'cmf-pop' });
+    pop.createDiv({ cls: 'cmf-pop-label', text: '追问：' });
+    const input = pop.createEl('input', {
+      cls: 'cmf-pop-input',
+      attr: { type: 'text', placeholder: `什么是「${truncate(anchor.text, 12)}」？（留空 = 详细解释）` },
+    });
+    const presets = this.presetQuestions();
+    if (presets.length) {
+      const chips = pop.createDiv({ cls: 'cmf-preset-chips' });
+      for (const q of presets) {
+        const c = chips.createDiv({ cls: 'cmf-preset-chip', text: q, attr: { 'aria-label': '用这个问题追问' } });
+        c.addEventListener('click', () => {
+          this.closePop();
+          this.doBranch(anchor, q);
+        });
+      }
+    }
+    const row = pop.createDiv({ cls: 'cmf-pop-row' });
+    const copy = row.createEl('button', { cls: 'cmf-pop-copy', attr: { 'aria-label': '复制选中内容（含公式）' } });
+    obsidian.setIcon(copy.createSpan(), 'copy');
+    copy.createSpan({ text: '复制' });
+    copy.addEventListener('click', async () => {
+      const ok = await copyText(anchor.text);
+      new Notice(ok ? '已复制' : '复制失败');
+      this.closePop();
+    });
+    const noteBtn = row.createEl('button', { cls: 'cmf-pop-copy', attr: { 'aria-label': '给这段写笔记' } });
+    obsidian.setIcon(noteBtn.createSpan(), 'notebook-pen');
+    noteBtn.createSpan({ text: '笔记' });
+    noteBtn.addEventListener('click', () => {
+      this.closePop();
+      this.takeNote(anchor);
+    });
+    const send = row.createEl('button', { cls: 'cmf-pop-send mod-cta', text: '发送追问' });
+    if (this.compact || !rect) {
+      // 手机：底部弹出
+      pop.addClass('is-sheet');
+      pop.prepend(createDiv({ cls: 'cmf-pop-quote', text: `「${truncate(anchor.text, 60)}」` }));
+    } else {
+      const w = 300;
+      const left = Math.min(Math.max(8, rect.left + rect.width / 2 - w / 2), window.innerWidth - w - 8);
+      const top = rect.bottom + 140 < window.innerHeight ? rect.bottom + 8 : Math.max(8, rect.top - 130);
+      pop.style.left = `${left}px`;
+      pop.style.top = `${top}px`;
+      pop.style.width = `${w}px`;
+    }
+    const go = () => {
+      const q = input.value;
+      this.closePop();
+      this.doBranch(anchor, q);
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.isComposing) return;
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        go();
+      } else if (e.key === 'Escape') this.closePop();
+    });
+    send.addEventListener('click', go);
+    this.popEl = pop;
+    if (!pop.hasClass('is-sheet') && rect) {
+      const h = pop.offsetHeight || 140;
+      const top = rect.bottom + h + 16 < window.innerHeight ? rect.bottom + 8 : Math.max(8, rect.top - h - 8);
+      pop.style.top = `${top}px`;
+    }
+    setTimeout(() => input.focus(), 20);
+  }
+
+  /** 新建划线追问并在右侧显示 */
+  doBranch(anchor, q, attachments) {
+    this.setPending(null);
+    const s = document.getSelection();
+    if (s) s.removeAllRanges();
+    const childId = this.chat.branch(this.session, this.nodeId, anchor, q, attachments);
+    this.sideTab = 'follow';
+    this.expanded.add(childId);
+    this.renderMain(true);
+    this.renderSide();
+    setTimeout(() => this.revealCard(childId, true), 30);
+    if (this.compact) {
+      if (this.inputEl) this.inputEl.blur();
+      this.openDrawer('side');
+    }
+  }
+
+  /** 手机：把选中的原文作为「引用」挂在主输入框上方，直接用主输入框追问（不会被键盘挡住） */
+  startReply(anchor) {
+    this.replyAnchor = anchor;
+    if (this.pendingSelRange) this.setPending(this.pendingSelRange);
+    this.pendingSelRange = null;
+    this.renderReply();
+    const sel = document.getSelection();
+    if (sel) sel.removeAllRanges();
+    if (this.inputEl) {
+      this.inputEl.focus();
+      setTimeout(() => this.inputEl && this.inputEl.scrollIntoView({ block: 'nearest' }), 300);
+    }
+  }
+
+  renderReply() {
+    const el = this.replyEl;
+    if (!el) return;
+    el.empty();
+    const a = this.replyAnchor;
+    el.toggleClass('is-active', !!a);
+    if (this.inputEl) {
+      this.inputEl.setAttr(
+        'placeholder',
+        a ? `针对这段追问…（留空 = ${this.settings.defaultFollowUp || '详细解释'}）` : this.node ? '继续追问…（也可以在回答里划线追问）' : '输入你的问题'
+      );
+    }
+    if (!a) return;
+    const icon = el.createSpan({ cls: 'cmf-reply-icon' });
+    obsidian.setIcon(icon, 'corner-down-right');
+    el.createSpan({ cls: 'cmf-reply-label', text: '追问' });
+    el.createSpan({ cls: 'cmf-reply-text', text: `「${truncate(a.text, 40)}」` });
+    const x = el.createSpan({ cls: 'cmf-reply-x', attr: { 'aria-label': '取消追问' } });
+    obsidian.setIcon(x, 'x');
+    x.addEventListener('click', () => {
+      this.replyAnchor = null;
+      this.setPending(null);
+      this.renderReply();
+    });
+    const presets = this.presetQuestions();
+    if (presets.length) {
+      const chips = el.createDiv({ cls: 'cmf-preset-chips is-reply' });
+      for (const q of presets) {
+        const c = chips.createDiv({ cls: 'cmf-preset-chip', text: q });
+        c.addEventListener('pointerdown', (e) => e.preventDefault());
+        c.addEventListener('click', () => {
+          if (!this.inputEl) return;
+          this.inputEl.value = q;
+          this.submit();
+        });
+      }
+    }
+    if (this.sendBtn) this.sendBtn.addClass('is-reply');
+  }
+
+  closePop() {
+    if (this.popEl) {
+      this.popEl.remove();
+      this.popEl = null;
+      if (!this.replyAnchor) this.setPending(null);
+    }
+  }
+
+  // ── 右侧栏：追问卡片 / 问答树 ──────────────────────────
+  scheduleSide() {
+    if (this.sideTimer) return;
+    this.sideTimer = setTimeout(() => {
+      this.sideTimer = null;
+      this.updateCards();
+    }, 150);
+  }
+
+  renderSide() {
+    const el = this.sideEl;
+    if (!el) return;
+    el.empty();
+    this.cardEls.clear();
+    const tabs = el.createDiv({ cls: 'cmf-tabs' });
+    const tab = (id, icon, text) => {
+      const t = tabs.createDiv({ cls: 'cmf-tab' + (this.sideTab === id ? ' is-active' : '') });
+      obsidian.setIcon(t.createSpan(), icon);
+      t.createSpan({ text });
+      t.addEventListener('click', () => {
+        this.sideTab = id;
+        this.renderSide();
+      });
+    };
+    tab('tree', 'git-fork', '问答树');
+    tab('follow', 'messages-square', '追问');
+    const body = el.createDiv({ cls: 'cmf-side-body' });
+    this.sideBody = body;
+    if (!this.session || !this.node) {
+      body.createDiv({ cls: 'cmf-side-empty', text: '开始对话后，追问会以卡片的形式出现在这里。' });
+      return;
+    }
+    if (this.sideTab === 'tree') this.renderTree(body);
+    else this.renderCards(body);
+  }
+
+  renderCards(body) {
+    const kids = childrenOf(this.session, this.nodeId);
+    if (!kids.length) {
+      body.createDiv({ cls: 'cmf-side-empty', text: '在左边的回答里划选一段文字，就能针对它追问。' });
+      return;
+    }
+    for (const c of kids) {
+      const card = body.createDiv({ cls: 'cmf-card' });
+      this.cardEls.set(c.id, card);
+      // 点击卡片 → 这个追问替换为主窗口；折叠按钮只展开 / 收起预览
+      card.addEventListener('click', (e) => {
+        if (e.target.closest('.cmf-card-fold, .cmf-card-del, .cmf-card-preview, .cmf-card-go')) return;
+        this.openNode(c.id);
+      });
+      this.fillCard(c, card);
+    }
+  }
+
+  fillCard(c, card) {
+    const s = this.session;
+    const open = this.expanded.has(c.id);
+    card.empty();
+    card.toggleClass('is-open', open);
+    const head = card.createDiv({ cls: 'cmf-card-head' });
+    const t = head.createDiv({ cls: 'cmf-card-title', text: c.title || '追问' });
+    t.setAttr('aria-label', '在主窗口打开');
+    const fold = head.createDiv({ cls: 'cmf-icon-btn cmf-card-fold', attr: { 'aria-label': open ? '收起' : '展开预览' } });
+    obsidian.setIcon(fold, open ? 'chevron-up' : 'chevron-down');
+    const del = head.createDiv({ cls: 'cmf-icon-btn cmf-card-del', attr: { 'aria-label': '删除这个追问' } });
+    obsidian.setIcon(del, 'x');
+    const running = this.chat.isNodeRunning(s, c);
+    const kidsN = childrenOf(s, c.id).length;
+    card.createDiv({
+      cls: 'cmf-card-meta',
+      text: `${fmtTime(c.createdAt)}${running ? ' · 生成中…' : ''}${kidsN ? ` · ${kidsN} 个追问` : ''}`,
+    });
+    const ans = lastAnswer(c);
+    if (open) {
+      const prev = card.createDiv({ cls: 'cmf-card-preview markdown-rendered' });
+      this.renderMarkdown(prev, (ans && ans.content) || '思考中…');
+      const go = card.createDiv({ cls: 'cmf-card-go', text: '进入这个对话 →' });
+      go.addEventListener('click', () => this.openNode(c.id));
+    } else {
+      card.createDiv({ cls: 'cmf-card-snippet', text: ans && ans.content ? plainExcerpt(ans.content, 70) : running ? '思考中…' : '' });
+    }
+    fold.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (open) this.expanded.delete(c.id);
+      else this.expanded.add(c.id);
+      this.fillCard(c, card);
+    });
+    del.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const n = subtreeIds(s, c.id).length;
+      const msg = n > 1 ? `确认删除「${c.title}」及其下的 ${n - 1} 个追问？` : `确认删除「${c.title}」？`;
+      if (await confirmModal(this.app, '删除追问', msg, '删除')) this.chat.deleteNode(s, c.id);
+    });
+  }
+
+  updateCards() {
+    if (!this.session || !this.node) return;
+    if (this.sideTab === 'tree') {
+      this.renderSide();
+      return;
+    }
+    const kids = childrenOf(this.session, this.nodeId);
+    if (kids.length !== this.cardEls.size) {
+      this.renderSide();
+      return;
+    }
+    for (const c of kids) {
+      const card = this.cardEls.get(c.id);
+      if (!card) continue;
+      const scroll = card.querySelector('.cmf-card-preview');
+      const st = scroll ? scroll.scrollTop : 0;
+      this.fillCard(c, card);
+      const ns = card.querySelector('.cmf-card-preview');
+      if (ns) ns.scrollTop = st;
+    }
+  }
+
+  revealCard(childId, quiet) {
+    if (this.compact && this.drawer !== 'side') this.openDrawer('side');
+    this.sideTab = 'follow';
+    this.expanded.add(childId);
+    this.renderSide();
+    const card = this.cardEls.get(childId);
+    if (!card) return;
+    card.scrollIntoView({ block: 'nearest', behavior: quiet ? 'auto' : 'smooth' });
+    card.addClass('is-flash');
+    setTimeout(() => card.removeClass('is-flash'), 900);
+  }
+
+  renderTree(body) {
+    const s = this.session;
+    const path = new Set(chainOf(s, this.nodeId).map((n) => n.id));
+    body.createDiv({ cls: 'cmf-tree-pos', text: `当前位于第 ${chainOf(s, this.nodeId).length} 层 · 点任一问题可跳转` });
+    const list = body.createDiv({ cls: 'cmf-tree' });
+
+    /** 把一个窗口的消息拆成「一轮一问」 */
+    const roundsOf = (node) => {
+      const out = [];
+      let cur = null;
+      for (const m of node.messages) {
+        if (m.role === 'user') {
+          cur = { user: m, ids: [m.id] };
+          out.push(cur);
+        } else if (cur) {
+          cur.ids.push(m.id);
+          cur = null;
+        } else {
+          out.push({ user: null, ids: [m.id] });
+        }
+      }
+      if (!out.length) out.push({ user: null, ids: [] });
+      return out;
+    };
+
+    /**
+     * 渲染一个窗口：窗口里的每个问题是同级的（1、2、3…）；
+     * 从某个回答里划线追问出来的窗口，挂在那个问题下面（1.1、1.2…）。
+     * 返回这个窗口占用的同级编号数量。
+     */
+    const renderWindow = (node, prefix, start, depth) => {
+      const rounds = roundsOf(node);
+      const kidsBy = new Map();
+      for (const c of childrenOf(s, node.id)) {
+        let idx = c.anchor ? rounds.findIndex((r) => r.ids.includes(c.anchor.msgId)) : -1;
+        if (idx < 0) idx = rounds.length - 1;
+        if (!kidsBy.has(idx)) kidsBy.set(idx, []);
+        kidsBy.get(idx).push(c);
+      }
+      const running = this.chat.isNodeRunning(s, node);
+      rounds.forEach((r, i) => {
+        const label = `${prefix}${start + i + 1}`;
+        const isCur = node.id === this.nodeId;
+        const item = list.createDiv({
+          cls: 'cmf-tree-item' + (isCur ? ' is-current' : path.has(node.id) ? ' is-path' : '') + (i > 0 ? ' is-followup' : ''),
+        });
+        item.style.paddingLeft = `${8 + depth * 16}px`;
+        item.createSpan({ cls: 'cmf-tree-dot' });
+        item.createSpan({ cls: 'cmf-tree-num', text: label });
+        const main = item.createDiv({ cls: 'cmf-tree-main' });
+        const line = main.createDiv({ cls: 'cmf-tree-line' });
+        const question = (r.user && r.user.content) || node.title || '未命名问题';
+        if (i === 0 && node.anchor && node.anchor.text) {
+          line.createSpan({ cls: 'cmf-tree-mark', text: truncate(node.anchor.text, 16) });
+        }
+        line.createSpan({ cls: 'cmf-tree-title', text: truncate(question, 60) });
+        if (running && i === rounds.length - 1) item.createSpan({ cls: 'cmf-tree-run', text: '…' });
+        item.setAttr(
+          'aria-label',
+          (i === 0 && node.anchor && node.anchor.text ? `划线「${node.anchor.text}」\n` : '') + question
+        );
+        item.addEventListener('click', () => {
+          if (r.user) this.focusMessage(node.id, r.user.id);
+          else this.openNode(node.id);
+        });
+        let k = 0;
+        for (const c of kidsBy.get(i) || []) k += renderWindow(c, `${label}.`, k, depth + 1);
+      });
+      return rounds.length;
+    };
+    renderWindow(s.nodes[s.rootId], '', 0, 0);
+
+    const gen = body.createDiv({ cls: 'cmf-card-go cmf-tree-gen', text: '生成 Canvas 总览图 →' });
+    gen.addEventListener('click', () => this.chat.generateOverview(s));
+  }
+
+  /** 打开某个窗口并滚动到其中一条消息 */
+  presetQuestions() {
+    const arr = this.settings.presetQuestions;
+    return Array.isArray(arr) ? arr.map((q) => String(q || '').trim()).filter(Boolean) : [];
+  }
+
+  /** 左侧栏：点哪个就切到哪个（历史 / 收藏夹 / 笔记） */
+  switchNav(which) {
+    if (which === 'notes') {
+      if (this.mode !== 'notes') {
+        this.mode = 'notes';
+        this.closePop();
+        this.renderMain();
+      }
+    } else {
+      this.navMode = which;
+      if (this.mode === 'notes') {
+        this.mode = 'chat';
+        this.renderMain('top');
+      }
+    }
+    this.renderNav();
+    this.app.workspace.requestSaveLayout();
+  }
+
+  // ── 想法笔记 ───────────────────────────────────────────
+  async takeNote(anchor) {
+    const s = this.session;
+    const node = this.node;
+    if (!s || !node || !anchor) return;
+    const sel = document.getSelection();
+    if (sel) sel.removeAllRanges();
+    this.setPending(null);
+    const notes = this.chat.notes;
+    await notes.load();
+    const n = await openNoteEditor(this.app, notes, {
+      anchor,
+      folderId: this.lastNoteFolder,
+      ctx: { sessionId: s.id, nodeId: node.id, msgId: anchor.msgId, sessionTitle: s.title, nodeTitle: node.title },
+    });
+    if (!n) return;
+    this.lastNoteFolder = n.folderId;
+    new Notice('已记笔记');
+    this.chat.emit({ type: 'notes', sessionId: s.id, nodeId: node.id });
+  }
+
+  async editNote(n) {
+    const r = await openNoteEditor(this.app, this.chat.notes, { note: n });
+    if (r) this.chat.emit({ type: 'notes', sessionId: n.sessionId, nodeId: n.nodeId });
+  }
+
+  async openNoteSource(n) {
+    this.closeDrawers();
+    const s = await this.chat.store.get(n.sessionId);
+    if (!s) return new Notice('原对话已被删除');
+    const node = s.nodes[n.nodeId];
+    if (!node) return new Notice('原来的窗口已被删除');
+    this.pendingFocusNote = n.id;
+    this.pendingFocusMsg = node.messages.some((m) => m.id === n.msgId) ? n.msgId : null;
+    if (!this.pendingFocusMsg) {
+      this.pendingFocusNote = null;
+      new Notice('那条回答已被删除，打开所在窗口');
+    }
+    if (this.session && this.session.id === s.id) {
+      this.mode = 'chat';
+      this.nodeId = node.id;
+      this.expanded.clear();
+      this.renderNav();
+      this.renderMain('top');
+      this.renderSide();
+    } else await this.openSession(s.id, node.id);
+  }
+
+  async renderNoteNav(el, tok) {
+    const notes = this.chat.notes;
+    await notes.load();
+    if (tok !== this.navTok) return;
+    if (!this.notesKey || (this.notesKey !== 'all' && this.notesKey !== 'none' && !notes.folder(this.notesKey))) this.notesKey = 'all';
+    const head = el.createDiv({ cls: 'cmf-nav-label cmf-fav-head' });
+    head.createSpan({ text: '笔记' });
+    const tools = head.createSpan({ cls: 'cmf-fav-tools' });
+    const tool = (icon, label, fn) => {
+      const t = tools.createSpan({ cls: 'cmf-fav-tool', attr: { 'aria-label': label } });
+      obsidian.setIcon(t, icon);
+      t.addEventListener('click', (e) => {
+        e.stopPropagation();
+        fn();
+      });
+    };
+    const newFolder = async (parentId) => {
+      const name = await promptText(this.app, parentId ? `在「${notes.folder(parentId).name}」里新建文件夹` : '新建笔记文件夹', '文件夹名称');
+      if (!name) return;
+      const f = notes.addFolder(name, parentId);
+      this.notesKey = f.id;
+      this.renderNav();
+      this.renderMain();
+    };
+    tool('folder-plus', '新建文件夹', () => newFolder(this.notesKey !== 'all' && this.notesKey !== 'none' ? this.notesKey : null));
+    tool('message-square', '返回对话', () => {
+      this.mode = 'chat';
+      this.renderNav();
+      this.renderMain('top');
+    });
+
+    const listEl = el.createDiv({ cls: 'cmf-fav' });
+    const select = (key) => {
+      this.notesKey = key;
+      this.closeDrawers();
+      this.renderNav();
+      this.renderMain();
+    };
+    const fixed = (key, icon, name, n) => {
+      const r = listEl.createDiv({ cls: 'cmf-fav-row cmf-note-nav' + (this.notesKey === key ? ' is-active' : '') });
+      obsidian.setIcon(r.createSpan({ cls: 'cmf-fav-icon' }), icon);
+      r.createSpan({ cls: 'cmf-fav-name', text: name });
+      if (n) r.createSpan({ cls: 'cmf-fav-count', text: String(n) });
+      r.addEventListener('click', () => select(key));
+    };
+    fixed('all', 'notebook', '全部笔记', notes.data.items.length);
+    fixed('none', 'inbox', '未分类', notes.list('none').length);
+
+    const folderMenu = (evt, f) => {
+      evt.preventDefault();
+      evt.stopPropagation();
+      const menu = new obsidian.Menu();
+      menu.addItem((i) => i.setTitle('新建子文件夹').setIcon('folder-plus').onClick(() => newFolder(f.id)));
+      menu.addItem((i) =>
+        i
+          .setTitle('重命名')
+          .setIcon('pencil')
+          .onClick(async () => {
+            const name = await promptText(this.app, '重命名文件夹', '文件夹名称', f.name);
+            if (!name) return;
+            notes.renameFolder(f.id, name);
+            this.renderNav();
+            this.renderMain();
+          })
+      );
+      menu.addItem((i) =>
+        i
+          .setTitle('移动到…')
+          .setIcon('folder-input')
+          .onClick(async () => {
+            const to = await pickFolder(this.app, notes, {
+              title: `移动「${f.name}」到`,
+              okText: '移动',
+              exclude: f.id,
+              allowRoot: true,
+              selected: f.parentId || '',
+            });
+            if (to === null) return;
+            notes.moveFolder(f.id, to || null);
+            this.renderNav();
+            this.renderMain();
+          })
+      );
+      menu.addItem((i) =>
+        i
+          .setTitle('删除文件夹')
+          .setIcon('trash')
+          .onClick(async () => {
+            const n = notes.count(f.id);
+            const msg = n ? `删除「${f.name}」及其子文件夹？里面的 ${n} 条笔记会移到「未分类」，不会被删除。` : `删除「${f.name}」？`;
+            if (!(await confirmModal(this.app, '删除文件夹', msg, '删除'))) return;
+            notes.removeFolder(f.id);
+            if (this.notesKey === f.id) this.notesKey = 'all';
+            this.renderNav();
+            this.renderMain();
+          })
+      );
+      menu.showAtMouseEvent(evt);
+    };
+
+    if (notes.data.folders.length) listEl.createDiv({ cls: 'cmf-note-nav-sep', text: '文件夹' });
+    const walk = (parentId, depth) => {
+      for (const f of notes.children(parentId)) {
+        const kids = notes.children(f.id).length;
+        const row = listEl.createDiv({
+          cls: 'cmf-fav-row cmf-fav-folder' + (f.collapsed ? ' is-collapsed' : '') + (this.notesKey === f.id ? ' is-active' : ''),
+        });
+        row.style.paddingLeft = `${6 + depth * 14}px`;
+        const chev = row.createSpan({ cls: 'cmf-fav-chev' + (kids ? '' : ' is-leaf') });
+        obsidian.setIcon(chev, 'chevron-down');
+        chev.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (!kids) return;
+          f.collapsed = !f.collapsed;
+          notes.save();
+          this.renderNav();
+        });
+        obsidian.setIcon(row.createSpan({ cls: 'cmf-fav-icon' }), this.notesKey === f.id ? 'folder-open' : 'folder');
+        row.createSpan({ cls: 'cmf-fav-name', text: f.name });
+        const n = notes.count(f.id);
+        if (n) row.createSpan({ cls: 'cmf-fav-count', text: String(n) });
+        const more = row.createSpan({ cls: 'cmf-fav-more', attr: { 'aria-label': '更多' } });
+        obsidian.setIcon(more, 'more-horizontal');
+        more.addEventListener('click', (e) => folderMenu(e, f));
+        row.addEventListener('click', () => select(f.id));
+        row.addEventListener('contextmenu', (e) => folderMenu(e, f));
+        if (!f.collapsed) walk(f.id, depth + 1);
+      }
+    };
+    walk(null, 0);
+  }
+
+  renderNotesPage(el) {
+    const notes = this.chat.notes;
+    this.msgsEl = null;
+    this.inputEl = null;
+    this.sendBtn = null;
+    this.replyEl = null;
+    if (!notes.data) {
+      notes.load().then(() => this.mode === 'notes' && this.renderMain());
+      return;
+    }
+    const key = this.notesKey || 'all';
+    const title = key === 'all' ? '全部笔记' : key === 'none' ? '未分类' : notes.pathName(key) || '全部笔记';
+
+    const head = el.createDiv({ cls: 'cmf-head' });
+    const navToggle = head.createDiv({ cls: 'cmf-icon-btn cmf-panel-toggle', attr: { 'aria-label': '展开 / 收起左侧栏' } });
+    obsidian.setIcon(navToggle, 'panel-left');
+    navToggle.addEventListener('click', () => this.togglePanel('nav'));
+    this.navToggleEl = navToggle;
+    const titleEl = head.createDiv({ cls: 'cmf-head-title' });
+    titleEl.createDiv({ cls: 'cmf-head-path', text: '笔记' });
+    titleEl.createDiv({ cls: 'cmf-head-main', text: title });
+    const sideToggle = head.createDiv({ cls: 'cmf-icon-btn cmf-panel-toggle', attr: { 'aria-label': '展开 / 收起右侧栏' } });
+    obsidian.setIcon(sideToggle, 'panel-right');
+    sideToggle.addEventListener('click', () => this.togglePanel('side'));
+    this.sideToggleEl = sideToggle;
+    this.applyLayout();
+
+    const page = el.createDiv({ cls: 'cmf-msgs cmf-notes' });
+    const all = notes.list(key);
+    const bar = page.createDiv({ cls: 'cmf-notes-bar' });
+    const search = bar.createEl('input', { cls: 'cmf-notes-search', attr: { type: 'search', placeholder: `在 ${all.length} 条笔记里搜索…` } });
+    search.value = this.notesQuery || '';
+    const listEl = page.createDiv({ cls: 'cmf-notes-list' });
+
+    const renderList = () => {
+      for (const c of this.notesComps || []) c.unload();
+      this.notesComps = [];
+      listEl.empty();
+      const q = (this.notesQuery || '').trim().toLowerCase();
+      const shown = q
+        ? all.filter((n) => [n.content, n.anchor && n.anchor.text, n.sessionTitle, n.nodeTitle].some((x) => String(x || '').toLowerCase().includes(q)))
+        : all;
+      if (!shown.length) {
+        const empty = listEl.createDiv({ cls: 'cmf-empty' });
+        empty.createDiv({ cls: 'cmf-empty-title', text: q ? '没有匹配的笔记' : '这里还没有笔记' });
+        if (!q) empty.createDiv({ cls: 'cmf-empty-sub', text: '在对话的回答里划选一段文字，右键「记笔记…」（或在划线弹窗里点「笔记」），写下看到这句话时的想法。' });
+        return;
+      }
+      for (const n of shown) this.renderNoteCard(listEl, n, key === 'all' || key === 'none' ? true : n.folderId !== key);
+    };
+    search.addEventListener('input', () => {
+      this.notesQuery = search.value;
+      renderList();
+    });
+    renderList();
+  }
+
+  renderNoteCard(parent, n, showFolder) {
+    const notes = this.chat.notes;
+    const card = parent.createDiv({ cls: 'cmf-note-card' });
+    const quote = card.createDiv({ cls: 'cmf-note-quote markdown-rendered' });
+    this.notesComps.push(renderMdInto(this.app, quote, n.anchor ? n.anchor.text : ''));
+    const body = card.createDiv({ cls: 'cmf-note-body markdown-rendered' });
+    if (n.content) this.notesComps.push(renderMdInto(this.app, body, n.content));
+    else body.createDiv({ cls: 'cmf-note-blank', text: '（没有写想法，点 ✏️ 补充）' });
+
+    const foot = card.createDiv({ cls: 'cmf-note-foot' });
+    const from = foot.createDiv({ cls: 'cmf-note-src', attr: { 'aria-label': '跳转到当时划线的对话' } });
+    obsidian.setIcon(from.createSpan({ cls: 'cmf-note-src-icon' }), 'corner-up-left');
+    const t = [n.sessionTitle, n.nodeTitle && n.nodeTitle !== n.sessionTitle ? n.nodeTitle : null].filter(Boolean).join(' › ');
+    from.createSpan({ text: truncate(t || '原对话', 40) });
+    const meta = foot.createDiv({ cls: 'cmf-note-meta' });
+    if (showFolder && n.folderId && notes.folder(n.folderId)) {
+      const chip = meta.createSpan({ cls: 'cmf-note-chip' });
+      obsidian.setIcon(chip.createSpan(), 'folder');
+      chip.createSpan({ text: notes.folder(n.folderId).name });
+    }
+    meta.createSpan({ text: fmtTime(n.updatedAt || n.addedAt) });
+    const acts = foot.createDiv({ cls: 'cmf-note-acts' });
+    const act = (icon, label, fn) => {
+      const b = acts.createDiv({ cls: 'cmf-icon-btn', attr: { 'aria-label': label } });
+      obsidian.setIcon(b, icon);
+      b.addEventListener('click', (e) => {
+        e.stopPropagation();
+        fn();
+      });
+    };
+    const move = async () => {
+      const to = await pickFolder(this.app, notes, { title: '移动笔记到', okText: '移动', allowRoot: true, rootLabel: '未分类', selected: n.folderId || '' });
+      if (to === null) return;
+      notes.updateNote(n.id, { folderId: to || null });
+      this.chat.emit({ type: 'notes' });
+    };
+    const del = async () => {
+      if (!(await confirmModal(this.app, '删除笔记', '删除这条笔记？此操作不可撤销。', '删除'))) return;
+      notes.data.items = notes.data.items.filter((x) => x.id !== n.id);
+      notes.save();
+      this.chat.emit({ type: 'notes' });
+    };
+    act('pencil', '编辑笔记', () => this.editNote(n));
+    act('folder-input', '移动到文件夹', move);
+    act('copy', '复制（Markdown）', async () => {
+      const md = `> ${String(n.anchor ? n.anchor.text : '').replace(/\n/g, '\n> ')}\n\n${n.content || ''}`;
+      new Notice((await copyText(md)) ? '已复制' : '复制失败');
+    });
+    act('trash-2', '删除笔记', del);
+
+    card.addEventListener('click', (e) => {
+      if (e.target instanceof Element && e.target.closest('a, .cmf-icon-btn')) return;
+      if ((document.getSelection() || {}).isCollapsed === false) return;
+      this.openNoteSource(n);
+    });
+    card.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      const menu = new obsidian.Menu();
+      menu.addItem((i) => i.setTitle('跳转到原对话').setIcon('corner-up-left').onClick(() => this.openNoteSource(n)));
+      menu.addItem((i) => i.setTitle('编辑笔记').setIcon('pencil').onClick(() => this.editNote(n)));
+      menu.addItem((i) => i.setTitle('移动到文件夹…').setIcon('folder-input').onClick(move));
+      menu.addSeparator();
+      menu.addItem((i) => i.setTitle('删除笔记').setIcon('trash-2').onClick(del));
+      menu.showAtMouseEvent(e);
+    });
+  }
+
+  // ── 收藏夹 ─────────────────────────────────────────────
+  /** 收藏当前窗口里的一轮问答（msgId = AI 回答） */
+  favoriteRound(msgId) {
+    const s = this.session;
+    const node = this.node;
+    if (!s || !node) return;
+    const i = node.messages.findIndex((x) => x.id === msgId);
+    if (i < 0) return;
+    const q = i > 0 && node.messages[i - 1].role === 'user' ? node.messages[i - 1].content : node.title;
+    this.chat.addToFavorites({ type: 'qa', sessionId: s.id, nodeId: node.id, msgId, title: truncate(q || node.title || '问答', 60) });
+  }
+
+  async openFavItem(it) {
+    this.closeDrawers();
+    const s = await this.chat.store.get(it.sessionId);
+    if (!s) return new Notice('这个对话已被删除');
+    if (it.type === 'qa') {
+      const node = s.nodes[it.nodeId];
+      if (!node) return new Notice('这个窗口已被删除');
+      if (!node.messages.some((m) => m.id === it.msgId)) new Notice('这条回答已被删除，打开所在窗口');
+      else this.pendingFocusMsg = it.msgId;
+      if (this.session && this.session.id === s.id) {
+        if (this.nodeId === node.id) this.applyPendingFocus();
+        else this.openNode(node.id);
+        this.renderNav();
+      } else await this.openSession(s.id, node.id);
+    } else await this.openSession(s.id);
+  }
+
+  async renderFavs(el, tok) {
+    const fav = this.chat.fav;
+    await fav.load();
+    if (tok !== this.navTok) return;
+    const head = el.createDiv({ cls: 'cmf-nav-label cmf-fav-head' });
+    head.createSpan({ text: '收藏夹' });
+    const tools = head.createSpan({ cls: 'cmf-fav-tools' });
+    const tool = (icon, label, fn) => {
+      const t = tools.createSpan({ cls: 'cmf-fav-tool', attr: { 'aria-label': label } });
+      obsidian.setIcon(t, icon);
+      t.addEventListener('click', (e) => {
+        e.stopPropagation();
+        fn();
+      });
+    };
+    const newFolder = async (parentId) => {
+      const name = await promptText(this.app, parentId ? `在「${fav.folder(parentId).name}」里新建收藏夹` : '新建收藏夹', '收藏夹名称');
+      if (!name) return;
+      fav.addFolder(name, parentId);
+      this.renderNav();
+    };
+    tool('folder-plus', '新建收藏夹', () => newFolder(null));
+    tool('layout-dashboard', '全部收藏夹生成 Canvas', () => {
+      if (!fav.data.folders.length) return new Notice('还没有收藏夹');
+      this.chat.exportFolderCanvas(null);
+    });
+    tool('history', '返回历史', () => {
+      this.navMode = 'history';
+      this.renderNav();
+    });
+
+    const listEl = el.createDiv({ cls: 'cmf-fav' });
+    if (!fav.data.folders.length) {
+      const empty = listEl.createDiv({ cls: 'cmf-hist-empty' });
+      empty.setText('还没有收藏夹。点右上角 + 新建，或在回答 / 历史对话上右键「加入收藏夹」。');
+      return;
+    }
+
+    const folderMenu = (evt, f) => {
+      evt.preventDefault();
+      evt.stopPropagation();
+      const menu = new obsidian.Menu();
+      menu.addItem((i) => i.setTitle('新建子收藏夹').setIcon('folder-plus').onClick(() => newFolder(f.id)));
+      menu.addItem((i) =>
+        i
+          .setTitle('加入已有对话…')
+          .setIcon('message-square-plus')
+          .onClick(async () => {
+            const s = await pickSession(this.app, await this.chat.store.list());
+            if (!s) return;
+            const r = fav.addItem(f.id, { type: 'session', sessionId: s.id, title: s.title || '未命名对话' });
+            f.collapsed = false;
+            new Notice(r.existed ? '这个对话已经在收藏夹里了' : `已加入「${f.name}」`);
+            this.renderNav();
+          })
+      );
+      menu.addItem((i) => i.setTitle('生成 Canvas').setIcon('layout-dashboard').onClick(() => this.chat.exportFolderCanvas(f.id)));
+      menu.addSeparator();
+      menu.addItem((i) =>
+        i
+          .setTitle('重命名')
+          .setIcon('pencil')
+          .onClick(async () => {
+            const name = await promptText(this.app, '重命名收藏夹', '收藏夹名称', f.name);
+            if (!name) return;
+            fav.renameFolder(f.id, name);
+            this.renderNav();
+          })
+      );
+      menu.addItem((i) =>
+        i
+          .setTitle('移动到…')
+          .setIcon('folder-input')
+          .onClick(async () => {
+            const to = await pickFolder(this.app, fav, { title: `移动「${f.name}」到`, okText: '移动', exclude: f.id, allowRoot: true, selected: f.parentId || '' });
+            if (to === null) return;
+            fav.moveFolder(f.id, to || null);
+            this.renderNav();
+          })
+      );
+      menu.addItem((i) =>
+        i
+          .setTitle('删除收藏夹')
+          .setIcon('trash')
+          .onClick(async () => {
+            const n = fav.count(f.id);
+            const msg = n ? `删除「${f.name}」及其子收藏夹？里面的 ${n} 条收藏会被移除（对话本身不受影响）。` : `删除「${f.name}」？`;
+            if (!(await confirmModal(this.app, '删除收藏夹', msg, '删除'))) return;
+            fav.removeFolder(f.id);
+            this.renderNav();
+          })
+      );
+      menu.showAtMouseEvent(evt);
+    };
+
+    const itemMenu = (evt, it) => {
+      evt.preventDefault();
+      evt.stopPropagation();
+      const menu = new obsidian.Menu();
+      menu.addItem((i) => i.setTitle('打开').setIcon('external-link').onClick(() => this.openFavItem(it)));
+      menu.addItem((i) =>
+        i
+          .setTitle('移动到…')
+          .setIcon('folder-input')
+          .onClick(async () => {
+            const to = await pickFolder(this.app, fav, { title: '移动到收藏夹', okText: '移动', selected: it.folderId });
+            if (!to) return;
+            fav.moveItem(it.id, to);
+            this.renderNav();
+          })
+      );
+      menu.addItem((i) =>
+        i
+          .setTitle('移出收藏夹')
+          .setIcon('star-off')
+          .onClick(() => {
+            fav.removeItem(it.id);
+            this.renderNav();
+          })
+      );
+      menu.showAtMouseEvent(evt);
+    };
+
+    const curMsgIds = new Set(this.node ? this.node.messages.map((m) => m.id) : []);
+    const walk = (parentId, depth) => {
+      for (const f of fav.children(parentId)) {
+        const row = listEl.createDiv({ cls: 'cmf-fav-row cmf-fav-folder' + (f.collapsed ? ' is-collapsed' : '') });
+        row.style.paddingLeft = `${6 + depth * 14}px`;
+        const chev = row.createSpan({ cls: 'cmf-fav-chev' });
+        obsidian.setIcon(chev, 'chevron-down');
+        obsidian.setIcon(row.createSpan({ cls: 'cmf-fav-icon' }), f.collapsed ? 'folder' : 'folder-open');
+        row.createSpan({ cls: 'cmf-fav-name', text: f.name });
+        const n = fav.count(f.id);
+        if (n) row.createSpan({ cls: 'cmf-fav-count', text: String(n) });
+        const more = row.createSpan({ cls: 'cmf-fav-more', attr: { 'aria-label': '更多' } });
+        obsidian.setIcon(more, 'more-horizontal');
+        more.addEventListener('click', (e) => folderMenu(e, f));
+        row.addEventListener('click', () => {
+          f.collapsed = !f.collapsed;
+          fav.save();
+          this.renderNav();
+        });
+        row.addEventListener('contextmenu', (e) => folderMenu(e, f));
+        if (f.collapsed) continue;
+        walk(f.id, depth + 1);
+        for (const it of fav.itemsIn(f.id)) {
+          const active =
+            it.type === 'qa'
+              ? this.session && this.session.id === it.sessionId && curMsgIds.has(it.msgId)
+              : this.session && this.session.id === it.sessionId;
+          const r = listEl.createDiv({ cls: 'cmf-fav-row cmf-fav-item' + (active ? ' is-active' : '') });
+          r.style.paddingLeft = `${6 + (depth + 1) * 14 + 16}px`;
+          obsidian.setIcon(r.createSpan({ cls: 'cmf-fav-icon' }), it.type === 'qa' ? 'message-square' : 'messages-square');
+          r.createSpan({ cls: 'cmf-fav-name', text: it.title || (it.type === 'qa' ? '问答' : '对话') });
+          r.setAttr('aria-label', it.type === 'qa' ? `问答：${it.title}` : `整个对话：${it.title}`);
+          r.addEventListener('click', () => this.openFavItem(it));
+          r.addEventListener('contextmenu', (e) => itemMenu(e, it));
+        }
+      }
+    };
+    walk(null, 0);
+  }
+
+  focusMessage(nodeId, msgId) {
+    this.pendingFocusMsg = msgId;
+    if (nodeId !== this.nodeId) {
+      this.openNode(nodeId);
+    } else {
+      this.closeDrawers();
+      this.applyPendingFocus();
+    }
+  }
+
+  applyPendingFocus() {
+    const msgId = this.pendingFocusMsg;
+    if (!msgId) return;
+    this.pendingFocusMsg = null;
+    const tryScroll = (n) => {
+      const el = this.msgsEl && this.msgsEl.querySelector(`.cmf-msg[data-msg="${msgId}"]`);
+      if (!el) {
+        if (n > 0) setTimeout(() => tryScroll(n - 1), 80);
+        return;
+      }
+      const noteId = this.pendingFocusNote;
+      this.pendingFocusNote = null;
+      const marks = noteId ? Array.from(el.querySelectorAll(`[data-note="${noteId}"]`)) : [];
+      const target = marks.length ? marks : [el];
+      target[0].scrollIntoView({ block: marks.length ? 'center' : 'start', behavior: 'smooth' });
+      for (const t of target) t.addClass('is-flash');
+      setTimeout(() => target.forEach((t) => t.removeClass('is-flash')), 1600);
+    };
+    // 等 Markdown 渲染完再滚动
+    setTimeout(() => tryScroll(10), 150);
+  }
+}
+
+module.exports._chat = { highlightAnchor, markSelectedMath, paintMath, normalizeMath, buildThreadMessages, chainOf, childrenOf, subtreeIds, highlightInEl };
+
+// ═════════════════════════════════════════════════════════════
+// 收藏夹：多级文件夹，收藏「一轮问答」或「整个对话」，可整夹导出为 Canvas
+//
+// 存在 <chatFolder>/收藏夹.json：
+//   { version, folders: [{ id, name, parentId|null, createdAt, collapsed? }],
+//     items:   [{ id, folderId, type: 'qa'|'session', sessionId, nodeId?, msgId?, title, addedAt }] }
+// ═════════════════════════════════════════════════════════════
+
+class FavStore {
+  constructor(chat) {
+    this.chat = chat;
+    this.data = null;
+    this.timer = null;
+  }
+
+  get adapter() {
+    return this.chat.app.vault.adapter;
+  }
+
+  path() {
+    return `${this.chat.store.folder()}/收藏夹.json`;
+  }
+
+  async load() {
+    if (this.data) return this.data;
+    let d = null;
+    try {
+      if (await this.adapter.exists(this.path())) d = JSON.parse(await this.adapter.read(this.path()));
+    } catch (e) {
+      console.error('Canvas Mindflow: 读取收藏夹失败', e);
+    }
+    if (!d || typeof d !== 'object') d = {};
+    if (!Array.isArray(d.folders)) d.folders = [];
+    if (!Array.isArray(d.items)) d.items = [];
+    d.version = 1;
+    this.data = d;
+    return d;
+  }
+
+  save(immediate) {
+    clearTimeout(this.timer);
+    const write = async () => {
+      this.timer = null;
+      try {
+        await this.chat.store.ensureDir(this.chat.store.folder());
+        await this.adapter.write(this.path(), JSON.stringify(this.data, null, 1));
+      } catch (e) {
+        console.error('Canvas Mindflow: 保存收藏夹失败', e);
+      }
+    };
+    if (immediate) return write();
+    this.timer = setTimeout(write, 300);
+  }
+
+  async flush() {
+    if (this.timer) await this.save(true);
+  }
+
+  folder(id) {
+    return this.data ? this.data.folders.find((f) => f.id === id) || null : null;
+  }
+
+  children(parentId) {
+    return this.data.folders.filter((f) => (f.parentId || null) === (parentId || null)).sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  itemsIn(folderId) {
+    return this.data.items.filter((i) => i.folderId === folderId).sort((a, b) => a.addedAt - b.addedAt);
+  }
+
+  /** 这个收藏夹及其所有子收藏夹的 id */
+  subtree(id) {
+    const out = [id];
+    for (let k = 0; k < out.length; k++) for (const c of this.children(out[k])) out.push(c.id);
+    return out;
+  }
+
+  /** 收藏夹及子收藏夹里的条目总数 */
+  count(id) {
+    const ids = new Set(this.subtree(id));
+    return this.data.items.filter((i) => ids.has(i.folderId)).length;
+  }
+
+  pathName(id) {
+    const names = [];
+    for (let f = this.folder(id); f; f = this.folder(f.parentId)) names.unshift(f.name);
+    return names.join(' / ');
+  }
+
+  addFolder(name, parentId) {
+    const f = { id: uid(), name: name.trim() || '未命名收藏夹', parentId: parentId || null, createdAt: Date.now() };
+    this.data.folders.push(f);
+    if (parentId) {
+      const p = this.folder(parentId);
+      if (p) p.collapsed = false;
+    }
+    this.save();
+    return f;
+  }
+
+  renameFolder(id, name) {
+    const f = this.folder(id);
+    if (!f || !name.trim()) return;
+    f.name = name.trim();
+    this.save();
+  }
+
+  removeFolder(id) {
+    const ids = new Set(this.subtree(id));
+    this.data.folders = this.data.folders.filter((f) => !ids.has(f.id));
+    this.data.items = this.data.items.filter((i) => !ids.has(i.folderId));
+    this.save();
+  }
+
+  /** 移动收藏夹（不能移到自己或自己的子收藏夹里） */
+  moveFolder(id, parentId) {
+    if (parentId && this.subtree(id).includes(parentId)) return false;
+    const f = this.folder(id);
+    if (!f) return false;
+    f.parentId = parentId || null;
+    this.save();
+    return true;
+  }
+
+  /** 加入条目；同一收藏夹里重复收藏同一内容时返回已有条目 */
+  addItem(folderId, item) {
+    const dup = this.data.items.find(
+      (i) => i.folderId === folderId && i.type === item.type && i.sessionId === item.sessionId && (i.msgId || null) === (item.msgId || null)
+    );
+    if (dup) return { item: dup, existed: true };
+    const it = Object.assign({ id: uid(), folderId, addedAt: Date.now() }, item);
+    this.data.items.push(it);
+    this.save();
+    return { item: it, existed: false };
+  }
+
+  removeItem(id) {
+    this.data.items = this.data.items.filter((i) => i.id !== id);
+    this.save();
+  }
+
+  moveItem(id, folderId) {
+    const it = this.data.items.find((i) => i.id === id);
+    if (!it) return;
+    it.folderId = folderId;
+    this.save();
+  }
+
+  /** 对话被删除后，移除指向它的收藏 */
+  async forgetSession(sessionId) {
+    await this.load();
+    const n = this.data.items.length;
+    this.data.items = this.data.items.filter((i) => i.sessionId !== sessionId);
+    if (this.data.items.length !== n) this.save();
+  }
+}
+
+// ── 小弹窗 ─────────────────────────────────────────────────
+function promptText(app, title, placeholder, value) {
+  return new Promise((resolve) => {
+    const m = new obsidian.Modal(app);
+    let result = null;
+    m.titleEl.setText(title);
+    const input = m.contentEl.createEl('input', { cls: 'cmf-prompt-input', attr: { type: 'text', placeholder: placeholder || '' } });
+    input.value = value || '';
+    const row = m.contentEl.createDiv({ cls: 'modal-button-container' });
+    row.createEl('button', { text: '取消' }).addEventListener('click', () => m.close());
+    const ok = row.createEl('button', { text: '确定', cls: 'mod-cta' });
+    const done = () => {
+      if (!input.value.trim()) return input.focus();
+      result = input.value.trim();
+      m.close();
+    };
+    ok.addEventListener('click', done);
+    input.addEventListener('keydown', (e) => {
+      if (e.isComposing) return;
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        done();
+      }
+    });
+    m.onClose = () => resolve(result);
+    m.open();
+    setTimeout(() => {
+      input.focus();
+      input.select();
+    }, 30);
+  });
+}
+
+/** 选择收藏夹（可以在里面新建），返回 folderId 或 null */
+function pickFolder(app, fav, opts = {}) {
+  return new Promise((resolve) => {
+    const m = new obsidian.Modal(app);
+    let result = null;
+    let selected = opts.selected && fav.folder(opts.selected) ? opts.selected : null;
+    m.titleEl.setText(opts.title || '加入收藏夹');
+    m.modalEl.addClass('cmf-picker-modal');
+    if (opts.subtitle) m.contentEl.createDiv({ cls: 'cmf-picker-sub', text: opts.subtitle });
+    const list = m.contentEl.createDiv({ cls: 'cmf-picker-list' });
+    const exclude = opts.exclude ? new Set(fav.subtree(opts.exclude)) : new Set();
+    const render = () => {
+      list.empty();
+      if (opts.allowRoot) {
+        const r = list.createDiv({ cls: 'cmf-picker-row' + (selected === '' ? ' is-selected' : '') });
+        obsidian.setIcon(r.createSpan({ cls: 'cmf-picker-icon' }), 'home');
+        r.createSpan({ text: opts.rootLabel || '（顶层）' });
+        r.addEventListener('click', () => {
+          selected = '';
+          render();
+        });
+      }
+      const walk = (parentId, depth) => {
+        for (const f of fav.children(parentId)) {
+          if (exclude.has(f.id)) continue;
+          const r = list.createDiv({ cls: 'cmf-picker-row' + (selected === f.id ? ' is-selected' : '') });
+          r.style.paddingLeft = `${8 + depth * 18}px`;
+          obsidian.setIcon(r.createSpan({ cls: 'cmf-picker-icon' }), 'folder');
+          r.createSpan({ text: f.name });
+          r.createSpan({ cls: 'cmf-picker-count', text: String(fav.count(f.id) || '') });
+          r.addEventListener('click', () => {
+            selected = f.id;
+            render();
+          });
+          r.addEventListener('dblclick', () => {
+            selected = f.id;
+            finish();
+          });
+          walk(f.id, depth + 1);
+        }
+      };
+      walk(null, 0);
+      if (!list.childElementCount) list.createDiv({ cls: 'cmf-picker-empty', text: '还没有收藏夹，先新建一个' });
+      ok.toggleAttribute('disabled', selected === null);
+    };
+    const row = m.contentEl.createDiv({ cls: 'modal-button-container cmf-picker-buttons' });
+    const add = row.createEl('button', { cls: 'cmf-picker-new' });
+    obsidian.setIcon(add.createSpan(), 'folder-plus');
+    add.createSpan({ text: '新建收藏夹' });
+    add.addEventListener('click', async () => {
+      const parent = selected || null;
+      const name = await promptText(app, parent ? `在「${fav.folder(parent).name}」里新建收藏夹` : '新建收藏夹', '收藏夹名称');
+      if (!name) return;
+      selected = fav.addFolder(name, parent).id;
+      render();
+    });
+    row.createEl('button', { text: '取消' }).addEventListener('click', () => m.close());
+    const ok = row.createEl('button', { text: opts.okText || '加入', cls: 'mod-cta' });
+    const finish = () => {
+      if (selected === null) return;
+      result = selected;
+      m.close();
+    };
+    ok.addEventListener('click', finish);
+    m.onClose = () => resolve(result);
+    render();
+    m.open();
+  });
+}
+
+/** 选择一个已有对话 */
+function pickSession(app, sessions) {
+  return new Promise((resolve) => {
+    const m = new obsidian.Modal(app);
+    let result = null;
+    m.titleEl.setText('加入已有对话');
+    m.modalEl.addClass('cmf-picker-modal');
+    const input = m.contentEl.createEl('input', { cls: 'cmf-prompt-input', attr: { type: 'text', placeholder: '搜索对话标题…' } });
+    const list = m.contentEl.createDiv({ cls: 'cmf-picker-list' });
+    const render = () => {
+      list.empty();
+      const q = input.value.trim().toLowerCase();
+      const hits = sessions.filter((s) => !q || (s.title || '').toLowerCase().includes(q));
+      if (!hits.length) list.createDiv({ cls: 'cmf-picker-empty', text: '没有匹配的对话' });
+      for (const s of hits) {
+        const r = list.createDiv({ cls: 'cmf-picker-row is-session' });
+        obsidian.setIcon(r.createSpan({ cls: 'cmf-picker-icon' }), 'messages-square');
+        const t = r.createDiv({ cls: 'cmf-picker-main' });
+        t.createDiv({ text: s.title || '未命名对话' });
+        t.createDiv({ cls: 'cmf-picker-sub', text: `${fmtTime(s.updatedAt)} · ${Object.keys(s.nodes).length} 个窗口` });
+        r.addEventListener('click', () => {
+          result = s;
+          m.close();
+        });
+      }
+    };
+    input.addEventListener('input', render);
+    m.onClose = () => resolve(result);
+    render();
+    m.open();
+    setTimeout(() => input.focus(), 30);
+  });
+}
+
+// ── 收藏夹 → Canvas ─────────────────────────────────────────
+/** 估算问答卡片高度（Canvas 卡片内部可滚动，这里只求大致合适） */
+function estimateCardHeight(md, width) {
+  const perLine = Math.max(10, Math.floor((width - 48) / 15));
+  let lines = 0;
+  for (const l of String(md).split('\n')) lines += Math.max(1, Math.ceil(l.length / perLine));
+  return Math.max(220, Math.min(720, 90 + lines * 22));
+}
+
+/** 生成一个收藏夹（含子收藏夹）的 Canvas 数据，坐标以 (0,0) 为左上角 */
+async function buildFolderCanvas(chat, fav, folderId) {
+  const PAD = 40;
+  const GAP = 60;
+  const MAX_ROW = 2400;
+  const QA_W = 460;
+
+  const shift = (part, dx, dy) => {
+    for (const n of part.nodes) {
+      n.x += dx;
+      n.y += dy;
+    }
+  };
+
+  const qaCard = async (it) => {
+    const s = await chat.store.get(it.sessionId);
+    const node = s && s.nodes[it.nodeId];
+    const i = node ? node.messages.findIndex((m) => m.id === it.msgId) : -1;
+    const link = `obsidian://${URI_ACTION}?session=${encodeURIComponent(it.sessionId)}&node=${encodeURIComponent(it.nodeId)}&msg=${encodeURIComponent(it.msgId)}`;
+    let text;
+    if (i < 0) {
+      text = `### ${it.title || '问答'}\n\n*（这条回答已被删除）*`;
+    } else {
+      const ans = node.messages[i];
+      const q = i > 0 && node.messages[i - 1].role === 'user' ? node.messages[i - 1].content : node.title;
+      const parts = [`### [${String(q || it.title).replace(/[[\]\n]/g, ' ').slice(0, 120)}](${link})`];
+      if (node.anchor && node.anchor.text) parts.push(`==${truncate(node.anchor.text.replace(/\n+/g, ' '), 60)}==`);
+      parts.push(normalizeMath(ans.content || ''));
+      text = parts.join('\n\n');
+    }
+    const h = estimateCardHeight(text, QA_W);
+    return { nodes: [{ id: it.id, type: 'text', text, x: 0, y: 0, width: QA_W, height: h, color: '5' }], edges: [], w: QA_W, h };
+  };
+
+  const sessionBlock = async (it) => {
+    const s = await chat.store.get(it.sessionId);
+    if (!s) {
+      const text = `### ${it.title || '对话'}\n\n*（这个对话已被删除）*`;
+      return { nodes: [{ id: it.id, type: 'text', text, x: 0, y: 0, width: 380, height: 160 }], edges: [], w: 380, h: 160 };
+    }
+    return chat.layoutSession(s, 0, 0, `${it.id}-`);
+  };
+
+  const build = async (fid) => {
+    const f = fav.folder(fid);
+    const blocks = [];
+    for (const it of fav.itemsIn(fid)) blocks.push(it.type === 'qa' ? await qaCard(it) : await sessionBlock(it));
+    for (const c of fav.children(fid)) blocks.push(await build(c.id));
+    const nodes = [];
+    const edges = [];
+    let x = PAD;
+    let y = PAD;
+    let rowH = 0;
+    let maxX = PAD + 320;
+    for (const b of blocks) {
+      if (x > PAD && x + b.w > MAX_ROW) {
+        x = PAD;
+        y += rowH + GAP;
+        rowH = 0;
+      }
+      shift(b, x, y);
+      nodes.push(...b.nodes);
+      edges.push(...b.edges);
+      x += b.w + GAP;
+      rowH = Math.max(rowH, b.h);
+      maxX = Math.max(maxX, x - GAP);
+    }
+    if (!blocks.length) {
+      nodes.push({ id: `${fid}-empty`, type: 'text', text: '*（空收藏夹）*', x: PAD, y: PAD, width: 260, height: 60 });
+      rowH = 60;
+    }
+    const w = maxX + PAD;
+    const h = y + rowH + PAD;
+    // 分组放在最前面，才会画在卡片下面
+    nodes.unshift({ id: `grp-${fid}`, type: 'group', label: f ? f.name : '收藏夹', x: 0, y: 0, width: w, height: h });
+    return { nodes, edges, w, h };
+  };
+
+  const ids = folderId ? [folderId] : fav.children(null).map((f) => f.id);
+  const nodes = [];
+  const edges = [];
+  let y = 0;
+  for (const id of ids) {
+    const part = await build(id);
+    shift(part, 0, y);
+    nodes.push(...part.nodes);
+    edges.push(...part.edges);
+    y += part.h + 120;
+  }
+  return { nodes, edges };
+}
+
+module.exports._fav = { FavStore, buildFolderCanvas, estimateCardHeight };
+module.exports._layoutSession = MindflowChat.prototype.layoutSession;
+
+// ═════════════════════════════════════════════════════════════
+// 想法笔记：对回答里划线的一段写下当时的想法，按（多级）文件夹分类
+//
+// 存在 <chatFolder>/想法笔记.json，结构与收藏夹相同：
+//   folders: [{ id, name, parentId|null, createdAt, collapsed? }]
+//   items:   [{ id, folderId|null, sessionId, nodeId, msgId, anchor: {text, plain?},
+//               content, sessionTitle, nodeTitle, addedAt, updatedAt }]
+// folderId 为 null 的笔记显示在「未分类」里。
+// ═════════════════════════════════════════════════════════════
+
+class NoteStore extends FavStore {
+  path() {
+    return `${this.chat.store.folder()}/想法笔记.json`;
+  }
+
+  note(id) {
+    return this.data ? this.data.items.find((n) => n.id === id) || null : null;
+  }
+
+  addNote(fields) {
+    const now = Date.now();
+    const n = Object.assign({ id: uid(), folderId: null, addedAt: now, updatedAt: now }, fields);
+    this.data.items.push(n);
+    this.save();
+    return n;
+  }
+
+  updateNote(id, patch) {
+    const n = this.note(id);
+    if (!n) return null;
+    Object.assign(n, patch, { updatedAt: Date.now() });
+    this.save();
+    return n;
+  }
+
+  /** 删除文件夹时笔记不删，移回「未分类」 */
+  removeFolder(id) {
+    const ids = new Set(this.subtree(id));
+    this.data.folders = this.data.folders.filter((f) => !ids.has(f.id));
+    for (const n of this.data.items) if (ids.has(n.folderId)) n.folderId = null;
+    this.save();
+  }
+
+  /** 某条消息上的所有笔记 */
+  notesOn(sessionId, nodeId, msgId) {
+    if (!this.data) return [];
+    return this.data.items.filter((n) => n.sessionId === sessionId && n.nodeId === nodeId && n.msgId === msgId);
+  }
+
+  /** 文件夹视图里要显示的笔记（新的在前）。key: 'all' | 'none' | folderId（含子文件夹） */
+  list(key) {
+    let arr = this.data.items;
+    if (key === 'none') arr = arr.filter((n) => !n.folderId || !this.folder(n.folderId));
+    else if (key && key !== 'all') {
+      const ids = new Set(this.subtree(key));
+      arr = arr.filter((n) => ids.has(n.folderId));
+    }
+    return arr.slice().sort((a, b) => b.addedAt - a.addedAt);
+  }
+
+  async forgetSession() {
+    /* 对话删掉后笔记仍然保留（只是不能再跳转） */
+  }
+}
+
+/** 渲染一段 Markdown（公式、加粗等），返回需要在关闭时卸载的 Component */
+function renderMdInto(app, el, md) {
+  const comp = new obsidian.Component();
+  comp.load();
+  obsidian.MarkdownRenderer.render(app, normalizeMath(md || ''), el, '', comp);
+  return comp;
+}
+
+/**
+ * 写 / 编辑笔记的弹窗。
+ * opts = { note? } 编辑已有笔记；或 { anchor, ctx: {sessionId,nodeId,msgId,sessionTitle,nodeTitle}, folderId? } 新建
+ * 返回保存后的笔记，取消返回 null；删除返回 { deleted: true }
+ */
+function openNoteEditor(app, notes, opts) {
+  return new Promise((resolve) => {
+    const m = new obsidian.Modal(app);
+    m.modalEl.addClass('cmf-note-modal');
+    const editing = opts.note || null;
+    const anchor = editing ? editing.anchor : opts.anchor;
+    let result = null;
+    const comps = [];
+    m.titleEl.setText(editing ? '编辑笔记' : '记笔记');
+
+    const quote = m.contentEl.createDiv({ cls: 'cmf-note-quote markdown-rendered' });
+    comps.push(renderMdInto(app, quote, anchor.text));
+    const src = editing || opts.ctx || {};
+    if (src.sessionTitle || src.nodeTitle) {
+      const from = m.contentEl.createDiv({ cls: 'cmf-note-from' });
+      from.setText(`来自：${[src.sessionTitle, src.nodeTitle && src.nodeTitle !== src.sessionTitle ? src.nodeTitle : null].filter(Boolean).join(' › ')}`);
+    }
+
+    const ta = m.contentEl.createEl('textarea', {
+      cls: 'cmf-note-input',
+      attr: { placeholder: '看到这句话时，你在想什么？（支持 Markdown 和 $公式$）', rows: '6' },
+    });
+    ta.value = editing ? editing.content || '' : '';
+
+    // 预览：输入时实时渲染
+    const prevWrap = m.contentEl.createDiv({ cls: 'cmf-note-preview-wrap' });
+    const prevLabel = prevWrap.createDiv({ cls: 'cmf-note-label', text: '预览' });
+    const prev = prevWrap.createDiv({ cls: 'cmf-note-preview markdown-rendered' });
+    let prevComp = null;
+    let prevTimer = null;
+    const updatePreview = () => {
+      if (prevComp) prevComp.unload();
+      prev.empty();
+      const v = ta.value.trim();
+      prevWrap.toggleClass('is-empty', !v);
+      prevLabel.toggleClass('is-hidden', !v);
+      if (v) prevComp = renderMdInto(app, prev, v);
+    };
+    ta.addEventListener('input', () => {
+      clearTimeout(prevTimer);
+      prevTimer = setTimeout(updatePreview, 250);
+    });
+
+    // 文件夹
+    let folderId = editing ? editing.folderId || null : opts.folderId || null;
+    if (folderId && !notes.folder(folderId)) folderId = null;
+    const frow = m.contentEl.createDiv({ cls: 'cmf-note-folder-row' });
+    frow.createSpan({ cls: 'cmf-note-label', text: '文件夹' });
+    const sel = frow.createEl('select', { cls: 'dropdown' });
+    const fillSelect = () => {
+      sel.empty();
+      sel.createEl('option', { text: '未分类', attr: { value: '' } });
+      const walk = (pid, depth) => {
+        for (const f of notes.children(pid)) {
+          sel.createEl('option', { text: `${'　'.repeat(depth)}${f.name}`, attr: { value: f.id } });
+          walk(f.id, depth + 1);
+        }
+      };
+      walk(null, 0);
+      sel.value = folderId || '';
+    };
+    sel.addEventListener('change', () => (folderId = sel.value || null));
+    const nf = frow.createEl('button', { cls: 'cmf-note-newfolder', attr: { 'aria-label': '新建文件夹（建在当前选中的文件夹里）' } });
+    obsidian.setIcon(nf.createSpan(), 'folder-plus');
+    nf.createSpan({ text: '新建文件夹' });
+    nf.addEventListener('click', async () => {
+      const name = await promptText(app, folderId ? `在「${notes.folder(folderId).name}」里新建文件夹` : '新建笔记文件夹', '文件夹名称');
+      if (!name) return;
+      folderId = notes.addFolder(name, folderId).id;
+      fillSelect();
+    });
+    fillSelect();
+
+    const row = m.contentEl.createDiv({ cls: 'modal-button-container' });
+    if (editing) {
+      const del = row.createEl('button', { text: '删除笔记', cls: 'mod-warning cmf-note-del' });
+      del.addEventListener('click', async () => {
+        if (!(await confirmModal(app, '删除笔记', '删除这条笔记？此操作不可撤销。', '删除'))) return;
+        notes.data.items = notes.data.items.filter((n) => n.id !== editing.id);
+        notes.save();
+        result = { deleted: true, id: editing.id };
+        m.close();
+      });
+    }
+    row.createEl('button', { text: '取消' }).addEventListener('click', () => m.close());
+    const ok = row.createEl('button', { text: '保存', cls: 'mod-cta' });
+    const save = () => {
+      const content = ta.value.trim();
+      if (editing) result = notes.updateNote(editing.id, { content, folderId });
+      else {
+        const c = opts.ctx;
+        result = notes.addNote({
+          folderId,
+          sessionId: c.sessionId,
+          nodeId: c.nodeId,
+          msgId: c.msgId,
+          sessionTitle: c.sessionTitle,
+          nodeTitle: c.nodeTitle,
+          anchor: Object.assign({}, anchor),
+          content,
+        });
+      }
+      m.close();
+    };
+    ok.addEventListener('click', save);
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.isComposing) {
+        e.preventDefault();
+        save();
+      }
+    });
+    m.contentEl.createDiv({ cls: 'cmf-note-hint', text: 'Ctrl/Cmd + Enter 保存' });
+
+    m.onClose = () => {
+      for (const c of comps) c.unload();
+      if (prevComp) prevComp.unload();
+      resolve(result);
+    };
+    updatePreview();
+    m.open();
+    setTimeout(() => ta.focus(), 30);
+  });
+}
+
+module.exports._notes = { NoteStore };
+
+// ═════════════════════════════════════════════════════════════
+// 附件：对话里加入图片 / 文件让 AI 分析
+//
+// 附件原件保存在 <chatFolder>/附件/ 里（随库同步，可在 Obsidian 里直接打开），
+// 消息里只记引用：msg.attachments = [{ id, kind: 'image'|'file', name, path, mime, size, text?, pages?, truncated? }]
+// 图片按 OpenAI 兼容的多模态格式发送（image_url + base64）；文件（PDF / 文本 / 代码）先提取文字再随问题发送。
+// ═════════════════════════════════════════════════════════════
+
+const ATT_TEXT_EXT = new Set(
+  'txt md markdown csv tsv json jsonl xml yaml yml toml ini cfg conf log html htm css scss less js mjs cjs ts tsx jsx py ipynb java c h cpp hpp cc cs go rs rb php swift kt kts m r sql sh bat ps1 lua dart scala tex bib vue svelte srt vtt'.split(
+    ' '
+  )
+);
+const ATT_IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
+const ATT_IMAGE_MAX_SIDE = 1600;
+
+function extOf(name) {
+  const m = /\.([^.\/\\]+)$/.exec(String(name || ''));
+  return m ? m[1].toLowerCase() : '';
+}
+
+function mimeOfExt(ext) {
+  return (
+    { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', pdf: 'application/pdf' }[ext] ||
+    'application/octet-stream'
+  );
+}
+
+function fmtSize(n) {
+  if (!n && n !== 0) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function attKind(file) {
+  const ext = extOf(file.name);
+  if ((file.type || '').startsWith('image/') || ATT_IMAGE_EXT.has(ext)) return 'image';
+  if (ext === 'pdf' || file.type === 'application/pdf') return 'pdf';
+  if ((file.type || '').startsWith('text/') || ATT_TEXT_EXT.has(ext)) return 'text';
+  return null;
+}
+
+/** 逐级创建库里的文件夹（让 Obsidian 立即索引到） */
+async function ensureVaultFolder(app, path) {
+  let cur = '';
+  for (const part of obsidian.normalizePath(path).split('/')) {
+    cur = cur ? `${cur}/${part}` : part;
+    const f = app.vault.getAbstractFileByPath(cur);
+    if (!f) {
+      try {
+        await app.vault.createFolder(cur);
+      } catch (_) {
+        /* 已存在 */
+      }
+    }
+  }
+}
+
+/** 把附件原件写进库里，返回路径 */
+async function saveAttachmentFile(chat, name, data) {
+  const dir = `${chat.store.folder()}/附件`;
+  await ensureVaultFolder(chat.app, dir);
+  const d = new Date();
+  const stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+  const base = String(name || '附件')
+    .replace(/[\\/:*?"<>|#^[\]]/g, ' ')
+    .trim()
+    .slice(-60) || '附件';
+  let path = `${dir}/${stamp}-${base}`;
+  for (let k = 2; chat.app.vault.getAbstractFileByPath(path); k++) {
+    const e = extOf(base);
+    path = `${dir}/${stamp}-${e ? base.slice(0, -(e.length + 1)) : base} ${k}${e ? '.' + e : ''}`;
+  }
+  await chat.app.vault.createBinary(path, data);
+  return path;
+}
+
+/** 大图缩小到最长边 1600px，减少请求体积（GIF 保持原样） */
+async function shrinkImage(file) {
+  const ext = extOf(file.name);
+  const raw = await file.arrayBuffer();
+  if (ext === 'gif' || !window.createImageBitmap) return { data: raw, ext: ext || 'png', mime: file.type || mimeOfExt(ext) };
+  try {
+    const bmp = await createImageBitmap(new Blob([raw], { type: file.type || mimeOfExt(ext) }));
+    const scale = Math.min(1, ATT_IMAGE_MAX_SIDE / Math.max(bmp.width, bmp.height));
+    if (scale >= 1 && raw.byteLength < 1.5 * 1024 * 1024 && ext !== 'bmp') {
+      bmp.close && bmp.close();
+      return { data: raw, ext: ext || 'png', mime: file.type || mimeOfExt(ext) };
+    }
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(bmp.width * scale));
+    c.height = Math.max(1, Math.round(bmp.height * scale));
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    bmp.close && bmp.close();
+    const keepPng = ext === 'png' && raw.byteLength < 3 * 1024 * 1024;
+    const blob = await new Promise((r) => c.toBlob(r, keepPng ? 'image/png' : 'image/jpeg', 0.88));
+    if (!blob) throw new Error('toBlob failed');
+    return { data: await blob.arrayBuffer(), ext: keepPng ? 'png' : 'jpg', mime: keepPng ? 'image/png' : 'image/jpeg' };
+  } catch (_) {
+    return { data: raw, ext: ext || 'png', mime: file.type || mimeOfExt(ext) };
+  }
+}
+
+/** 用 Obsidian 自带的 pdf.js 提取 PDF 文字 */
+async function extractPdfText(data) {
+  const pdfjs = await obsidian.loadPdfJs();
+  const doc = await pdfjs.getDocument({ data: new Uint8Array(data) }).promise;
+  const pages = [];
+  for (let i = 1; i <= doc.numPages; i++) {
+    const page = await doc.getPage(i);
+    const tc = await page.getTextContent();
+    let line = '';
+    let lastY = null;
+    const out = [];
+    for (const it of tc.items) {
+      const y = it.transform ? it.transform[5] : null;
+      if (lastY !== null && y !== null && Math.abs(y - lastY) > 2) {
+        out.push(line);
+        line = '';
+      }
+      line += it.str;
+      if (it.hasEOL) {
+        out.push(line);
+        line = '';
+      }
+      lastY = y;
+    }
+    if (line) out.push(line);
+    pages.push(`--- 第 ${i} 页 ---\n${out.join('\n').replace(/\n{3,}/g, '\n\n').trim()}`);
+  }
+  return { text: pages.join('\n\n'), pages: doc.numPages };
+}
+
+/**
+ * 处理一个用户选的 / 粘贴的 / 拖进来的文件，返回附件对象（失败时抛出带中文说明的错误）
+ */
+async function processUpload(chat, file) {
+  const kind = attKind(file);
+  const max = Math.max(2000, parseInt(chat.plugin.settings.attachMaxChars, 10) || 40000);
+  const limit = (t) => (t.length > max ? { text: t.slice(0, max) + '\n…（内容太长，后面已截断）', truncated: true } : { text: t });
+  if (kind === 'image') {
+    if (file.size > 30 * 1024 * 1024) throw new Error('图片太大（超过 30MB）');
+    const img = await shrinkImage(file);
+    let name = file.name || `图片.${img.ext}`;
+    if (!extOf(name) || extOf(name) !== img.ext) name = name.replace(/\.[^.]+$/, '') + '.' + img.ext;
+    if (/^image\.(png|jpe?g)$/i.test(name)) name = `粘贴的图片.${img.ext}`;
+    const path = await saveAttachmentFile(chat, name, img.data);
+    return { id: uid(), kind: 'image', name, path, mime: img.mime, size: img.data.byteLength };
+  }
+  if (kind === 'pdf') {
+    if (file.size > 60 * 1024 * 1024) throw new Error('PDF 太大（超过 60MB）');
+    const raw = await file.arrayBuffer();
+    const path = await saveAttachmentFile(chat, file.name || '文件.pdf', raw.slice(0));
+    let r;
+    try {
+      r = await extractPdfText(raw);
+    } catch (e) {
+      throw new Error('PDF 文字提取失败：' + ((e && e.message) || e));
+    }
+    if (!r.text.replace(/---.*?---/g, '').trim()) throw new Error('这个 PDF 里没有可提取的文字（可能是扫描件，可以截图后作为图片发送）');
+    return Object.assign({ id: uid(), kind: 'file', name: file.name, path, mime: 'application/pdf', size: file.size, pages: r.pages }, limit(r.text));
+  }
+  if (kind === 'text') {
+    if (file.size > 20 * 1024 * 1024) throw new Error('文件太大（超过 20MB）');
+    const raw = await file.arrayBuffer();
+    const path = await saveAttachmentFile(chat, file.name || '文件.txt', raw.slice(0));
+    const text = new TextDecoder('utf-8').decode(raw);
+    return Object.assign({ id: uid(), kind: 'file', name: file.name, path, mime: file.type || 'text/plain', size: file.size }, limit(text));
+  }
+  throw new Error(`暂不支持「${file.name}」这种文件（支持图片、PDF、文本 / Markdown / 代码 / CSV 等）`);
+}
+
+/** 文件类附件变成随问题发送的文字 */
+function attachmentsAsText(atts) {
+  let out = '';
+  for (const a of atts || []) {
+    if (a.kind !== 'file') continue;
+    out += `\n\n【附件：${a.name}${a.pages ? `，共 ${a.pages} 页` : ''}】\n${a.text || '（未能读取文字内容）'}`;
+  }
+  return out;
+}
+
+/** 把消息里标记的图片读出来，换成多模态格式 */
+async function materializeImages(app, messages) {
+  const out = [];
+  for (const m of messages) {
+    if (!m._images || !m._images.length) {
+      out.push({ role: m.role, content: m.content });
+      continue;
+    }
+    const parts = [{ type: 'text', text: m.content }];
+    for (const img of m._images) {
+      try {
+        const data = await app.vault.adapter.readBinary(img.path);
+        parts.push({ type: 'image_url', image_url: { url: `data:${img.mime || mimeOfExt(extOf(img.path))};base64,${obsidian.arrayBufferToBase64(data)}` } });
+      } catch (_) {
+        parts[0].text += `\n（图片「${img.name}」已找不到）`;
+      }
+    }
+    out.push({ role: m.role, content: parts });
+  }
+  return out;
+}
+
+module.exports._attach = { attKind, extOf, attachmentsAsText, materializeImages };
+
+module.exports._mathsel = { annotateMath, selectionToSource, markSelectedMath, setPendingHighlight, highlightAnchor };
+module.exports._classes = { CanvasMindflowPlugin, MindflowChat, MindflowChatView, MindflowSettingTab, CHAT_VIEW, DEFAULT_SETTINGS };
+
+  })(__mf, __mf.exports, (n) => (n === 'obsidian' ? obsidian : require(n)));
+  __mf.loaded = true;
+  return __mf.exports;
+}
+/* ======== MINDFLOW-END ======== */
+
+module.exports = class ResearchWorkbenchPlugin extends Plugin {
+  /* 移动端：量出底部悬浮工具栏挡住的高度，写进 --rw-nav-inset，输入框等据此让开 */
+  /* ---------- Mindflow（合并进来的划线追问对话） ---------- */
+  setupMindflow() {
+    const host = this;
+    const hooks = {
+      // 用工作台的 AI 设置时，请求交给工作台（处理深度思考、报错说明）；识图模型等单独模型仍走 Mindflow 自己的请求
+      useHost: (st) => !!st && st.useHostAi !== false && host.directAiReady() && (!st.model || st.model === host.settings.llmModel),
+      once: (msgs) => host.directChat(msgs, { quick: true }),
+      stream: (msgs, onDelta, signal) => host.directStream(msgs, onDelta, signal),
+    };
+    let M;
+    try { M = __loadMindflow(hooks); } catch (e) { console.error('[科研工作台] Mindflow 代码加载失败', e); this._mfReady = Promise.reject(e); this._mfReady.catch(() => {}); return; }
+    const C = (this.mfClasses = M._classes);
+    if (this.app.plugins && this.app.plugins.enabledPlugins && this.app.plugins.enabledPlugins.has && this.app.plugins.enabledPlugins.has('canvas-mindflow')) {
+      new Notice('Mindflow 已合并进科研工作台：请在 设置 → 第三方插件 里关掉独立的 Canvas Mindflow，避免重复', 10000);
+    }
+    const mf = new C.CanvasMindflowPlugin(this.app, this.manifest);
+    this.mindflow = mf;
+    // 设置存在工作台的 data.json 里（mindflow 字段）；第一次从旧插件目录搬过来
+    mf.loadData = async () => {
+      if (this.settings.mindflow) return this.settings.mindflow;
+      try {
+        const p = this.app.vault.configDir + '/plugins/canvas-mindflow/data.json';
+        if (await this.app.vault.adapter.exists(p)) { return JSON.parse(await this.app.vault.adapter.read(p)); }
+      } catch (e) { /* ignore */ }
+      return null;
+    };
+    mf.saveData = async (d) => { this.settings.mindflow = JSON.parse(JSON.stringify(d)); await this.saveSettings(); };
+    // AI 接口三项可以直接跟工作台共用（useHostAi）
+    let st = null;
+    Object.defineProperty(mf, 'settings', { configurable: true, get: () => st, set: (v) => { st = v; if (v) this.mfLinkAi(v); } });
+    const addCmd = mf.addCommand.bind(mf);
+    mf.addCommand = (c) => addCmd(Object.assign({}, c, { id: 'mindflow-' + c.id, name: 'Mindflow：' + c.name }));
+    mf.addSettingTab = (tab) => {
+      this.mfSettingTab = tab;
+      const orig = tab.display.bind(tab);
+      tab.display = () => { orig(); this.mfTrimSettings(tab.containerEl); };
+    };
+    const ol = mf.onload.bind(mf);
+    let ready;
+    this._mfReady = new Promise((r) => (ready = r));
+    mf.onload = async () => {
+      try { await ol(); } catch (e) { console.error('[科研工作台] Mindflow 启动失败', e); }
+      const chat = mf.chat;
+      if (chat) {
+        chat.openView = (sid, nid, fresh, msgId) => this.openMindflow({ sid, nid, fresh, msgId });
+        const av = chat.activeView.bind(chat);
+        chat.activeView = () => av() || this.mfActiveView();
+        const al = chat.applyLayoutSettings.bind(chat);
+        chat.applyLayoutSettings = (...a) => { al(...a); for (const v of this.mfViews()) { try { v.applyLayout(); } catch (e) { /* ignore */ } } };
+      }
+      ready();
+      // 以前单独打开过的「Mindflow 对话」窗格（旧插件留下的布局）：关掉，改到工作台的 Mindflow 标签里显示
+      const sweep = () => {
+        const ls = this.app.workspace.getLeavesOfType(C.CHAT_VIEW);
+        if (!ls.length) return;
+        const v = ls[0].view;
+        const sid = v && v.session && v.session.id;
+        const nid = v && v.nodeId;
+        for (const l of ls) { try { l.detach(); } catch (e) { /* ignore */ } }
+        this.openMindflow(sid ? { sid, nid } : {});
+      };
+      this.app.workspace.onLayoutReady(() => setTimeout(sweep, 300));
+      this.registerEvent(this.app.workspace.on('layout-change', () => { clearTimeout(this._mfSweepT); this._mfSweepT = setTimeout(sweep, 200); }));
+    };
+    this.addChild(mf);
+  }
+  mfLinkAi(obj) {
+    const host = this;
+    if (obj.useHostAi === undefined) obj.useHostAi = true;
+    for (const [k, hk] of [['apiBaseUrl', 'llmBase'], ['apiKey', 'llmKey'], ['model', 'llmModel']]) {
+      const d = Object.getOwnPropertyDescriptor(obj, k);
+      if (d && d.get) continue;
+      let own = obj[k];
+      Object.defineProperty(obj, k, {
+        enumerable: true, configurable: true,
+        get: () => (obj.useHostAi !== false && String(host.settings[hk] || '').trim() ? host.settings[hk] : own),
+        set: (v) => { if (obj.useHostAi !== false) { host.settings[hk] = v; host.saveSettingsSoon(); } else own = v; },
+      });
+    }
+  }
+  /* 用工作台 AI 时，Mindflow 设置里的「AI 服务」一节换成一句说明 */
+  mfTrimSettings(root) {
+    const st = this.mindflow && this.mindflow.settings;
+    if (!st || st.useHostAi === false || !root) return;
+    const heads = [...root.querySelectorAll('.setting-item-heading')];
+    const a = heads.find((x) => /AI 服务/.test(x.textContent));
+    if (!a) return;
+    const b = heads[heads.indexOf(a) + 1];
+    let n = a.nextSibling;
+    while (n && n !== b) { const nx = n.nextSibling; n.remove(); n = nx; }
+    const tip = document.createElement('div');
+    tip.className = 'setting-item-description rw-mf-ai-tip';
+    tip.textContent = '正在使用科研工作台的 AI 接口（上面「AI」一节：' + (this.settings.llmModel || '未设置模型') + '）。想给 Mindflow 单独配接口，关掉上面的「Mindflow 使用工作台的 AI 接口」。';
+    a.after(tip);
+  }
+  mfViews() {
+    return this.app.workspace.getLeavesOfType(VIEW_TYPE).map((l) => l.view && l.view.mfView).filter(Boolean);
+  }
+  mfActiveView() {
+    const leaf = this.app.workspace.activeLeaf;
+    const v = leaf && leaf.view;
+    return v && v.tab === 'mindflow' && v.mfView ? v.mfView : null;
+  }
+  /* 打开工作台的 Mindflow 标签（可指定对话 / 窗口 / 消息） */
+  async openMindflow(o) {
+    o = o || {};
+    try { await this._mfReady; } catch (e) { new Notice('Mindflow 没有加载成功'); return null; }
+    await this.activateView();
+    const leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
+    const wb = leaf && leaf.view;
+    if (!wb || !wb.showMindflow) return null;
+    if (wb.tab !== 'mindflow') wb.switchTab('mindflow');
+    const v = await wb.showMindflow();
+    if (!v) return null;
+    if (o.fresh) v.newChat();
+    else if (o.sid) { if (o.msgId) v.pendingFocusMsg = o.msgId; await v.openSession(o.sid, o.nid); }
+    return v;
+  }
+  updateNavInset() {
+    try {
+      const win = window;
+      let top = Infinity;
+      for (const bar of document.querySelectorAll('.mobile-navbar, .mobile-toolbar')) {
+        const r = bar.getBoundingClientRect();
+        const cs = getComputedStyle(bar);
+        if (!r.height || cs.display === 'none' || cs.visibility === 'hidden') continue;
+        if (r.top < win.innerHeight * 0.6) continue; // 只管贴底的那条
+        top = Math.min(top, r.top);
+      }
+      // 每个用到本插件的视图：算它底部被工具栏盖住多少
+      for (const vc of document.querySelectorAll('.view-content')) {
+        const sel = '.rw-mf, .rw-pr, .rw-root, .rw-htmlview';
+        if (!vc.matches(sel) && !vc.querySelector(sel)) continue;
+        const r = vc.getBoundingClientRect();
+        const ov = top === Infinity ? 0 : Math.max(0, Math.min(200, Math.round(r.bottom - top)));
+        const v = ov + 'px';
+        if (vc.style.getPropertyValue('--rw-nav-inset') !== v) vc.style.setProperty('--rw-nav-inset', v);
+      }
+    } catch (e) { /* ignore */ }
+  }
+  async onload() {
+    await this.loadSettings();
+    this.registerView(VIEW_TYPE, (leaf) => new WorkbenchView(leaf, this));
+    this.addRibbonIcon('flask-conical', '打开科研工作台', () => this.activateView());
+    this.addCommand({ id: 'open-workbench', name: '打开科研工作台', callback: () => this.activateView() });
+    this.addCommand({ id: 'open-mindflow', name: '打开 Mindflow 对话', callback: () => this.openMindflow() });
+    this.addCommand({ id: 'new-project', name: '新建科研项目', callback: () => this.newProjectModal() });
+    this.addCommand({ id: 'rename-project', name: '重命名当前项目', checkCallback: (chk) => { const nm = this.currentProjectName(); const p = nm && this.buildIndex().byName.get(nm); if (!p) return false; if (!chk) this.renameProjectPrompt(p); return true; } });
+    for (const k of Object.keys(NOTE_TYPES)) {
+      this.addCommand({ id: 'new-' + k, name: '新建' + NOTE_TYPES[k].label + '笔记', callback: () => this.newNoteModal({ type: k, project: this.currentProjectName() }) });
+    }
+    this.addCommand({ id: 'import-files', name: '导入文件到工作台', callback: () => this.pickFiles({ project: this.currentProjectName() }) });
+    this.addCommand({ id: 'zotero-import', name: '从 Zotero 导入文献', callback: () => this.zoteroImportModal({ project: this.currentProjectName() }) });
+    this.addCommand({ id: 'quick-log', name: '记录科研日志（刚刚做了什么）', callback: () => new TextPromptModal(this.app, '刚刚做了什么？（记录时间：现在）', '', async (v) => { if (v) { await this.addLog({ text: v }); new Notice('🕒 已记录'); } }).open() });
+    this.addCommand({ id: 'zotero-sync', name: '同步 Zotero 批注', callback: () => this.syncZoteroAnnotations() });
+    this.addCommand({ id: 'write-agent-guide', name: '生成 / 更新 CLAUDE.md 与 AGENTS.md', callback: () => this.writeAgentGuide() });
+    this.registerView(READER_VIEW, (leaf) => new ReaderView(leaf, this));
+    this.registerView(PAPER_READER_VIEW, (leaf) => new PaperReaderView(leaf, this));
+    this.setupMindflow();
+    // .html 直接在 Obsidian 里打开（论文 HTML 阅读页、速成手册等）
+    try {
+      this.registerView(HTML_VIEW, (leaf) => new HtmlFileView(leaf, this));
+      if (obsidian.FileView && this.registerExtensions) { this.registerExtensions(['html', 'htm'], HTML_VIEW); this._htmlViewOk = true; }
+    } catch (e) { console.warn('[科研工作台] .html 已被其他插件接管，HTML 将用系统浏览器打开', e); this._htmlViewOk = false; }
+    const ftCmd = (id, name, fn) => this.addCommand({ id, name, checkCallback: (chk) => { const pdf = this.ftPdfOfActive(); if (!pdf) return false; if (!chk) fn(pdf); return true; } });
+    ftCmd('ft-convert', '当前文献：PDF 转 Markdown', (pdf) => this.ftConvert(pdf));
+    ftCmd('ft-translate-ai', '当前文献：一键全文翻译（AI）', (pdf) => this.ftTranslate(pdf, 'ai'));
+    ftCmd('ft-translate-mt', '当前文献：一键全文翻译（机器翻译）', (pdf) => this.ftTranslate(pdf, 'machine'));
+    ftCmd('ft-html', '当前文献：生成并打开 HTML 阅读页', async (pdf) => { const f = await this.ftHtml(pdf); if (f) this.ftOpen(f); });
+    this.setupActivity();
+    this.addCommand({ id: 'open-activity', name: '打开全局记录（自动记录的文件操作）', callback: async () => { await this.activateView(); const l = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0]; if (l && l.view && l.view.switchTab) l.view.switchTab('activity'); } });
+    this.mfStore = new MindflowStore(this);
+    this.addRibbonIcon('book-open-check', '文献阅读面板（划词翻译）', () => this.activateReader(true));
+    this.addCommand({ id: 'open-reader', name: '打开文献阅读面板', callback: () => this.activateReader(true) });
+    this.addCommand({ id: 'translate-selection', name: '翻译选中的文字', callback: () => this.translateSelectionCommand() });
+    this.addCommand({ id: 'gloss-selection', name: '把选中文字的译文标在原文上方（Remarkble）', hotkeys: [{ modifiers: ['Alt', 'Shift'], key: 'T' }], callback: () => this.glossSelectionCommand() });
+    this.addCommand({ id: 'toggle-glosses', name: '显示 / 隐藏 PDF 上的译文', callback: async () => { this.settings.glossShow = this.settings.glossShow === false; await this.saveSettings(); this.repaintAllGlosses(); new Notice(this.settings.glossShow ? '已显示 PDF 上的译文' : '已隐藏 PDF 上的译文'); } });
+    this.addCommand({ id: 'ask-selection', name: '就选中文字向 AI 提问（阅读面板）', callback: () => { const ctx = this.selectionContext(this.curDoc(), true); if (!ctx) return new Notice('先选中一段文字'); this.askAboutQuote(ctx); } });
+    this.addCommand({ id: 'open-paper-reader', name: '用文献阅读视图打开当前文献（PDF + AI 问答）', checkCallback: (chk) => { const f = this.app.workspace.getActiveFile(); const c = f ? this.paperOf(f) : null; if (!c) return false; if (!chk) this.openPaperReader(c); return true; } });
+    this.addCommand({ id: 'toggle-auto-translate', name: '开 / 关 划词自动翻译', callback: async () => { const s = this.settings; s.transTrigger = s.transTrigger === 'off' ? 'auto' : 'off'; await this.saveSettings(); new Notice(s.transTrigger === 'off' ? '划词翻译：已关闭（仍可用命令翻译选中文字）' : '划词翻译：已开启'); } });
+    this.setupSelectionTranslate();
+    // 阅读视图的 PDF 里选中文字后右键：翻译 / 标注 / 划词按钮 / 摘录
+    this.registerDomEvent(document, 'contextmenu', (e) => {
+      const t = e.target;
+      if (!t || !t.closest || !t.closest('.rw-pdfv')) return;
+      // 手机 / 触屏：长按会触发 contextmenu，再弹一个菜单就和划词小窗重复了，交给小窗处理
+      if (IS_MOBILE || e.pointerType === 'touch' || (e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents)) return;
+      const ctx = this.selectionContext(document, true);
+      if (!ctx || !ctx.text) return;
+      e.preventDefault(); e.stopPropagation();
+      const pop = this.popupFor(document);
+      const m = new Menu();
+      m.addItem((i) => i.setTitle('翻译').setIcon('languages').onClick(() => pop.show(ctx.rect, ctx)));
+      if (ctx.anchor) m.addItem((i) => i.setTitle('把译文标在原文上').setIcon('type').onClick(() => { pop.hide(); this.glossFromContext(ctx); }));
+      const ps = this.selPresets();
+      if (ps.length) m.addSeparator();
+      for (const sp of ps) m.addItem((i) => i.setTitle(sp.name).setIcon(SEL_PRESET_ICON[sp.mode] || 'sparkles').onClick(() => this.runSelPreset(sp, ctx, pop, ctx.rect)));
+      m.addSeparator();
+      if (ctx.pdf || ctx.note) m.addItem((i) => i.setTitle('存入笔记摘录').setIcon('bookmark-plus').onClick(() => this.addExcerpt({ text: ctx.text, pdf: ctx.pdf, page: ctx.page, note: ctx.note, source: '原文高亮' })));
+      m.addItem((i) => i.setTitle('复制').setIcon('copy').onClick(() => this.copyText(ctx.text)));
+      m.showAtMouseEvent(e);
+    }, true);
+    const scan = () => { clearTimeout(this._scanT); this._scanT = setTimeout(() => this.scanPdfViews(), 300); };
+    this.registerEvent(this.app.workspace.on('layout-change', scan));
+    this.registerEvent(this.app.workspace.on('file-open', scan));
+    this.registerEvent(this.app.workspace.on('active-leaf-change', scan));
+    this.registerInterval(window.setInterval(() => this.scanPdfViews(), 3000));
+    if (IS_MOBILE) {
+      this.updateNavInset();
+      const ni = () => this.updateNavInset();
+      this.registerEvent(this.app.workspace.on('layout-change', ni));
+      this.registerEvent(this.app.workspace.on('active-leaf-change', ni));
+      this.registerDomEvent(window, 'resize', ni);
+      this.registerInterval(window.setInterval(ni, 1500));
+    }
+    this.app.workspace.onLayoutReady(scan);
+    this.registerEvent(this.app.vault.on('modify', (f) => this.onDataFileChanged(f)));
+    this.registerEvent(this.app.vault.on('create', (f) => { if (this.app.workspace.layoutReady) this.onDataFileChanged(f); }));
+    this.registerEvent(this.app.vault.on('rename', async (f, old) => {
+      try { await this.mfStore.rename(old, f.path); } catch (e) { /* ignore */ }
+      if (this._pg && this._pg[old]) { this._pg[f.path] = this._pg[old]; delete this._pg[old]; this.pgSaveSoon(); }
+      if ((f.extension || '').toLowerCase() !== 'pdf') return;
+      const st = await this.glossStore(old);
+      if (!st.glosses.length) return;
+      this._gl.delete(old); st.path = f.path; this._gl.set(f.path, st);
+      await this.dataRemove('译文标注', old);
+      await this.saveGloss(f.path);
+    }));
+    this.registerEvent(this.app.workspace.on('file-open', (f) => {
+      if (!this.settings.readerAuto || !f || (f.extension || '').toLowerCase() !== 'pdf') return;
+      if (this.app.workspace.getLeavesOfType(READER_VIEW).length) return;
+      const c = this.paperOf(f);
+      if (c && c.note) this.activateReader(false);
+    }));
+    this.addSettingTab(new WorkbenchSettingTab(this.app, this));
+    this.app.workspace.onLayoutReady(() => { if (this.settings.openOnStartup) this.activateView(true); });
+  }
+
+  onunload() { clearTimeout(this._saveT); clearTimeout(this._actT); if (this._actQ && this._actQ.length) this.actFlush(); }
+
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, (await this.loadData()) || {});
+    if (!this.settings.noteViews) this.settings.noteViews = {};
+    if (!Array.isArray(this.settings.prompts)) this.settings.prompts = DEFAULT_PROMPTS.map((p, i) => Object.assign({ id: 'd' + i, created: Date.now(), updated: Date.now(), used: 0 }, p));
+    if (!Array.isArray(this.settings.inspireLinks)) this.settings.inspireLinks = DEFAULT_INSPIRE_LINKS.map((x) => Object.assign({}, x));
+    if (!this.settings.collapsed) this.settings.collapsed = {};
+    if (!Array.isArray(this.settings.logTags)) this.settings.logTags = ['邮件', '学习', '阅读', '实验', '写作', '会议', '汇报', '杂事'];
+  }
+  async saveSettings() { await this.saveData(this.settings); }
+  saveSettingsSoon() { clearTimeout(this._saveT); this._saveT = setTimeout(() => this.saveSettings(), 500); }
+  openSettings() {
+    const st = this.app.setting;
+    if (st && st.open) { st.open(); if (st.openTabById) st.openTabById(this.manifest.id); }
+    else new Notice('请在 设置 → 第三方插件 → 科研工作台 中修改');
+  }
+
+  async activateView(startup) {
+    const ws = this.app.workspace;
+    const existing = ws.getLeavesOfType(VIEW_TYPE);
+    if (existing.length) { ws.revealLeaf(existing[0]); return; }
+    const leaf = ws.getLeaf(startup ? false : 'tab');
+    await leaf.setViewState({ type: VIEW_TYPE, active: true });
+    ws.revealLeaf(leaf);
+  }
+
+  /* ---------- 索引 ---------- */
+  buildIndex() {
+    const root = normalizePath(this.settings.rootFolder || '科研');
+    const projRoot = root + '/项目/';
+    const projects = [];
+    const notes = [];
+    const files = [];
+    const byName = new Map();
+    const projectOfPath = (path) => {
+      if (!path.startsWith(projRoot)) return '';
+      const rest = path.slice(projRoot.length);
+      return rest.includes('/') ? rest.split('/')[0] : '';
+    };
+    const looseMd = [];
+    const dataPre = this.dataDir() + '/';
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (file.path.startsWith(dataPre)) continue;
+      const cache = this.app.metadataCache.getFileCache(file);
+      const fm = (cache && cache.frontmatter) || {};
+      if (fm.type === 'rw-data') continue;
+      let type = normType(fm.type);
+      let inferred = false;
+      if (!type) {
+        // 没写 type 属性的 md：在科研根目录内按所在文件夹推断（会议/ → 会议纪要，文献/ → 文献…）
+        if (!file.path.startsWith(root + '/')) continue;
+        type = noteTypeOfPath(file.path, root);
+        if (!type) { looseMd.push(file); continue; }
+        inferred = true;
+      }
+      const openTasks = cache.listItems ? cache.listItems.filter((li) => li.task === ' ').length : 0;
+      if (type === 'project') {
+        const p = {
+          kind: 'project', file, fm, name: file.basename,
+          title: str(fm.title) || file.basename,
+          pkind: normKind(fm.kind),
+          stage: '',
+          parentName: parseLinkName(fm.parent),
+          status: PROJECT_STATUSES.includes(str(fm.status)) ? str(fm.status) : (fm.status ? str(fm.status) : '进行中'),
+          priority: str(fm.priority),
+          deadline: str(fm.deadline),
+          next: str(fm.next),
+          description: str(fm.description || fm.summary),
+          counts: {}, openTasks, lastActivity: file.stat.mtime,
+        };
+        const stages = stagesOf(p);
+        const raw = str(fm.stage).trim();
+        p.stage = stages.some((x) => x.id === raw) ? raw : (p.pkind === 'paper' && normStage(raw)) || (stages[0] ? stages[0].id : '');
+        projects.push(p);
+        byName.set(p.name, p);
+      } else if (type === 'resource') {
+        const extPath = str(fm.path);
+        const name = str(fm.name) || extPath.split(/[\\/]/).pop() || file.basename;
+        const ext = extOf(name);
+        files.push({
+          kind: 'link', file, name, ext, extPath,
+          cat: FILE_CATS[str(fm.category)] ? str(fm.category) : catOfExt(ext),
+          projectName: parseLinkName(fm.project) || projectOfPath(file.path),
+          size: Number(fm.size) || null, mtime: file.stat.mtime,
+        });
+      } else if (NOTE_TYPES[type]) {
+        let pn = parseLinkName(fm.project);
+        if (!pn && file.path.startsWith(projRoot)) pn = file.path.slice(projRoot.length).split('/')[0];
+        notes.push({
+          kind: 'note', file, fm, type, inferred,
+          title: str(fm.title) || (type === 'literature' ? litH1Title(file, cache) : '') || smartTitle(file, cache),
+          status: str(fm.status),
+          date: str(fm.date || fm.created).slice(0, 10) || dateFromName(file.basename) || (inferred ? fmtDate(new Date(file.stat.ctime)) : ''),
+          projectName: pn || '',
+          openTasks,
+        });
+      }
+    }
+    // 库内的非笔记文件（PDF、PPT、数据…）
+    for (const f of this.app.vault.getFiles()) {
+      if (f.extension === 'md' || !f.path.startsWith(root + '/') || f.path.startsWith(dataPre)) continue;
+      if (/^(~\$|\.~lock\.|~WRL)|^(Thumbs\.db|desktop\.ini|\.DS_Store)$/i.test(f.name)) continue; // Office 打开文件时生成的临时锁文件等
+      const segs = f.path.split('/');
+      let cat = '';
+      for (let i = segs.length - 2; i >= 1; i--) { if (FOLDER_CAT[segs[i]]) { cat = FOLDER_CAT[segs[i]]; break; } }
+      const ext = (f.extension || '').toLowerCase();
+      // 放在分类文件夹里的以文件夹为准（方便手动调整分类），否则按扩展名判断
+      if (!cat) cat = catOfExt(ext);
+      files.push({ kind: 'file', file: f, name: f.name, ext, cat: cat || 'other', projectName: projectOfPath(f.path), size: f.stat.size, mtime: f.stat.mtime });
+    }
+    // 无法归类的 md（如 附件/ 里的、根目录下的）也作为文件列出，至少能找到、打开
+    for (const f of looseMd) {
+      const segs = f.path.split('/');
+      let cat = '';
+      for (let i = segs.length - 2; i >= 1; i--) { if (FOLDER_CAT[segs[i]]) { cat = FOLDER_CAT[segs[i]]; break; } }
+      files.push({ kind: 'file', file: f, name: f.name, ext: 'md', cat: cat || 'other', projectName: projectOfPath(f.path), size: f.stat.size, mtime: f.stat.mtime, looseMd: true });
+    }
+    // 项目主页已删除的“孤儿”笔记 / 文件视为未归属
+    for (const x of files) if (x.projectName && !byName.has(x.projectName)) x.projectName = '';
+    for (const n of notes) if (n.projectName && !byName.has(n.projectName)) n.projectName = '';
+    for (const x of files) {
+      const p = byName.get(x.projectName);
+      if (p) { p.fileCount = (p.fileCount || 0) + 1; if (x.mtime > p.lastActivity) p.lastActivity = x.mtime; }
+    }
+    for (const n of notes) {
+      const p = byName.get(n.projectName);
+      if (!p) continue;
+      n.projectName = p.name;
+      p.counts[n.type] = (p.counts[n.type] || 0) + 1;
+      p.openTasks += n.openTasks;
+      if (n.file.stat.mtime > p.lastActivity) p.lastActivity = n.file.stat.mtime;
+    }
+    for (const p of projects) {
+      p.children = projects.filter((c) => c.parentName === p.name);
+      if (p.parentName && !byName.has(p.parentName)) p.parentName = '';
+    }
+    projects.sort((a, b) => KIND_ORDER.indexOf(a.pkind) - KIND_ORDER.indexOf(b.pkind) || stageIdxOf(a) - stageIdxOf(b) || b.lastActivity - a.lastActivity);
+    return { projects, notes, files, byName };
+  }
+
+  countOpenTasks(index) {
+    let c = 0;
+    for (const p of index.projects) {
+      const cache = this.app.metadataCache.getFileCache(p.file);
+      if (cache && cache.listItems) c += cache.listItems.filter((li) => li.task === ' ').length;
+    }
+    for (const n of index.notes) c += n.openTasks;
+    return c;
+  }
+
+  planFilePath() { return normalizePath(this.settings.rootFolder + '/计划.md'); }
+  async collectTasks(index, withDone) {
+    const out = [];
+    const items = index.projects.map((p) => ({ file: p.file, projectName: p.name })).concat(index.notes.map((n) => ({ file: n.file, projectName: n.projectName })));
+    const pf = this.app.vault.getAbstractFileByPath(this.planFilePath());
+    if (pf instanceof TFile && !items.some((x) => x.file === pf)) items.push({ file: pf, projectName: '' });
+    for (const it of items) {
+      const cache = this.app.metadataCache.getFileCache(it.file);
+      const open = cache && cache.listItems ? cache.listItems.filter((li) => li.task === ' ' || (withDone && li.task && li.task !== ' ')) : [];
+      if (!open.length) continue;
+      const lines = (await this.app.vault.cachedRead(it.file)).split('\n');
+      for (const li of open) {
+        const line = li.position.start.line;
+        const raw = lines[line] || '';
+        const text = raw.replace(/^\s*[-*+]\s*\[.\]\s*/, '').trim();
+        if (!text) continue;
+        const dm = text.match(/(?:📅|@|due:\s*)\s*(\d{4}-\d{2}-\d{2})/);
+        const tm = text.match(/⏰\s*(\d{1,2}):(\d{2})/) || text.match(/(?:📅|due:)\s*\d{4}-\d{2}-\d{2}\s+(\d{1,2}):(\d{2})/);
+        const clean = text.replace(/(?:📅|due:)\s*\d{4}-\d{2}-\d{2}(\s+\d{1,2}:\d{2})?/, '').replace(/⏰\s*\d{1,2}:\d{2}/, '').replace(/✅\s*\d{4}-\d{2}-\d{2}/, '').trim();
+        out.push({ file: it.file, projectName: it.projectName, line, raw, text: clean, due: dm ? dm[1] : '', time: tm ? pad(Number(tm[1])) + ':' + tm[2] : '', done: li.task !== ' ' });
+      }
+    }
+    return out;
+  }
+
+  /* 日历事件：截止日、带日期的待办、会议纪要、其他笔记 */
+  async collectEvents(index) {
+    const ev = [];
+    for (const p of index.projects) {
+      if (p.status !== '已完成' && parseDate(p.deadline)) ev.push({ date: fmtDate(parseDate(p.deadline)), kind: 'deadline', title: p.title + ' 截止', project: p.name, file: p.file, isProject: true, projectKey: p.name });
+    }
+    for (const n of index.notes) {
+      const dl = n.fm.deadline || n.fm.due;
+      if (dl && parseDate(dl)) ev.push({ date: fmtDate(parseDate(dl)), kind: 'deadline', title: n.title + ' 截止', project: n.projectName, file: n.file });
+      if (!n.date || !parseDate(n.date)) continue;
+      const tmv = str(n.fm.time).match(/(\d{1,2}):(\d{2})/);
+      ev.push({ date: n.date, kind: n.type === 'meeting' ? 'meeting' : 'note', title: n.title, project: n.projectName, file: n.file, time: n.type === 'meeting' && tmv ? pad(Number(tmv[1])) + ':' + tmv[2] : '' });
+    }
+    const tasks = await this.collectTasks(index, true);
+    for (const t of tasks) if (t.due) ev.push({ date: t.due, kind: 'task', title: t.text, project: t.projectName, file: t.file, time: t.time, task: t, done: t.done });
+    return ev;
+  }
+
+  /* 热力图数据：每天新建 / 修改过的笔记和文件 */
+  activityByDay(index) {
+    const map = new Map();
+    const add = (key, item) => {
+      if (!key) return;
+      if (!map.has(key)) map.set(key, []);
+      const arr = map.get(key);
+      if (!arr.some((x) => x.path === item.path)) arr.push(item);
+    };
+    for (const p of index.projects) {
+      const it = { path: p.file.path, title: p.title, icon: KINDS[p.pkind].icon, project: p.name, file: p.file };
+      add(str(p.fm.created).slice(0, 10) || fmtDate(new Date(p.file.stat.ctime)), Object.assign({ what: '创建项目' }, it));
+      add(fmtDate(new Date(p.file.stat.mtime)), Object.assign({ what: '更新项目' }, it));
+    }
+    for (const n of index.notes) {
+      const it = { path: n.file.path, title: n.title, icon: NOTE_TYPES[n.type].icon, project: n.projectName, file: n.file, entry: this.noteEntry(n) };
+      add(n.date, Object.assign({ what: '新建' + NOTE_TYPES[n.type].label }, it));
+      add(fmtDate(new Date(n.file.stat.mtime)), Object.assign({ what: '编辑' + NOTE_TYPES[n.type].label }, it));
+    }
+    for (const x of index.files) {
+      const it = { path: x.file.path, title: x.name, icon: x.ext === 'md' ? 'file-text' : fileIcon(x.ext), project: x.projectName, file: x.file, entry: x };
+      add(fmtDate(new Date(x.file.stat.ctime)), Object.assign({ what: '加入文件' }, it));
+      add(fmtDate(new Date(x.mtime || x.file.stat.mtime)), Object.assign({ what: '修改文件' }, it));
+    }
+    return map;
+  }
+
+  /* ---------- 添加待办（写入项目主页「待办」小节或 科研/计划.md） ---------- */
+  addTaskModal(preset) { new AddTaskModal(this.app, this, preset || {}).open(); }
+  async addTask(o) {
+    const text = String(o.text || '').trim();
+    if (!text) return null;
+    let line = '- [ ] ' + text + (o.date ? ' 📅 ' + o.date : '') + (o.time ? ' ⏰ ' + o.time : '');
+    let file;
+    const p = o.project ? this.buildIndex().byName.get(o.project) : null;
+    if (p) file = p.file;
+    else {
+      file = this.app.vault.getAbstractFileByPath(this.planFilePath());
+      if (!(file instanceof TFile)) {
+        await this.ensureFolder(normalizePath(this.settings.rootFolder));
+        file = await this.app.vault.create(this.planFilePath(), '# 计划\n\n不属于具体项目的待办写在这里，科研工作台的「计划」页和日历会自动汇总。\n\n## ✅ 待办\n');
+      }
+    }
+    await this.app.vault.process(file, (data) => {
+      const m = data.match(/\n##[^\n]*待办[^\n]*\n/);
+      if (!m) return data.replace(/\s*$/, '') + '\n\n## ✅ 待办\n' + line + '\n';
+      const startI = m.index + m[0].length;
+      const lines = data.slice(startI).split('\n');
+      let k = 0;
+      while (k < lines.length && /^\s*[-*+]\s/.test(lines[k])) k++;
+      // 去掉模板里的空待办 "- [ ] "
+      const before = lines.slice(0, k).filter((l) => !/^\s*[-*+]\s*\[ \]\s*$/.test(l));
+      return data.slice(0, startI) + before.concat([line]).concat(lines.slice(k)).join('\n');
+    });
+    new Notice('✅ 已添加待办' + (o.date ? '：' + o.date + (o.time ? ' ' + o.time : '') : '') + (p ? ' → ' + p.title : ' → 计划.md'));
+    this.refreshViews();
+    return file;
+  }
+
+
+  /* ═════════ PDF 全文（转 Markdown / HTML / 全文翻译） ═════════ */
+  ftRoot() { return normalizePath(this.dataDir() + '/全文'); }
+  ftDirFor(pdf) { return normalizePath(this.ftRoot() + '/' + (sanitize(pdf.basename).replace(/[#^[\]|]/g, '').slice(0, 40).trim() || 'paper') + '-' + md5(pdf.path).slice(0, 8)); }
+  /* 这篇 PDF 已有的全文文件 */
+  ftInfo(pdf) {
+    if (!pdf) return { dir: '' };
+    let dir = this.ftDirFor(pdf);
+    const get = (p) => { const f = this.app.vault.getAbstractFileByPath(normalizePath(dir + '/' + p)); return f instanceof TFile ? f : null; };
+    if (!get('full.md')) {
+      // PDF 改过名 / 挪过位置：按旧文件夹里记的来源找
+      const root = this.app.vault.getAbstractFileByPath(this.ftRoot());
+      const pre = (sanitize(pdf.basename).replace(/[#^[\]|]/g, '').slice(0, 40).trim() || 'paper') + '-';
+      const hit = root && root.children ? root.children.find((c) => c.children && c.name.startsWith(pre) && c.children.some((x) => x.name === 'full.md')) : null;
+      if (hit) dir = hit.path;
+    }
+    const md = get('full.md');
+    return { dir, md, zhAi: get('full.zh.ai.md'), zhMachine: get('full.zh.machine.md'), html: get('full.html'), get zh() { return this.zhAi || this.zhMachine; } };
+  }
+  async ftWrite(path, data) {
+    path = normalizePath(path);
+    await this.ensureFolder(path.split('/').slice(0, -1).join('/'));
+    const f = this.app.vault.getAbstractFileByPath(path);
+    if (typeof data === 'string') { if (f instanceof TFile) await this.app.vault.modify(f, data); else await this.app.vault.create(path, data); }
+    else { if (f instanceof TFile) await this.app.vault.modifyBinary(f, data); else await this.app.vault.createBinary(path, data); }
+    return this.app.vault.getAbstractFileByPath(path);
+  }
+  ftProgress(title) {
+    const n = new Notice(title, 0);
+    const set = (m) => { try { if (n.setMessage) n.setMessage(title + '\n' + m); else if (n.noticeEl) n.noticeEl.textContent = title + '\n' + m; } catch (e) { /* ignore */ } };
+    return { set, done: () => { try { n.hide(); } catch (e) { /* ignore */ } } };
+  }
+  ftBusy(pdf, kind) {
+    this._ftJobs = this._ftJobs || new Set();
+    const k = pdf.path + '|' + kind;
+    if (this._ftJobs.has(k)) { new Notice('这篇正在处理中，稍等一下'); return null; }
+    this._ftJobs.add(k);
+    return () => this._ftJobs.delete(k);
+  }
+  /* ① PDF → Markdown */
+  async ftConvert(pdf, provider, quiet) {
+    provider = provider || this.settings.ftProvider || 'local';
+    const end = this.ftBusy(pdf, 'convert');
+    if (!end) return null;
+    const label = (FT_PROVIDERS.find((x) => x[0] === provider) || FT_PROVIDERS[0])[1];
+    const prog = this.ftProgress('📄 转 Markdown：' + trunc(pdf.basename, 40));
+    try {
+      prog.set('方式：' + label);
+      const res = provider === 'mineru' ? await this.ftMineru(pdf, prog.set) : provider === 'mistral' ? await this.ftMistral(pdf, prog.set) : await this.ftLocal(pdf, prog.set);
+      const dir = this.ftDirFor(pdf);
+      prog.set('写入文件…');
+      for (const img of res.images || []) await this.ftWrite(dir + '/images/' + img.name, img.data.buffer ? img.data.buffer.slice(img.data.byteOffset, img.data.byteOffset + img.data.byteLength) : img.data);
+      const md = await this.ftWrite(dir + '/full.md', res.markdown.replace(/\r\n?/g, '\n').trim() + '\n');
+      await this.ftWrite(dir + '/来源.json', JSON.stringify({ pdf: pdf.path, provider, at: new Date().toISOString(), pages: res.pages || 0 }, null, 2));
+      this.ftAct(pdf, '全文 Markdown', md);
+      if (this.settings.ftAutoHtml !== false) { prog.set('生成 HTML 阅读页…'); try { await this.ftHtml(pdf, true); } catch (e) { console.warn('[科研工作台] HTML 生成失败', e); } }
+      prog.done();
+      if (!quiet) new Notice('✅ 已转成 Markdown' + (res.images && res.images.length ? '（' + res.images.length + ' 张图）' : '') + '：' + trunc(pdf.basename, 30), 5000);
+      this.refreshReaders && this.refreshReaders();
+      return md;
+    } catch (e) {
+      prog.done();
+      new Notice('❌ 转换失败：' + (e.message || e), 10000);
+      console.error('[科研工作台] PDF 转换失败', e);
+      return null;
+    } finally { end(); }
+  }
+  ftAct(pdf, kind, f) {
+    try { const n = this.paperOf(pdf); this.act({ a: 'create', p: f.path, k: kind, n: (n ? this.paperTitle(n) : pdf.basename), pr: this.actProjectOf(pdf.path, {}) || undefined, s: '工作台' }); } catch (e) { /* ignore */ }
+  }
+  /* 本地：pdf.js 按字号 / 行距拼成 Markdown（没有公式和表格结构，但不用任何密钥） */
+  async ftLocal(pdf, prog) {
+    const pdfjs = await obsidian.loadPdfJs();
+    const buf = await this.app.vault.readBinary(pdf);
+    const doc = await pdfjs.getDocument({ data: new Uint8Array(buf) }).promise;
+    const pages = [];
+    const sizes = [];
+    for (let i = 1; i <= doc.numPages; i++) {
+      prog('读取第 ' + i + ' / ' + doc.numPages + ' 页…');
+      const page = await doc.getPage(i);
+      const tc = await page.getTextContent();
+      const lines = [];
+      for (const it of tc.items) {
+        if (!it.str || !it.transform) continue;
+        const size = Math.round(Math.hypot(it.transform[2], it.transform[3]) * 10) / 10 || it.height || 10;
+        const x = it.transform[4], y = it.transform[5];
+        let ln = lines.find((l) => Math.abs(l.y - y) < Math.max(2, size * 0.35));
+        if (!ln) { ln = { y, size: 0, parts: [] }; lines.push(ln); }
+        ln.parts.push({ x, w: it.width || 0, s: it.str, size });
+        ln.size = Math.max(ln.size, size);
+        if (it.str.trim()) sizes.push(size);
+      }
+      lines.sort((a, b) => b.y - a.y);
+      for (const ln of lines) {
+        ln.parts.sort((a, b) => a.x - b.x);
+        let t = '', lastEnd = null;
+        for (const p of ln.parts) { if (lastEnd != null && p.x - lastEnd > p.size * 0.25 && !/\s$/.test(t) && !/^\s/.test(p.s)) t += ' '; t += p.s; lastEnd = p.x + p.w; }
+        ln.text = t.replace(/\s+/g, ' ').trim();
+      }
+      pages.push(lines.filter((l) => l.text));
+    }
+    try { doc.destroy(); } catch (e) { /* ignore */ }
+    sizes.sort((a, b) => a - b);
+    const body = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 10;
+    const out = [];
+    let para = '';
+    const flush = () => { if (para.trim()) out.push(para.trim()); para = ''; };
+    pages.forEach((lines, pi) => {
+      let prevY = null, prevSize = null;
+      for (const ln of lines) {
+        if (/^\d{1,4}$/.test(ln.text) && (ln === lines[0] || ln === lines[lines.length - 1])) continue; // 页码
+        const big = ln.size >= body * 1.18 && ln.text.length < 140;
+        const gap = prevY == null ? 0 : prevY - ln.y;
+        if (big) {
+          flush();
+          const lvl = ln.size >= body * 1.6 ? '#' : ln.size >= body * 1.35 ? '##' : '###';
+          const last = out[out.length - 1];
+          if (last && last.startsWith(lvl + ' ') && prevSize === ln.size && gap < ln.size * 1.8) out[out.length - 1] = last + ' ' + ln.text;
+          else out.push(lvl + ' ' + ln.text);
+        } else {
+          if (prevY != null && (gap > (prevSize || body) * 1.75 || (prevSize && prevSize >= body * 1.18))) flush();
+          if (/^(\d+(\.\d+)*\.?|[IVX]+\.)\s+[A-Z]/.test(ln.text) && ln.text.length < 90 && !para) { out.push('## ' + ln.text); prevY = ln.y; prevSize = ln.size; continue; }
+          if (para && /[A-Za-z]-$/.test(para) && /^[a-z]/.test(ln.text)) para = para.slice(0, -1) + ln.text;
+          else para += (para ? ' ' : '') + ln.text;
+        }
+        prevY = ln.y; prevSize = ln.size;
+      }
+      flush();
+      if (pi < pages.length - 1) out.push('<!-- 第 ' + (pi + 2) + ' 页 -->');
+    });
+    return { markdown: '<!-- 第 1 页 -->\n\n' + out.join('\n\n'), images: [], pages: pages.length };
+  }
+  /* MinerU 云端（https://mineru.net → API Token） */
+  async ftMineru(pdf, prog) {
+    const st = this.settings;
+    const token = String(st.mineruToken || '').trim();
+    if (!token) throw new Error('还没填 MinerU API Token：设置 → 科研工作台 → PDF 转换与全文翻译');
+    const H = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
+    const api = 'https://mineru.net/api/v4';
+    const parse = (r) => { let j = null; try { j = r.json; } catch (e) { j = null; } if (r.status >= 400 || !j || j.code !== 0) throw new Error('MinerU：' + ((j && (j.msg || j.message)) || 'HTTP ' + r.status)); return j.data; };
+    prog('创建转换任务…');
+    const lang = st.mineruLang || 'en';
+    const body = { files: [{ name: pdf.name, data_id: 'rw_' + md5(pdf.path).slice(0, 12), is_ocr: !!st.mineruOcr, language: lang }], model_version: st.mineruModel || 'vlm', language: lang, enable_formula: true, enable_table: true };
+    const d = parse(await requestUrl({ url: api + '/file-urls/batch', method: 'POST', headers: H, body: JSON.stringify(body), throw: false }));
+    const batch = d.batch_id, url = (d.file_urls || [])[0];
+    if (!batch || !url) throw new Error('MinerU 没有返回上传地址');
+    prog('上传 PDF（' + Math.round(pdf.stat.size / 1024) + ' KB）…');
+    const buf = await this.app.vault.readBinary(pdf);
+    let ok = false, err = '';
+    for (let a = 1; a <= 3 && !ok; a++) {
+      try { const r = await requestUrl({ url, method: 'PUT', body: buf, throw: false }); if (r.status < 300) ok = true; else err = 'HTTP ' + r.status; } catch (e) { err = e.message || String(e); }
+      if (!ok) { try { const r2 = await fetch(url, { method: 'PUT', body: buf }); if (r2.ok) ok = true; else err = 'HTTP ' + r2.status; } catch (e) { err = err || e.message; } }
+      if (!ok && a < 3) await sleepMs(1500 * a);
+    }
+    if (!ok) throw new Error('上传到 MinerU 失败：' + err + '（MinerU 的存储在国内，海外网络可能要开代理）');
+    const t0 = Date.now();
+    let item = null;
+    while (Date.now() - t0 < 40 * 60000) {
+      await sleepMs(4000);
+      const r = parse(await requestUrl({ url: api + '/extract-results/batch/' + batch, headers: H, throw: false }));
+      item = (r.extract_result || [])[0];
+      const stt = item ? String(item.state || '') : '';
+      if (stt === 'done' || stt === 'failed') break;
+      const pr = item && item.extract_progress;
+      prog('MinerU 正在解析' + (pr && pr.total_pages ? '：' + (pr.extracted_pages || 0) + ' / ' + pr.total_pages + ' 页' : '（' + ({ pending: '排队中', running: '解析中', converting: '整理中', 'waiting-file': '等待文件' }[stt] || stt || '处理中') + '）') + ' · 已等 ' + Math.round((Date.now() - t0) / 1000) + ' 秒');
+    }
+    if (!item || item.state !== 'done') throw new Error('MinerU 转换' + (item && item.state === 'failed' ? '失败：' + (item.err_msg || '') : '超时'));
+    prog('下载结果…');
+    const zr = await requestUrl({ url: item.full_zip_url, throw: false });
+    if (zr.status >= 400) throw new Error('下载 MinerU 结果失败：HTTP ' + zr.status);
+    const entries = await ftUnzip(zr.arrayBuffer, (n) => /\.md$/i.test(n) || /(^|\/)images\/[^/]+\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(n));
+    const mds = entries.filter((e) => /\.md$/i.test(e.name));
+    const main = mds.find((e) => /(^|\/)full\.md$/i.test(e.name)) || mds.find((e) => !/_layout|_span|_model|_middle/i.test(e.name)) || mds[0];
+    if (!main) throw new Error('MinerU 结果里没有 Markdown');
+    const images = entries.filter((e) => /(^|\/)images\//i.test(e.name)).map((e) => ({ name: e.name.split('/').pop(), data: e.data }));
+    let markdown = new TextDecoder().decode(main.data);
+    markdown = markdown.replace(/(!\[[^\]]*\]\()(?:\.\/)?(?:[^)]*\/)?images\//g, '$1images/').replace(/(<img\b[^>]*\bsrc=["'])(?:\.\/)?(?:[^"']*\/)?images\//gi, '$1images/');
+    return { markdown, images };
+  }
+  /* Mistral OCR（https://console.mistral.ai → API Key） */
+  async ftMistral(pdf, prog) {
+    const key = String(this.settings.mistralKey || '').trim();
+    if (!key) throw new Error('还没填 Mistral API Key：设置 → 科研工作台 → PDF 转换与全文翻译');
+    prog('读取 PDF…');
+    const buf = await this.app.vault.readBinary(pdf);
+    const b64 = obsidian.arrayBufferToBase64 ? obsidian.arrayBufferToBase64(buf) : btoa(String.fromCharCode(...new Uint8Array(buf)));
+    prog('Mistral OCR 识别中（几十页大约要一两分钟）…');
+    const r = await requestUrl({ url: 'https://api.mistral.ai/v1/ocr', method: 'POST', headers: { Authorization: 'Bearer ' + key }, contentType: 'application/json', body: JSON.stringify({ model: 'mistral-ocr-latest', document: { type: 'document_url', document_url: 'data:application/pdf;base64,' + b64 }, include_image_base64: true }), throw: false });
+    let j = null; try { j = r.json; } catch (e) { j = null; }
+    if (r.status >= 400) throw new Error('Mistral：' + ((j && (j.message || j.detail || (j.error && j.error.message))) || 'HTTP ' + r.status));
+    const pages = (j && j.pages) || [];
+    if (!pages.length) throw new Error('Mistral OCR 没有返回内容');
+    const images = [];
+    const used = new Set();
+    for (const pg of pages) for (const im of pg.images || []) {
+      const raw = String(im.image_base64 || '');
+      if (!raw) continue;
+      const m = raw.match(/^data:([^;]+);base64,(.+)$/);
+      let name = String(im.id || '').replace(/^.*[\\/]/, '');
+      if (!/^[\w.-]+\.(png|jpe?g|gif|webp|bmp)$/i.test(name)) name = 'img-' + images.length + '.jpg';
+      if (used.has(name)) name = name.replace(/(\.\w+)$/, '-' + images.length + '$1');
+      used.add(name);
+      const bin = atob(m ? m[2] : raw);
+      const u8 = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      images.push({ name, data: u8, orig: String(im.id || '') });
+    }
+    let markdown = pages.map((p) => String(p.markdown || '').trim()).filter(Boolean).join('\n\n');
+    for (const im of images) if (im.orig) markdown = markdown.split('](' + im.orig + ')').join('](images/' + im.name + ')');
+    markdown = markdown.replace(/!\[([^\]]*)\]\((?!images\/|https?:|data:)([^)]+)\)/g, (a, alt, src) => '![' + alt + '](images/' + src.replace(/^\.\//, '') + ')');
+    return { markdown, images, pages: pages.length };
+  }
+  /* ② 一键全文翻译：AI（工作台的 AI 接口）或机器翻译（Google / 微软…），逐行保留公式和格式 */
+  async ftTranslate(pdf, engine) {
+    engine = engine || this.settings.ftEngine || 'ai';
+    if (engine === 'ai' && !this.directAiReady()) return new Notice('先在 设置 → 科研工作台 → AI 填接口地址和密钥（或改用机器翻译）');
+    let info = this.ftInfo(pdf);
+    if (!info.md) {
+      new Notice('这篇还没有 Markdown，先自动转换（' + ((FT_PROVIDERS.find((x) => x[0] === (this.settings.ftProvider || 'local')) || FT_PROVIDERS[0])[1]) + '）…');
+      if (!(await this.ftConvert(pdf, null, true))) return null;
+      info = this.ftInfo(pdf);
+    }
+    const end = this.ftBusy(pdf, 'translate');
+    if (!end) return null;
+    const prog = this.ftProgress('🌐 全文翻译（' + FT_ENGINE_LABEL[engine] + '）：' + trunc(pdf.basename, 36));
+    try {
+      const md = await this.app.vault.read(info.md);
+      const title = (() => { const n = this.paperOf(pdf); return n ? this.paperTitle(n) : pdf.basename; })();
+      const { lines, items } = ftPrepare(md);
+      if (!items.length) throw new Error('没有可翻译的正文（可能已经是中文，或几乎全是公式 / 图片）');
+      let failed = 0;
+      if (engine === 'ai') {
+        const batches = ftBatches(items, 5000, 30);
+        let done = 0;
+        await mapLimit(batches, 2, async (batch) => {
+          let tr = null;
+          for (let a = 0; a < 2 && !tr; a++) { try { tr = await this.ftAiBatch(batch, title); } catch (e) { if (a === 1) console.warn('[科研工作台] 一段翻译失败', e); } }
+          for (const it of batch) {
+            let v = tr && tr.get(it.id);
+            if (!v || it.tokens.some((t) => !v.includes(t.placeholder))) { failed++; continue; }
+            for (const t of it.tokens) v = v.split(t.placeholder).join(t.value);
+            lines[it.lineIndex] = it.prefix + v + it.trailing;
+          }
+          done++;
+          prog.set('AI 翻译中：' + done + ' / ' + batches.length + ' 段');
+        });
+      } else {
+        const service = this.settings.ftMachineService || this.settings.transService || 'google';
+        // 把每行里要翻的文字片段攒成批（换行分隔），一批一次请求；对不上就逐段重翻
+        const segs = [];
+        const partsOf = new Map();
+        for (const it of items) {
+          const parts = it.text.split(/(ZXQPGTOKEN\d+X\d+QXZ)/).map((p) => ({ p, t: null }));
+          partsOf.set(it.id, parts);
+          for (const x of parts) if (!/^ZXQPGTOKEN\d+X\d+QXZ$/.test(x.p) && /[A-Za-z]{2,}/.test(x.p)) segs.push(x);
+        }
+        const groups = [];
+        let cur = [], n = 0;
+        for (const x of segs) { const L = x.p.trim().length + 1; if (cur.length && (n + L > 1500 || cur.length >= 40)) { groups.push(cur); cur = []; n = 0; } cur.push(x); n += L; }
+        if (cur.length) groups.push(cur);
+        let done = 0;
+        await mapLimit(groups, 2, async (g) => {
+          const src = g.map((x) => x.p.trim().replace(/\n/g, ' ')).join('\n');
+          let out = null;
+          try { out = String(await this.translate(src, service) || '').split(/\n/).map((x) => x.trim()); } catch (e) { out = null; }
+          if (!out || out.length !== g.length) {
+            for (const x of g) { try { x.t = await this.translate(x.p.trim(), service); } catch (e) { failed++; } }
+          } else g.forEach((x, i) => { x.t = out[i]; });
+          done++;
+          prog.set('机器翻译中：' + done + ' / ' + groups.length + ' 批');
+        });
+        for (const it of items) {
+          let v = partsOf.get(it.id).map((x) => (x.t ? (x.p.match(/^\s*/)[0] + x.t + x.p.match(/\s*$/)[0]) : x.p)).join('');
+          for (const t of it.tokens) v = v.split(t.placeholder).join(t.value);
+          lines[it.lineIndex] = it.prefix + v + it.trailing;
+        }
+      }
+      const zh = await this.ftWrite(info.dir + '/full.zh.' + engine + '.md', lines.join('\n'));
+      this.ftAct(pdf, '全文译文', zh);
+      prog.set('生成双语 HTML 阅读页…');
+      try { await this.ftHtml(pdf, true, engine); } catch (e) { console.warn(e); }
+      prog.done();
+      new Notice('✅ 全文翻译完成' + (failed ? '（' + failed + ' 处没翻好，保留原文）' : '') + '：' + trunc(pdf.basename, 30), 6000);
+      this.refreshReaders && this.refreshReaders();
+      return zh;
+    } catch (e) {
+      prog.done();
+      new Notice('❌ 全文翻译失败：' + (e.message || e), 10000);
+      console.error('[科研工作台] 全文翻译失败', e);
+      return null;
+    } finally { end(); }
+  }
+  async ftAiBatch(batch, title) {
+    const sys = '你是专业学术论文翻译器。把输入 JSON 中每一项的 text 翻译为准确、流畅的简体中文。必须逐项返回，不得合并、遗漏或增加内容。所有 ZXQPGTOKEN...QXZ 占位符必须原样保留；Markdown 标记、数字、引用编号、公式、变量、单位和符号不得改写。每项译文必须保持单行。只输出 JSON：{"translations":[{"id":"L0","text":"译文"}]}。';
+    const raw = await this.directChat([{ role: 'system', content: sys }, { role: 'user', content: JSON.stringify({ paperTitle: title, items: batch.map((x) => ({ id: x.id, text: x.text })) }) }], { quick: true });
+    const j = parseAiJson(raw);
+    const rows = Array.isArray(j) ? j : j && j.translations;
+    if (!Array.isArray(rows)) throw new Error('AI 翻译结果格式不对');
+    return new Map(rows.filter((r) => r && typeof r.id === 'string' && typeof r.text === 'string').map((r) => [r.id, r.text.replace(/\r?\n+/g, ' ').trim()]));
+  }
+  /* ③ HTML 阅读页（英文 / 中文 / 对照；公式离线渲染、图片内嵌） */
+  async ftKatex() {
+    if (this._katexTried) return __mdh.katex;
+    this._katexTried = true;
+    const dir = (this.manifest && this.manifest.dir) || (this.app.vault.configDir + '/plugins/research-workbench');
+    try {
+      const ad = this.app.vault.adapter;
+      const js = await ad.read(normalizePath(dir + '/vendor-katex.js'));
+      const m = { exports: {} };
+      new Function('module', 'exports', js)(m, m.exports);
+      __mdh.katex = m.exports && m.exports.renderToString ? m.exports : m.exports.default || null;
+      this._katexCss = await ad.read(normalizePath(dir + '/vendor-katex.css'));
+    } catch (e) { console.warn('[科研工作台] 没有找到离线公式库，HTML 将在联网时加载公式', e); __mdh.katex = null; this._katexCss = ''; }
+    return __mdh.katex;
+  }
+  async ftHtml(pdf, quiet, prefer) {
+    const info = this.ftInfo(pdf);
+    if (!info.md) { if (!quiet) new Notice('还没有 Markdown，先「PDF 转 Markdown」'); return null; }
+    await this.ftKatex();
+    const md = await this.app.vault.read(info.md);
+    const zf = prefer === 'machine' ? info.zhMachine || info.zhAi : info.zhAi || info.zhMachine;
+    const zh = zf ? await this.app.vault.read(zf) : '';
+    const noCmt = (t) => String(t || '').replace(/^[ \t]*<!--[\s\S]*?-->[ \t]*$/gm, '');
+    const prepared = preprocessMath(noCmt(md));
+    const preparedZh = zh ? preprocessMath(noCmt(zh)) : '';
+    // 图片：读进来转成 data URI，HTML 单文件就能离线看
+    const refs = new Set();
+    for (const x of (prepared + '\n' + preparedZh).matchAll(/!\[[^\]]*\]\(\s*([^)\s]+)/g)) refs.add(x[1]);
+    for (const x of (prepared + '\n' + preparedZh).matchAll(/\ssrc="([^"]+)"/g)) refs.add(x[1]);
+    const images = new Map();
+    for (const href of refs) {
+      if (/^(https?:|data:)/i.test(href)) { images.set(href, href); continue; }
+      const p = normalizePath(info.dir + '/' + decodeURIComponent(href.replace(/^\.\//, '')));
+      const f = this.app.vault.getAbstractFileByPath(p);
+      if (!(f instanceof TFile)) { images.set(href, ''); continue; }
+      try { const b = await this.app.vault.readBinary(f); images.set(href, 'data:' + mimeForName(f.name) + ';base64,' + (obsidian.arrayBufferToBase64 ? obsidian.arrayBufferToBase64(b) : btoa(String.fromCharCode(...new Uint8Array(b))))); } catch (e) { images.set(href, ''); }
+    }
+    const n = this.paperOf(pdf);
+    const title = (n && this.paperTitle(n)) || firstHeading(prepared) || pdf.basename;
+    const en = splitReaderBlocks(prepared);
+    const zb = preparedZh ? splitReaderBlocks(preparedZh) : [];
+    const count = Math.max(en.length, zb.length, 1);
+    const ids1 = { n: 0, prefix: 'en' }, ids2 = { n: 0, prefix: 'zh' };
+    const rows = [];
+    for (let i = 0; i < count; i++) rows.push('<div class="row" id="b' + i + '"><article class="en" lang="en">' + renderBlocks(en[i] || '', images, ids1) + '</article>' + (zb.length ? '<article class="zh">' + renderBlocks(zb[i] || '', images, ids2) + '</article>' : '') + '</div>');
+    let body = rows.join('\n');
+    // 表格 HTML 里的 <img src> 也内嵌
+    body = body.replace(/(\ssrc=")([^"]+)(")/g, (a, p1, src, p3) => (images.get(src) ? p1 + images.get(src) + p3 : a));
+    const page = ftReaderPage({ title, body, hasZh: !!zb.length, mode: zb.length ? (this.settings.ftHtmlMode || 'dual') : 'en', katexCss: __mdh.katex ? this._katexCss : '', meta: pdf.path + (zf ? ' · 译文：' + FT_ENGINE_LABEL[zf.name.includes('.ai.') ? 'ai' : 'machine'] : '') + ' · ' + today() });
+    const f = await this.ftWrite(info.dir + '/full.html', page);
+    if (!quiet) { this.ftAct(pdf, 'HTML 阅读页', f); new Notice('✅ 已生成 HTML 阅读页'); }
+    return f;
+  }
+  async ftOpen(file) {
+    if (!file) return;
+    if (/\.html?$/i.test(file.path)) {
+      if (this._htmlViewOk) { const leaf = this.app.workspace.getLeaf('tab'); await leaf.openFile(file); return; }
+      return this.openWithDefault(file);
+    }
+    return this.openFile(file);
+  }
+  /* 给菜单加「全文」相关项 */
+  ftMenuItems(m, pdf) {
+    if (!pdf) return;
+    const info = this.ftInfo(pdf);
+    const prov = (FT_PROVIDERS.find((x) => x[0] === (this.settings.ftProvider || 'local')) || FT_PROVIDERS[0])[1];
+    m.addItem((i) => i.setTitle((info.md ? '重新转 Markdown' : 'PDF 转 Markdown') + '（' + prov.replace(/（.*$/, '') + '）').setIcon('file-down').onClick(() => this.ftConvert(pdf)));
+    if (info.md) m.addItem((i) => i.setTitle('打开全文 Markdown').setIcon('file-text').onClick(() => this.ftOpen(info.md)));
+    m.addItem((i) => i.setTitle('一键全文翻译（AI）').setIcon('languages').onClick(() => this.ftTranslate(pdf, 'ai')));
+    m.addItem((i) => i.setTitle('一键全文翻译（机器翻译）').setIcon('languages').onClick(() => this.ftTranslate(pdf, 'machine')));
+    if (info.zh) m.addItem((i) => i.setTitle('打开中文译文 Markdown').setIcon('file-text').onClick(() => this.ftOpen(info.zh)));
+    if (info.md) m.addItem((i) => i.setTitle(info.html ? '更新 HTML 阅读页' : '生成 HTML 阅读页').setIcon('code').onClick(async () => { const f = await this.ftHtml(pdf); if (f) this.ftOpen(f); }));
+    if (info.html) m.addItem((i) => i.setTitle('打开 HTML 阅读页（中英对照）').setIcon('globe').onClick(() => this.ftOpen(info.html)));
+  }
+  ftPdfOfActive() {
+    const f = this.app.workspace.getActiveFile && this.app.workspace.getActiveFile();
+    const c = f ? this.paperOf(f) : null;
+    return c && c.pdf ? c.pdf : null;
+  }
+  /* ═════════ 全局记录（自动）：新建 / 导入 / 移动 / 改名 / 删除 / 编辑 / 改属性，按月存在 工作台数据/全局记录/YYYY-MM.md ═════════ */
+  actDir() { return normalizePath(this.dataDir() + '/全局记录'); }
+  actPath(d) { return normalizePath(this.actDir() + '/' + fmtDate(d).slice(0, 7) + '.md'); }
+  actIgnored(path) {
+    if (!path) return true;
+    const dd = this.dataDir();
+    if (path === dd || path.startsWith(dd + '/')) return true;
+    const cfg = this.app.vault.configDir || '.obsidian';
+    if (path === cfg || path.startsWith(cfg + '/')) return true;
+    const logDir = normalizePath((this.settings.rootFolder || '科研') + '/日志');
+    if (path === logDir || path.startsWith(logDir + '/')) return true; // 科研日志自己有记录
+    if (/^Mindflow\/[^/]+\.json$/.test(path) || /^Mindflow\/附件\/.+\.json$/.test(path)) return true; // 收藏夹 / 想法笔记 / 附件清单
+    if (/(^|\/)\.trash\//.test(path)) return true;
+    return false;
+  }
+  /* 在一段工作台操作期间产生的文件事件，记成「工作台」来源（并带上动作，比如 导入） */
+  async actWith(ctx, fn) {
+    const prev = this._actCtx;
+    this._actCtx = Object.assign({}, prev || {}, ctx || {});
+    try { return await fn(); } finally { this._actCtx = prev; }
+  }
+  actQuiet(path, ms) { (this._actQuiet = this._actQuiet || new Map()).set(path, Date.now() + (ms || 8000)); }
+  actIsQuiet(path) { const t = this._actQuiet && this._actQuiet.get(path); return !!t && t > Date.now(); }
+  act(e) {
+    if (this.settings.activityOn === false) return;
+    e.t = e.t || Date.now();
+    e.id = e.id || uid();
+    (this._actQ = this._actQ || []).push(e);
+    clearTimeout(this._actT);
+    this._actT = setTimeout(() => this.actFlush(), 1500);
+    return e;
+  }
+  setupActivity() {
+    const isFolder = (f) => f && !(f instanceof TFile) && Array.isArray(f.children);
+    const fresh = (f) => !f || !f.stat || !f.stat.mtime || Date.now() - f.stat.mtime < 90000; // 同步过来的旧文件不算新动作
+    const src = () => (this._actCtx ? '工作台' : '外部');
+    const onCreate = (f) => {
+      if (!f || this.actIgnored(f.path)) return;
+      const ctx = this._actCtx;
+      if (isFolder(f)) { if (ctx && ctx.a !== 'folder') return; this.act({ a: 'folder', p: f.path, s: src() }); return; }
+      if (!ctx && !fresh(f)) return;
+      this.actQuiet(f.path, 12000);
+      if (/^Mindflow\/对话数据\/.+\.json$/.test(f.path)) { this.act({ a: 'mindflow', p: f.path, s: '工作台' }); return; }
+      if (/^Mindflow\//.test(f.path) && /\.json$/.test(f.path)) return;
+      this.act({ a: ctx && ctx.a === 'import' ? 'import' : 'create', p: f.path, src: ctx && ctx.src, s: src() });
+    };
+    const onRename = (f, old) => {
+      if (!f || (this.actIgnored(f.path) && this.actIgnored(old))) return;
+      if (/^Mindflow\/对话数据\//.test(f.path)) return;
+      const dir = (x) => x.split('/').slice(0, -1).join('/');
+      const moved = dir(f.path) !== dir(old);
+      this.actQuiet(f.path, 8000);
+      this.act({ a: moved ? 'move' : 'rename', p: f.path, o: old, folder: isFolder(f) ? 1 : 0, s: src() });
+    };
+    const onDelete = (f) => {
+      if (!f || this.actIgnored(f.path)) return;
+      if (/^Mindflow\/对话数据\/.+\.json$/.test(f.path)) { this.act({ a: 'delete', p: f.path, n: 'Mindflow 对话', k: 'Mindflow', s: src() }); return; }
+      const fm = f instanceof TFile ? ((this.app.metadataCache.getFileCache(f) || {}).frontmatter || {}) : {};
+      this.act({ a: 'delete', p: f.path, folder: isFolder(f) ? 1 : 0, k: this.actKind(f.path, fm, isFolder(f)), s: src() });
+    };
+    const onModify = (f) => {
+      if (!f || !(f instanceof TFile) || this.actIgnored(f.path) || this.actIsQuiet(f.path)) return;
+      if (/^Mindflow\//.test(f.path) && /\.json$/.test(f.path)) return;
+      if (this.settings.activityEdits === false) return;
+      if (!fresh(f)) return;
+      // 同一个文件 30 分钟内的连续编辑合成一条（次数累加）
+      this._actEdit = this._actEdit || new Map();
+      const cur = this._actEdit.get(f.path);
+      const now = Date.now();
+      if (cur && now - cur.last < 30 * 60000) {
+        cur.e.c = (cur.e.c || 1) + 1; cur.e.t2 = now; cur.last = now;
+        if (now - cur.wrote > 5 * 60000) { cur.wrote = now; this.act(Object.assign({}, cur.e, { upd: 1 })); }
+        return;
+      }
+      const e = this.act({ a: 'edit', p: f.path, c: 1, s: src() });
+      if (e) this._actEdit.set(f.path, { e, last: now, wrote: now });
+    };
+    this.app.workspace.onLayoutReady(() => {
+      this.registerEvent(this.app.vault.on('create', onCreate));
+      this.registerEvent(this.app.vault.on('rename', onRename));
+      this.registerEvent(this.app.vault.on('delete', onDelete));
+      this.registerEvent(this.app.vault.on('modify', onModify));
+    });
+    // 工作台里的操作：标成「工作台」来源；导入要写清从哪里导入
+    const ctxWrap = (name, ctx) => {
+      const orig = this[name];
+      if (typeof orig !== 'function') return;
+      this[name] = function (...a) { return this.actWith(typeof ctx === 'function' ? ctx(...a) : ctx, () => orig.apply(this, a)); };
+    };
+    ctxWrap('createNote', {});
+    ctxWrap('createProject', {});
+    ctxWrap('createFolderIn', { a: 'folder' });
+    ctxWrap('importFiles', { a: 'import', src: '电脑' });
+    ctxWrap('importZoteroItems', { a: 'import', src: 'Zotero' });
+    for (const n of ['moveEntry', 'moveFileTo', 'renameFileTo', 'renameFolder', 'deleteFolder', 'trash', 'deleteNote', 'deleteEntry', 'deleteProject', 'convertMdToNote']) ctxWrap(n, {});
+    // 属性变化（状态、阶段、类型、所属项目…）单独记一条「把 X 从 A 改成 B」
+    const propWrap = (name, fn) => {
+      const orig = this[name];
+      if (typeof orig !== 'function') return;
+      this[name] = async function (...a) {
+        try { const e = fn(...a); if (e) { this.actQuiet(e.p, 10000); this.act(e); } } catch (er) { /* ignore */ }
+        return this.actWith({}, () => orig.apply(this, a));
+      };
+    };
+    const fmOf = (file) => ((this.app.metadataCache.getFileCache(file) || {}).frontmatter || {});
+    propWrap('setField', (file, key, value) => {
+      if (!file || !file.path) return null;
+      const old = str(fmOf(file)[key]);
+      if (old === str(value)) return null;
+      return { a: 'prop', p: file.path, key, from: old, to: str(value), s: '工作台' };
+    });
+    propWrap('setProjectStage', (p, sid) => (p && p.file && str(fmOf(p.file).stage) !== str(sid) ? { a: 'prop', p: p.file.path, key: 'stage', from: str(fmOf(p.file).stage), to: str(sid), s: '工作台' } : null));
+    propWrap('setProjectKind', (p, k) => (p && p.file && KINDS[k] ? { a: 'prop', p: p.file.path, key: 'kind', from: str(fmOf(p.file).kind), to: KINDS[k].label, s: '工作台' } : null));
+  }
+  /* 这个路径是什么：灵感 / 文献 / 项目 / 文件(PDF) / 文件夹 … */
+  actKind(path, fm, folder) {
+    if (folder) return '文件夹';
+    if (/^Mindflow\//.test(path)) return /\.canvas$/.test(path) ? 'Mindflow 总览图' : 'Mindflow';
+    const t = normType(fm && fm.type);
+    if (t === 'project') return '项目';
+    if (t && NOTE_TYPES[t]) return NOTE_TYPES[t].label;
+    const root = normalizePath(this.settings.rootFolder || '科研');
+    const m = path.match(new RegExp('^' + root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/项目/([^/]+)/([^/]+)\\.md$'));
+    if (m && m[1] === m[2]) return '项目';
+    const ext = (path.split('.').pop() || '').toLowerCase();
+    if (ext === 'md') {
+      for (const k of Object.keys(NOTE_TYPES)) if (path.startsWith(root + '/' + NOTE_TYPES[k].folder + '/') || new RegExp('/项目/[^/]+/' + NOTE_TYPES[k].folder + '/').test(path)) return NOTE_TYPES[k].label;
+      return '笔记';
+    }
+    if (ext === 'canvas') return '白板';
+    return ext ? ext.toUpperCase() + ' 文件' : '文件';
+  }
+  actProjectOf(path, fm) {
+    const root = normalizePath(this.settings.rootFolder || '科研');
+    const pre = root + '/项目/';
+    if (path && path.startsWith(pre)) return path.slice(pre.length).split('/')[0];
+    const v = str(fm && fm.project).replace(/^\[\[|\]\]$/g, '').split('|')[0];
+    return v || '';
+  }
+  async actEnrich(e) {
+    const f = this.app.vault.getAbstractFileByPath(e.p);
+    const folder = !!e.folder || (f && !(f instanceof TFile) && Array.isArray(f.children));
+    const fm = f instanceof TFile ? ((this.app.metadataCache.getFileCache(f) || {}).frontmatter || {}) : {};
+    if (!e.k) e.k = this.actKind(e.p, fm, folder);
+    if (!e.n) {
+      if (e.a === 'mindflow' && f instanceof TFile) {
+        try { const j = JSON.parse(await this.app.vault.read(f)); e.n = trunc(String(j.title || (j.nodes && j.rootId && j.nodes[j.rootId] && j.nodes[j.rootId].title) || 'Mindflow 对话'), 60); } catch (er) { e.n = 'Mindflow 对话'; }
+      } else e.n = (e.p.split('/').pop() || e.p).replace(/\.md$/, '');
+    }
+    if (e.pr == null) e.pr = this.actProjectOf(e.p, fm);
+    if (!e.pr) delete e.pr;
+    return e;
+  }
+  actVerb(e) {
+    const k = e.k || '';
+    switch (e.a) {
+      case 'create': return k === '项目' ? '新建项目' : k === '灵感' ? '加入灵感' : '新建' + (k && k !== '笔记' ? k : '笔记');
+      case 'import': return '导入' + (k || '文件') + (e.src ? '（来自' + e.src + '）' : '');
+      case 'folder': return '新建文件夹';
+      case 'mindflow': return '新建 Mindflow 对话';
+      case 'move': return '移动' + (e.folder ? '文件夹' : k || '');
+      case 'rename': return '重命名' + (e.folder ? '文件夹' : k || '');
+      case 'delete': return '删除' + (e.folder ? '文件夹' : k || '');
+      case 'edit': return '编辑' + (k || '');
+      case 'prop': return '改' + (ACT_PROP_LABELS[e.key] || e.key);
+      default: return e.a;
+    }
+  }
+  actCat(e) {
+    if ((e.a === 'create' || e.a === 'import') && e.k === '灵感') return 'idea';
+    if (e.a === 'rename') return 'move';
+    if (e.a === 'folder') return 'create';
+    return e.a;
+  }
+  actLine(e) {
+    const d = new Date(e.t);
+    let txt = this.actVerb(e) + '「' + (e.n || '') + '」';
+    if (e.a === 'move' || e.a === 'rename') txt += '：' + (e.o || '') + ' → ' + e.p;
+    else if (e.a === 'prop') txt += '：' + (e.from || '空') + ' → ' + (e.to || '空');
+    else txt += ' · ' + e.p;
+    if (e.a === 'edit' && e.c > 1) txt += ' · ' + e.c + ' 次';
+    if (e.pr) txt += ' · 项目 ' + e.pr;
+    if (e.s === '外部') txt += ' · 外部';
+    const j = Object.assign({}, e); delete j.upd;
+    return '- ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ' ' + txt.replace(/\n/g, ' ').replace(/%%/g, '%') + ' %%rwact ' + JSON.stringify(j) + '%%';
+  }
+  async actFlush() {
+    const q = this._actQ || [];
+    this._actQ = [];
+    if (!q.length) return;
+    try {
+      for (const e of q) await this.actEnrich(e);
+      // 按月分文件写入
+      const byMonth = new Map();
+      for (const e of q) { const p = this.actPath(new Date(e.t)); if (!byMonth.has(p)) byMonth.set(p, []); byMonth.get(p).push(e); }
+      for (const [path, list] of byMonth) {
+        this._dataSelf = this._dataSelf || new Map();
+        this._dataSelf.set(path, Date.now());
+        let file = this.app.vault.getAbstractFileByPath(path);
+        if (!(file instanceof TFile)) {
+          await this.ensureFolder(this.actDir());
+          const mon = path.split('/').pop().replace(/\.md$/, '');
+          file = await this.app.vault.create(path, '---\ntype: rw-data\nkind: activity\nmonth: ' + mon + '\n---\n# 全局记录 ' + mon + '\n\n> 科研工作台自动记录：新建、导入、移动、改名、删除、编辑、改属性。在工作台「全局记录」里查看。手写的科研日志在 日志/ 文件夹，两者分开。\n');
+        }
+        await this.app.vault.process(file, (data) => {
+          const lines = data.replace(/\s+$/, '').split('\n');
+          for (const e of list) {
+            const line = this.actLine(e);
+            if (e.upd) { const i = lines.findIndex((l) => l.includes('"id":"' + e.id + '"')); if (i >= 0) { lines[i] = line; continue; } }
+            const d = new Date(e.t);
+            const key = fmtDate(d);
+            let hi = lines.findIndex((l) => l.startsWith('## ' + key));
+            if (hi < 0) {
+              let ins = lines.length;
+              for (let i = 0; i < lines.length; i++) { const m = lines[i].match(/^## (\d{4}-\d{2}-\d{2})/); if (m && m[1] > key) { ins = i; break; } }
+              lines.splice(ins, 0, '', this.dayHeading(d), '');
+              hi = ins + 1;
+            }
+            let end = hi + 1;
+            while (end < lines.length && !/^## /.test(lines[end])) end++;
+            let at = end;
+            while (at > hi + 1 && !lines[at - 1].trim()) at--;
+            lines.splice(at, 0, line);
+          }
+          return lines.join('\n') + '\n';
+        });
+      }
+      this._actCache = null;
+      for (const l of this.app.workspace.getLeavesOfType(VIEW_TYPE)) { const v = l.view; if (v && v.onActivity) v.onActivity(); }
+    } catch (er) { console.warn('[科研工作台] 写入全局记录失败', er); }
+  }
+  /* 读最近 days 天（0 = 全部）的全局记录，新的在前 */
+  async readActivity(days) {
+    const dir = this.app.vault.getAbstractFileByPath(this.actDir());
+    let files = dir && dir.children ? dir.children.filter((f) => f instanceof TFile && /^\d{4}-\d{2}\.md$/.test(f.name)) : this.app.vault.getFiles().filter((f) => f.path.startsWith(this.actDir() + '/') && /^\d{4}-\d{2}\.md$/.test(f.name));
+    const since = days ? Date.now() - days * 86400000 : 0;
+    if (days) { const m0 = fmtDate(new Date(since)).slice(0, 7); files = files.filter((f) => f.basename >= m0); }
+    this._actCache = this._actCache || new Map();
+    const out = [];
+    for (const f of files) {
+      const ck = f.path + '|' + f.stat.mtime + '|' + f.stat.size;
+      let list = this._actCache.get(ck);
+      if (!list) {
+        list = [];
+        const text = await this.app.vault.cachedRead(f);
+        for (const l of text.split('\n')) {
+          const m = l.match(/%%rwact (\{.*\})%%\s*$/);
+          if (!m) continue;
+          try { list.push(JSON.parse(m[1])); } catch (er) { /* 坏行跳过 */ }
+        }
+        this._actCache.set(ck, list);
+      }
+      for (const e of list) if (!since || e.t >= since) out.push(e);
+    }
+    // 内存里还没写盘的编辑次数，以内存为准
+    if (this._actEdit) for (const x of this._actEdit.values()) { const i = out.findIndex((e) => e.id === x.e.id); if (i >= 0) out[i] = Object.assign({}, out[i], { c: x.e.c, t2: x.e.t2 }); }
+    out.sort((a, b) => (b.t2 || b.t) - (a.t2 || a.t));
+    return out;
+  }
+  /* ---------- 科研日志（时间线）：科研/日志/YYYY-MM.md，按天分节，每条 "- HH:MM 内容 #标签 [[项目]]" ---------- */
+  logFilePath(d) { return normalizePath(this.settings.rootFolder + '/日志/' + fmtDate(d).slice(0, 7) + '.md'); }
+  dayHeading(d) { return '## ' + fmtDate(d) + ' 星期' + '日一二三四五六'[d.getDay()]; }
+  async addLog(o) {
+    const text = String(o.text || '').trim();
+    if (!text) return null;
+    const when = o.when || new Date();
+    const path = this.logFilePath(when);
+    let file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) {
+      await this.ensureFolder(normalizePath(this.settings.rootFolder + '/日志'));
+      file = await this.app.vault.create(path, '---\ntype: log\nmonth: ' + fmtDate(when).slice(0, 7) + '\n---\n# 科研日志 ' + fmtDate(when).slice(0, 7) + '\n\n在工作台首页「科研日志」里记录，或按格式手写：`- 14:30 做了什么 #标签 [[项目]]`\n');
+    }
+    let line = '- ' + pad(when.getHours()) + ':' + pad(when.getMinutes()) + ' ' + text.replace(/\n+/g, ' ');
+    for (const t of o.tags || []) if (!line.includes('#' + t)) line += ' #' + t;
+    if (o.project && !line.includes('[[' + o.project + ']]')) line += ' [[' + o.project + ']]';
+    const key = fmtDate(when);
+    await this.app.vault.process(file, (data) => {
+      const lines = data.replace(/\s+$/, '').split('\n');
+      let hi = lines.findIndex((l) => l.startsWith('## ' + key));
+      if (hi < 0) {
+        // 按日期顺序插入新的一天
+        let ins = lines.length;
+        for (let i = 0; i < lines.length; i++) { const m = lines[i].match(/^## (\d{4}-\d{2}-\d{2})/); if (m && m[1] > key) { ins = i; break; } }
+        if (ins < lines.length) lines.splice(ins, 0, '', this.dayHeading(when), '');
+        else lines.splice(ins, 0, '', this.dayHeading(when));
+        hi = ins + 1;
+      }
+      // 本节里按时间先后插入
+      let end = hi + 1;
+      while (end < lines.length && !/^## /.test(lines[end])) end++;
+      let at = end;
+      while (at > hi + 1 && !lines[at - 1].trim()) at--;
+      const hm = line.slice(2, 7);
+      for (let i = hi + 1; i < at; i++) { const m = lines[i].match(/^- (\d{1,2}:\d{2})/); if (m && m[1].padStart(5, '0') > hm) { at = i; break; } }
+      lines.splice(at, 0, line);
+      return lines.join('\n') + '\n';
+    });
+    this.refreshViews();
+    return file;
+  }
+  async readLogs(days) {
+    const out = [];
+    const folder = normalizePath(this.settings.rootFolder + '/日志/');
+    const since = fmtDate(addDays(new Date(), -(days || 3650)));
+    const files = this.app.vault.getMarkdownFiles().filter((f) => f.path.startsWith(folder) && /^\d{4}-\d{2}$/.test(f.basename) && f.basename >= since.slice(0, 7));
+    for (const f of files) {
+      const lines = (await this.app.vault.cachedRead(f)).split('\n');
+      let day = '';
+      lines.forEach((l, i) => {
+        const hm = l.match(/^## (\d{4}-\d{2}-\d{2})/);
+        if (hm) { day = hm[1]; return; }
+        const m = l.match(/^\s*[-*] (\d{1,2}):(\d{2})\s+(.*)$/);
+        if (!m || !day || day < since) return;
+        let text = m[3];
+        const tags = [];
+        text = text.replace(/(^|\s)#([^\s#]+)/g, (a, sp, t) => { tags.push(t); return ''; });
+        let project = '';
+        text = text.replace(/\s*\[\[([^\]|]+)(\|[^\]]*)?\]\]/g, (a, n) => { if (!project) project = n.split('/').pop(); return ''; });
+        out.push({ date: day, time: pad(Number(m[1])) + ':' + m[2], text: text.trim(), tags, project, file: f, line: i, raw: l });
+      });
+    }
+    return out.sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time));
+  }
+  async editLog(e, newText) {
+    await this.app.vault.process(e.file, (data) => {
+      const lines = data.split('\n');
+      if (lines[e.line] === e.raw) lines[e.line] = newText == null ? null : newText;
+      return lines.filter((l) => l !== null).join('\n');
+    });
+    this.refreshViews();
+  }
+
+  /* ---------- 灵感链接 ---------- */
+  manageLinksModal(addNew) { new LinksModal(this.app, this, addNew).open(); }
+  openInspireLink(lk, kw) {
+    let url = lk.url || '';
+    if (/\{q\}/.test(url)) {
+      if (kw) url = url.replace(/\{q\}/g, encodeURIComponent(kw));
+      else { try { const u = new URL(url.replace(/\{q\}/g, '')); url = u.origin + '/'; } catch (e) { url = url.replace(/\{q\}/g, ''); } }
+    }
+    if (!/^[a-z][\w+.-]*:/i.test(url)) url = 'https://' + url;
+    this.openUrl(url);
+  }
+
+  /* 网页链接优先用 Obsidian 内置「网页浏览器」打开；zotero:// 等其他协议交给系统 */
+  webviewerEnabled() {
+    try {
+      const ip = this.app.internalPlugins;
+      if (!ip) return false;
+      if (ip.getEnabledPluginById) return !!ip.getEnabledPluginById('webviewer');
+      const pl = ip.getPluginById && ip.getPluginById('webviewer');
+      return !!(pl && pl.enabled);
+    } catch (e) { return false; }
+  }
+  async openUrl(url) {
+    const web = /^https?:\/\//i.test(url);
+    if (web && this.settings.linkOpen !== 'system' && this.webviewerEnabled()) {
+      try {
+        const leaf = this.app.workspace.getLeaf('tab');
+        await leaf.setViewState({ type: 'webviewer', active: true, state: { url, navigate: true } });
+        this.app.workspace.revealLeaf(leaf);
+        return;
+      } catch (e) { console.warn('[科研工作台] 内置浏览器打开失败，改用系统浏览器', e); }
+    }
+    if (web && this.settings.linkOpen !== 'system' && !this.webviewerEnabled() && !this._wvHinted) {
+      this._wvHinted = true;
+      new Notice('提示：在 设置 → 核心插件 中开启「网页浏览器」，链接就会在 Obsidian 里打开', 6000);
+    }
+    openExternalUrl(url);
+  }
+
+  async completeTask(t) {
+    await this.app.vault.process(t.file, (data) => {
+      const lines = data.split('\n');
+      const l = lines[t.line];
+      if (l != null && /\[ \]/.test(l)) {
+        lines[t.line] = l.replace('[ ]', '[x]') + (/✅/.test(l) ? '' : ' ✅ ' + today());
+      }
+      return lines.join('\n');
+    });
+    new Notice('✅ 已完成：' + t.text.slice(0, 30));
+  }
+
+  currentProjectName() {
+    const f = this.app.workspace.getActiveFile();
+    if (!f) return '';
+    const idx = this.buildIndex();
+    const p = idx.projects.find((x) => x.file.path === f.path);
+    if (p) return p.name;
+    const n = idx.notes.find((x) => x.file.path === f.path);
+    return n && idx.byName.has(n.projectName) ? n.projectName : '';
+  }
+
+  /* ---------- 文件操作 ---------- */
+  async ensureFolder(path) {
+    path = normalizePath(path);
+    const parts = path.split('/');
+    let cur = '';
+    for (const part of parts) {
+      cur = cur ? cur + '/' + part : part;
+      if (!this.app.vault.getAbstractFileByPath(cur)) {
+        try { await this.app.vault.createFolder(cur); } catch (e) { /* 已存在 */ }
+      }
+    }
+  }
+  uniquePath(folder, base) {
+    let p = normalizePath(folder + '/' + base + '.md');
+    let i = 2;
+    while (this.app.vault.getAbstractFileByPath(p)) p = normalizePath(folder + '/' + base + ' ' + i++ + '.md');
+    return p;
+  }
+
+  async createProject(o) {
+    const name = sanitize(o.name);
+    const folder = normalizePath(this.settings.rootFolder + '/项目/' + name);
+    const path = normalizePath(folder + '/' + name + '.md');
+    if (this.app.vault.getAbstractFileByPath(path)) { new Notice('项目已存在：' + name); return null; }
+    await this.ensureFolder(folder);
+    const file = await this.app.vault.create(path, projectTemplate(Object.assign({}, o, { name })));
+    new Notice('📁 已创建项目：' + name);
+    return file;
+  }
+
+  async createNote(o) {
+    const type = o.type;
+    const def = NOTE_TYPES[type];
+    let title = sanitize(o.title || '未命名');
+    if ((type === 'meeting' || type === 'experiment') && !/^\d{4}-\d{2}-\d{2}/.test(title)) title = today() + ' ' + title;
+    const folder = o.project
+      ? normalizePath(this.settings.rootFolder + '/项目/' + o.project + '/' + def.folder)
+      : normalizePath(this.settings.rootFolder + '/' + def.folder);
+    await this.ensureFolder(folder);
+    const path = this.uniquePath(folder, title);
+    const file = await this.app.vault.create(path, noteTemplate(type, Object.assign({}, o, { title: title })));
+    if (o.open) await this.openFile(file);
+    else if (!o.silent) new Notice('已创建：' + title);
+    return file;
+  }
+
+  async setField(file, key, value) {
+    await this.app.fileManager.processFrontMatter(file, (fm) => { fm[key] = value; });
+  }
+
+  async setProjectKind(p, k) {
+    const stages = stagesOfKind(k);
+    await this.app.fileManager.processFrontMatter(p.file, (fm) => {
+      fm.kind = KINDS[k].label;
+      if (!stages.some((x) => x.id === fm.stage)) fm.stage = stages[0] ? stages[0].id : '';
+      if (k === 'direction') fm.parent = '';
+    });
+    new Notice('「' + p.title + '」→ ' + KINDS[k].label);
+  }
+
+  async setProjectStage(p, stageId) {
+    await this.app.fileManager.processFrontMatter(p.file, (fm) => { fm.stage = stageId; });
+    // 在进展日志追加一行
+    try {
+      await this.app.vault.process(p.file, (data) => {
+        const line = '- ' + today() + ' 进入「' + stageId + '」阶段';
+        const m = data.match(/\n## [^\n]*进展日志[^\n]*\n/);
+        if (!m) return data;
+        let pos = m.index + m[0].length;
+        const rest = data.slice(pos);
+        const nextHead = rest.search(/\n## /);
+        const block = nextHead >= 0 ? rest.slice(0, nextHead) : rest;
+        const trimmed = block.replace(/\s+$/, '');
+        const insertAt = pos + trimmed.length;
+        return data.slice(0, insertAt) + (trimmed ? '\n' : '') + line + data.slice(insertAt);
+      });
+    } catch (e) { console.warn('[科研工作台] 写入进展日志失败', e); }
+    new Notice('「' + p.title + '」→ ' + stageId);
+  }
+
+  async ideaToProject(n) {
+    new NewProjectModal(this.app, this, {
+      name: n.title, kind: 'paper', stage: '文献综述', description: str(n.fm.description) || '',
+      onDone: async (file) => {
+        await this.app.fileManager.processFrontMatter(n.file, (fm) => { fm.status = '已立项'; fm.project = '[[' + file.basename + ']]'; });
+        await this.openFile(file);
+      },
+    }).open();
+  }
+
+  async openFile(file, line) {
+    const ws = this.app.workspace;
+    let leaf = null;
+    ws.iterateAllLeaves((l) => { if (!leaf && l.view && l.view.file && l.view.file.path === file.path) leaf = l; });
+    if (!leaf) leaf = ws.getLeaf('tab');
+    await leaf.openFile(file, line != null ? { eState: { line } } : undefined);
+    ws.setActiveLeaf(leaf, { focus: true });
+  }
+
+  newProjectModal(preset) { new NewProjectModal(this.app, this, preset).open(); }
+  newNoteModal(preset) { new NewNoteModal(this.app, this, preset).open(); }
+  promptText(title, value, cb) { new TextPromptModal(this.app, title, value, async (v) => { await cb(v); this.refreshViews(); }).open(); }
+  refreshViews() {
+    for (const l of this.app.workspace.getLeavesOfType(VIEW_TYPE)) if (l.view && l.view.render) l.view.render();
+  }
+
+  /* ---------- 主题 ---------- */
+  currentTheme() {
+    const st = this.settings;
+    if (st.theme === 'custom') return customTheme(st.customBg || '#1e2430', st.customAccent || '#d4f27a');
+    return THEMES[st.theme] || THEMES.obsidian;
+  }
+  applyTheme(el) {
+    const t = this.currentTheme();
+    const keys = Object.keys(themeVars(THEMES.midnight));
+    for (const k of keys) el.style.removeProperty(k);
+    el.classList.remove('rw-themed', 'rw-theme-dark', 'rw-theme-light');
+    if (t.bg) {
+      const v = themeVars(t);
+      for (const k of keys) el.style.setProperty(k, v[k]);
+      el.classList.add('rw-themed', t.dark ? 'rw-theme-dark' : 'rw-theme-light');
+    }
+    el.classList.toggle('rw-tinted', !!this.settings.panelTint);
+  }
+  applyThemeAll() { for (const l of this.app.workspace.getLeavesOfType(VIEW_TYPE)) if (l.view && l.view.contentEl) this.applyTheme(l.view.contentEl); }
+
+  /* ---------- 提示词库 ---------- */
+  editPrompt(p, isNew) { new PromptEditModal(this.app, this, p, isNew).open(); }
+  async deletePrompt(p) {
+    const ok = await this.confirmDelete({ title: '删除提示词', lines: ['确定删除提示词「' + p.title + '」吗？'], noTrashNote: true, confirmText: '删除' });
+    if (!ok) return;
+    this.settings.prompts = this.settings.prompts.filter((x) => x !== p);
+    await this.saveSettings();
+    this.refreshViews();
+  }
+  usePrompt(p, builtin) {
+    const done = async (text) => {
+      try { await navigator.clipboard.writeText(text); new Notice('📋 已复制提示词，去 AI 对话框粘贴即可'); } catch (e) { new Notice('复制失败：' + e.message); }
+      if (!builtin) { p.used = (p.used || 0) + 1; p.lastUsed = Date.now(); this.saveSettingsSoon(); this.refreshViews(); }
+    };
+    const vars = promptVars(p.text);
+    if (vars.length) new PromptFillModal(this.app, this, p, vars, done).open();
+    else done(p.text);
+  }
+
+  /* ---------- 预览 ---------- */
+  previewEntries(list, idx) { new FilePreviewModal(this.app, this, list, Math.max(0, idx || 0)).open(); }
+  noteEntry(n) { return { kind: 'file', file: n.file, name: n.file.name, title: n.title, ext: 'md', projectName: n.projectName, size: n.file.stat.size, mtime: n.file.stat.mtime }; }
+  previewNotes(list, n) { const es = list.map((x) => this.noteEntry(x)); this.previewEntries(es, list.indexOf(n)); }
+
+  /* ---------- 文件导入与打开 ---------- */
+  noteFolder(project, type) {
+    const f = NOTE_TYPES[type].folder;
+    return project ? normalizePath(this.settings.rootFolder + '/项目/' + project + '/' + f) : normalizePath(this.settings.rootFolder + '/' + f);
+  }
+  catFolder(project, cat) {
+    if (String(cat).startsWith('note:')) return this.noteFolder(project, cat.slice(5));
+    const folder = (FILE_CATS[cat] || FILE_CATS.other).folder;
+    return project
+      ? normalizePath(this.settings.rootFolder + '/项目/' + project + '/' + folder)
+      : normalizePath(this.settings.rootFolder + '/' + folder);
+  }
+  uniqueFilePath(folder, name) {
+    name = sanitize(name) || 'file';
+    const ext = extOf(name);
+    const base = ext ? name.slice(0, -(ext.length + 1)) : name;
+    let p = normalizePath(folder + '/' + name);
+    let i = 2;
+    while (this.app.vault.getAbstractFileByPath(p)) p = normalizePath(folder + '/' + base + ' ' + i++ + (ext ? '.' + ext : ''));
+    return p;
+  }
+  /* ---------- 翻译引擎 ---------- */
+  async translate(text, service) {
+    const s = this.settings;
+    service = service || s.transService || 'google';
+    text = String(text || '').trim();
+    if (!text) return '';
+    if (text.length > 5000) text = text.slice(0, 5000);
+    let to = s.transTo || 'zh-CN';
+    // 选中的已经是目标语言（比如中文论文）时，改译成英文（同 Remarkble）
+    if (to.startsWith('zh') && hasCJK(text)) to = 'en';
+    const key = service + '|' + to + '|' + text;
+    this._tcache = this._tcache || new Map();
+    if (this._tcache.has(key)) return this._tcache.get(key);
+    const req = async (o) => {
+      const r = await requestUrl(Object.assign({ throw: false }, o));
+      if (r.status >= 400) {
+        let msg = '';
+        try { msg = (r.json && (r.json.message || (r.json.error && (r.json.error.message || r.json.error)))) || r.text; } catch (e) { msg = ''; }
+        throw new Error('HTTP ' + r.status + (msg ? '：' + String(msg).slice(0, 160) : ''));
+      }
+      return r;
+    };
+    const J = (r) => r.json || JSON.parse(r.text);
+    let out = '';
+    if (service === 'google') {
+      const r = await req({ url: 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=' + encodeURIComponent(to) + '&dt=t&q=' + encodeURIComponent(text), method: 'GET' });
+      out = (J(r)[0] || []).map((x) => x[0]).join('');
+    } else if (service === 'microsoft') {
+      if (!this._msTok || Date.now() - this._msTok.t > 8 * 60000) {
+        const a = await req({ url: 'https://edge.microsoft.com/translate/auth', method: 'GET' });
+        this._msTok = { v: a.text.trim(), t: Date.now() };
+      }
+      const r = await req({ url: 'https://api-edge.cognitive.microsofttranslator.com/translate?api-version=3.0&to=' + encodeURIComponent(LANG_MAP.microsoft[to] || to), method: 'POST', contentType: 'application/json', headers: { Authorization: 'Bearer ' + this._msTok.v }, body: JSON.stringify([{ Text: text }]) });
+      out = J(r)[0].translations[0].text;
+    } else if (service === 'mymemory') {
+      const from = hasCJK(text) ? 'zh-CN' : 'en';
+      const r = await req({ url: 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text.slice(0, 500)) + '&langpair=' + from + '|' + to, method: 'GET' });
+      const j = J(r);
+      if (j.responseStatus && Number(j.responseStatus) !== 200) throw new Error('MyMemory：' + (j.responseDetails || j.responseStatus));
+      out = String(j.responseData && j.responseData.translatedText || '');
+    } else if (service === 'deepl') {
+      const k = (s.deeplKey || '').trim();
+      if (!k) throw new Error('还没填 DeepL API Key（设置 → 科研工作台 → 划词翻译）');
+      const host = /:fx$/.test(k) ? 'https://api-free.deepl.com' : 'https://api.deepl.com';
+      const r = await req({ url: host + '/v2/translate', method: 'POST', contentType: 'application/json', headers: { Authorization: 'DeepL-Auth-Key ' + k }, body: JSON.stringify({ text: [text], target_lang: LANG_MAP.deepl[to] || to.toUpperCase() }) });
+      out = J(r).translations.map((x) => x.text).join('\n');
+    } else if (service === 'baidu') {
+      const id = (s.baiduAppId || '').trim(), sk = (s.baiduKey || '').trim();
+      if (!id || !sk) throw new Error('还没填百度翻译的 APPID 和密钥（设置 → 科研工作台 → 划词翻译）');
+      const salt = String(Date.now());
+      const r = await req({ url: 'https://fanyi-api.baidu.com/api/trans/vip/translate?q=' + encodeURIComponent(text) + '&from=auto&to=' + (LANG_MAP.baidu[to] || to) + '&appid=' + id + '&salt=' + salt + '&sign=' + md5(id + text + salt + sk), method: 'GET' });
+      const j = J(r);
+      if (j.error_code) throw new Error('百度翻译错误 ' + j.error_code + '：' + (j.error_msg || ''));
+      out = (j.trans_result || []).map((x) => x.dst).join('\n');
+    } else if (service === 'llm') {
+      if (!this.directAiReady()) throw new Error('还没填 AI 接口地址和密钥（设置 → 科研工作台 → AI）');
+      const lang = (TRANS_LANGS.find((x) => x[0] === to) || [to, to])[1];
+      out = await this.directChat([{ role: 'system', content: (s.llmPrompt || DEFAULT_LLM_PROMPT).replace(/\{lang\}/g, lang) }, { role: 'user', content: text }], { quick: true });
+    } else throw new Error('未知的翻译服务：' + service);
+    out = String(out || '').trim();
+    if (!out) throw new Error('服务没有返回译文');
+    if (this._tcache.size > 300) this._tcache.clear();
+    this._tcache.set(key, out);
+    return out;
+  }
+  recordTranslation(o, refresh) {
+    const h0 = (this.settings.transHistory = Array.isArray(this.settings.transHistory) ? this.settings.transHistory : []);
+    const last = h0[0];
+    if (last && last.src === o.src && last.service === o.service) return;
+    h0.unshift(Object.assign({ t: Date.now() }, o));
+    if (h0.length > 300) h0.length = 300;
+    this.saveSettingsSoon();
+    if (refresh) this.refreshReaders();
+  }
+  historyFor(c) {
+    const all = Array.isArray(this.settings.transHistory) ? this.settings.transHistory : [];
+    const pdf = c && c.pdf ? c.pdf.path : '', note = c && c.note ? c.note.path : '';
+    return all.filter((x) => (pdf && x.pdf === pdf) || (note && x.note === note)).slice(0, 60);
+  }
+  refreshReaders(tab) {
+    for (const l of this.app.workspace.getLeavesOfType(READER_VIEW)) if (l.view && l.view.renderSoon && (!tab || l.view.tab === tab)) l.view.renderSoon();
+  }
+
+  /* ---------- 文献上下文 ---------- */
+  paperOf(f) {
+    if (!f) return null;
+    const ext = (f.extension || '').toLowerCase();
+    const idx = this.buildIndex();
+    if (ext === 'pdf') {
+      const n = idx.notes.find((x) => x.type === 'literature' && this.pdfsOf(x).some((p) => p.kind === 'vault' && p.file.path === f.path));
+      return { pdf: f, note: n ? n.file : null, noteObj: n || null };
+    }
+    if (ext === 'md') {
+      const n = idx.notes.find((x) => x.file.path === f.path && x.type === 'literature');
+      if (!n) return null;
+      const v = this.pdfsOf(n).find((p) => p.kind === 'vault');
+      return { pdf: v ? v.file : null, note: n.file, noteObj: n };
+    }
+    return null;
+  }
+  paperKey(c) { return c ? (c.note ? c.note.path : '') + '|' + (c.pdf ? c.pdf.path : '') : ''; }
+  /* ═════════ 识别文献标题 / 作者 / 年份：PDF 元数据 + 第一页字号最大的那几行，能用 AI 时再让 AI 校对 ═════════ */
+  async pdfFirstPage(pdf) {
+    const pdfjs = await obsidian.loadPdfJs();
+    const buf = await this.app.vault.readBinary(pdf);
+    const doc = await pdfjs.getDocument({ data: new Uint8Array(buf) }).promise;
+    let info = {};
+    try { const md = await doc.getMetadata(); info = (md && md.info) || {}; } catch (e) { /* ignore */ }
+    const page = await doc.getPage(1);
+    const vp = page.getViewport({ scale: 1 });
+    const tc = await page.getTextContent();
+    const lines = [];
+    for (const it of tc.items) {
+      if (!it.str || !it.str.trim() || !it.transform) continue;
+      const size = Math.round(Math.hypot(it.transform[2], it.transform[3]) * 10) / 10;
+      const y = it.transform[5], x = it.transform[4];
+      let ln = lines.find((l) => Math.abs(l.y - y) < Math.max(2, size * 0.4) && Math.abs(l.size - size) < 0.6);
+      if (!ln) { ln = { y, size, parts: [] }; lines.push(ln); }
+      ln.parts.push({ x, s: it.str });
+    }
+    for (const l of lines) { l.parts.sort((a, b) => a.x - b.x); l.text = l.parts.map((p) => p.s).join(' ').replace(/\s+/g, ' ').trim(); }
+    lines.sort((a, b) => b.y - a.y);
+    let text = lines.map((l) => l.text).join('\n');
+    try { doc.destroy(); } catch (e) { /* ignore */ }
+    return { info, lines, pageH: vp.height, text };
+  }
+  guessTitle(fp) {
+    const bad = /^(ieee|acm|elsevier|springer|journal|proceedings|transactions|arxiv|preprint|vol\.|volume|received|accepted|copyright|©|doi|http|www\.|article|research article|letter|original|contents lists|available online|this article)/i;
+    const cands = fp.lines.filter((l) => l.y > fp.pageH * 0.35 && l.text.length >= 3 && !bad.test(l.text) && !/^\d+$/.test(l.text));
+    const sizes = [...new Set(cands.map((l) => l.size))].sort((a, b) => b - a);
+    for (const sz of sizes.slice(0, 3)) {
+      const group = cands.filter((l) => Math.abs(l.size - sz) < 0.6);
+      // 同一字号、上下挨着的几行拼起来
+      group.sort((a, b) => b.y - a.y);
+      const blocks = [];
+      for (const l of group) { const b = blocks[blocks.length - 1]; if (b && b.lastY - l.y < sz * 2.2) { b.text += ' ' + l.text; b.lastY = l.y; } else blocks.push({ text: l.text, lastY: l.y }); }
+      const best = blocks.find((b) => b.text.length >= 12 && b.text.length <= 300 && /[A-Za-z\u4e00-\u9fff]{3}/.test(b.text));
+      if (best) return best.text.replace(/\s*-\s+(?=[a-z])/g, '').replace(/\s+/g, ' ').trim();
+    }
+    return '';
+  }
+  async detectPaperMeta(pdf, useAi) {
+    const fp = await this.pdfFirstPage(pdf);
+    const mt = String(fp.info.Title || '').trim();
+    const okMeta = mt.length >= 12 && mt.length <= 300 && /\s/.test(mt) && !/^(microsoft|untitled|doi|arxiv|main|paper|manuscript|\d)/i.test(mt) && !/\.(pdf|docx?|tex|dvi)$/i.test(mt);
+    let title = okMeta ? mt : this.guessTitle(fp);
+    const out = { title, source: okMeta ? 'PDF 元数据' : '第一页排版' };
+    if (fp.info.Author && !/^(user|admin|author|anonymous|unknown|administrator)$/i.test(String(fp.info.Author).trim())) out.authors = String(fp.info.Author).trim();
+    const ym = fp.text.match(/\b(19[89]\d|20[0-4]\d)\b/);
+    if (ym) out.year = ym[1];
+    const dm = fp.text.match(/\b(10\.\d{4,9}\/[^\s"<>]+[^\s"<>.,;)])/);
+    if (dm) out.doi = dm[1];
+    if (useAi && this.directAiReady()) {
+      try {
+        const raw = await this.directChat([
+          { role: 'system', content: '你是文献信息抽取助手。根据论文第一页的文字，找出论文的真实标题、作者、年份、期刊或会议、DOI。只输出 JSON：{"title":"原文标题（保持原语言和大小写，不要翻译）","title_zh":"标题的中文翻译","authors":"作者, 用英文分号分隔","year":"四位年份","journal":"期刊或会议名","doi":"DOI"}。找不到的字段给空字符串。' },
+          { role: 'user', content: '候选标题（可能不准）：' + (title || '无') + '\n\n第一页文字：\n' + fp.text.slice(0, 3500) },
+        ], { quick: true });
+        const j = parseAiJson(raw);
+        if (j && j.title && String(j.title).trim().length >= 6) {
+          out.title = String(j.title).replace(/\s+/g, ' ').trim(); out.source = 'AI 识别';
+          for (const k of ['title_zh', 'authors', 'year', 'journal', 'doi']) if (j[k] && String(j[k]).trim()) out[k] = String(j[k]).trim();
+        }
+      } catch (e) { console.warn('[科研工作台] AI 识别标题失败，用排版结果', e); }
+    }
+    return out;
+  }
+  /* 给文献笔记补全标题等属性：只填空着的，不覆盖已有内容；pdf-only 的记在设置里 */
+  async fillLitMeta(noteFile, pdf, o) {
+    o = o || {};
+    if (!pdf && noteFile) { const c = this.paperOf(noteFile); pdf = c && c.pdf; }
+    if (!pdf) { if (!o.quiet) new Notice('这篇文献没有库内 PDF，识别不了标题'); return null; }
+    const meta = await this.detectPaperMeta(pdf, o.ai !== false && this.settings.litMetaAi !== false);
+    if (!meta.title) { if (!o.quiet) new Notice('没认出标题：' + pdf.basename); return null; }
+    if (noteFile) {
+      await this.app.fileManager.processFrontMatter(noteFile, (fm) => {
+        const empty = (v) => v == null || String(v).trim() === '';
+        if (empty(fm.title) || o.force) fm.title = meta.title;
+        for (const k of ['title_zh', 'authors', 'year', 'journal', 'doi']) if (meta[k] && empty(fm[k])) fm[k] = k === 'year' ? Number(meta[k]) || meta[k] : meta[k];
+      });
+    } else {
+      this.settings.pdfMeta = this.settings.pdfMeta || {};
+      this.settings.pdfMeta[pdf.path] = meta;
+      this.saveSettingsSoon();
+    }
+    if (!o.quiet) new Notice('✅ 标题：' + trunc(meta.title, 60) + '（' + meta.source + '）', 5000);
+    return meta;
+  }
+  async fillLitMetaBatch(entries, force) {
+    const todo = entries.filter((n) => force || !str(n.fm && n.fm.title) && (n.pdfOnly ? !(this.settings.pdfMeta || {})[n.file.path] : true));
+    if (!todo.length) return new Notice('这些文献都已经有标题了');
+    const prog = this.ftProgress('🔎 识别文献标题（' + todo.length + ' 篇）');
+    let ok = 0, i = 0;
+    await mapLimit(todo, 2, async (n) => {
+      try {
+        const pdf = n.pdfOnly ? n.file : (this.pdfsOf(n).find((x) => x.kind === 'vault') || {}).file;
+        if (pdf && (await this.fillLitMeta(n.pdfOnly ? null : n.file, pdf, { quiet: true, force }))) ok++;
+      } catch (e) { console.warn(e); }
+      i++; prog.set(i + ' / ' + todo.length + ' 篇，认出 ' + ok + ' 篇');
+    });
+    prog.done();
+    new Notice('✅ 识别完成：' + ok + ' / ' + todo.length + ' 篇有了标题' + (todo.length - ok ? '（没有库内 PDF 或认不出的保持原样）' : ''), 6000);
+    this.refreshViews();
+  }
+  /* 项目里有 PDF 但还没有文献笔记的（例如「文献讲解/10月21日/原文PDF/」）：在文献表格和资料库里也显示出来 */
+  orphanPdfEntries(idx) {
+    idx = idx || this.buildIndex();
+    if (idx._orphans) return idx._orphans;
+    const root = normalizePath(this.settings.rootFolder || '科研');
+    const dd = this.dataDir() + '/';
+    const linked = new Set();
+    for (const n of idx.notes) if (n.type === 'literature') for (const p of this.pdfsOf(n)) if (p.kind === 'vault' && p.file) linked.add(p.file.path);
+    const LIT = /文献|原文|论文|参考|阅读|讲解|paper|literature|reading|reference/i;
+    const NOT = /overleaf|对比|目标稿|投稿|草稿|draft|submission|审稿|rebuttal/i;
+    const out = [];
+    let mdByDir = null;
+    for (const f of this.app.vault.getFiles()) {
+      if ((f.extension || '').toLowerCase() !== 'pdf' || linked.has(f.path) || !f.path.startsWith(root + '/') || f.path.startsWith(dd)) continue;
+      const dirs = f.path.slice(root.length + 1).split('/').slice(0, -1);
+      if (!dirs.some((d) => LIT.test(d)) || dirs.some((d) => NOT.test(d))) continue;
+      const projectName = dirs[0] === '项目' && dirs[1] ? dirs[1] : '';
+      // 同目录 / 上一级里编号相同的 md（比如「02 xxx.md」对「02_xxx.pdf」）当作讲解稿，标题也用它的
+      let explain = null;
+      const pm = f.basename.match(/^(\d{1,3})[\s_.-]/);
+      if (pm) {
+        const num = Number(pm[1]);
+        if (!mdByDir) { mdByDir = new Map(); for (const x of this.app.vault.getMarkdownFiles()) { if (!x.path.startsWith(root + '/')) continue; const d = x.path.split('/').slice(0, -1).join('/'); if (!mdByDir.has(d)) mdByDir.set(d, []); mdByDir.get(d).push(x); } }
+        const d1 = f.path.split('/').slice(0, -1).join('/');
+        const d2 = d1.split('/').slice(0, -1).join('/');
+        for (const d of [d1, d2]) {
+          const hit = (mdByDir.get(d) || []).find((x) => { const m = x.basename.match(/^(\d{1,3})[\s_.-]/); return m && Number(m[1]) === num; });
+          if (hit) { explain = hit; break; }
+        }
+      }
+      const pm2 = (this.settings.pdfMeta || {})[f.path];
+      const title = (pm2 && pm2.title) || (explain ? explain.basename : f.basename.replace(/_/g, ' '));
+      out.push({ kind: 'note', type: 'literature', pdfOnly: true, file: f, fm: {}, title, projectName, status: '无笔记', date: fmtDate(new Date(f.stat.mtime || f.stat.ctime || Date.now())), explain, inferred: false, openTasks: 0 });
+    }
+    idx._orphans = out;
+    return out;
+  }
+  paperTitle(c) {
+    if (!c) return '';
+    const n = c.noteObj || (c.note ? this.buildIndex().notes.find((x) => x.file.path === c.note.path) : null);
+    if (n) return str(n.fm && n.fm.title) || n.title;
+    return c.pdf ? c.pdf.basename : c.html ? c.html.basename : '';
+  }
+  titleZh(c) {
+    const n = c && c.noteObj;
+    const t = n && n.fm ? str(n.fm.title_zh) : '';
+    return t || this.infoCache(c).titleZh || '';
+  }
+  infoCache(c) {
+    this._info = this._info || new Map();
+    const k = this.paperKey(c);
+    if (!this._info.has(k)) this._info.set(k, {});
+    return this._info.get(k);
+  }
+  async createLitNoteForPdf(pdf) {
+    const idx = this.buildIndex();
+    let x = idx.files.find((e) => e.file && e.file.path === pdf.path) || { kind: 'file', file: pdf, name: pdf.name, ext: 'pdf', cat: 'literature', projectName: '' };
+    // 有编号对得上的讲解稿：用讲解稿的标题，并在笔记里链接它
+    const orphan = this.orphanPdfEntries(idx).find((n) => n.file.path === pdf.path);
+    const known = (this.settings.pdfMeta || {})[pdf.path];
+    if (orphan) x = Object.assign({}, x, { projectName: x.projectName || orphan.projectName, noteTitle: known && known.title ? known.title.slice(0, 90) : orphan.explain ? orphan.title : '', explain: orphan.explain });
+    const nf = await this.createNoteForEntry(x, 'literature', false);
+    // 之前按 PDF 记下的表格分析结果、AI 问答，挪到新笔记名下
+    if (nf && nf.path) {
+      try { if (this._pg && this._pg[pdf.path]) { this._pg[nf.path] = Object.assign({}, this._pg[pdf.path], this._pg[nf.path] || {}); delete this._pg[pdf.path]; this.pgSaveSoon(); } } catch (e) { /* ignore */ }
+      try { if (this.mfStore && this.mfStore.rename) await this.mfStore.rename(pdf.path, nf.path); } catch (e) { /* ignore */ }
+      // 新笔记顺手识别标题、作者、年份（填空，不覆盖）
+      if (this.settings.litAutoMeta !== false) setTimeout(() => { this.fillLitMeta(nf, pdf, { quiet: true }).catch(() => {}); }, 300);
+    }
+    return nf;
+  }
+  /* 原文 + 译文 / AI 结果 / 我的笔记 写进文献笔记的「## 划线摘录」 */
+  async addExcerpt(o) {
+    let noteFile = o.note || null;
+    if (!noteFile && o.pdf) {
+      const c = this.paperOf(o.pdf);
+      noteFile = c && c.note;
+      if (!noteFile) {
+        noteFile = await this.createLitNoteForPdf(o.pdf);
+        if (noteFile) new Notice('已为这个 PDF 新建文献笔记：' + noteFile.basename);
+      }
+    }
+    if (!noteFile) { new Notice('找不到这篇文献的笔记'); return false; }
+    const x = { id: uid(), pdfPath: o.pdf ? o.pdf.path : '', page: o.page ? String(o.page) : '', date: today(), source: o.source || (o.translation ? '划线翻译' : o.ai ? o.ai.label : '原文高亮'), text: o.text || '', translation: o.translation || '', ai: o.ai ? [o.ai] : [], note: o.noteText || '' };
+    const block = excerptToMd(x);
+    await this.app.vault.process(noteFile, (data) => {
+      const i = data.search(/(^|\n)## 划线摘录[ \t]*(\n|$)/);
+      if (i < 0) return data.replace(/\s*$/, '') + '\n\n' + EXCERPT_HEADING + '\n\n' + block;
+      const hs = data.indexOf('## 划线摘录', i);
+      const next = data.indexOf('\n## ', hs + 6);
+      if (next < 0) return data.replace(/\s*$/, '') + '\n\n' + block;
+      return data.slice(0, next).replace(/\s*$/, '') + '\n\n' + block + data.slice(next);
+    });
+    if (!o.silent) new Notice('❝ 已写入「' + noteFile.basename + '」的划线摘录');
+    this.refreshReaders();
+    return true;
+  }
+  async readExcerpts(file) {
+    let data = '';
+    try { data = await this.app.vault.cachedRead(file); } catch (e) { return []; }
+    return excerptBlocks(data).reverse();
+  }
+  async abstractOf(n) {
+    if (n.fm && str(n.fm.abstract)) return str(n.fm.abstract);
+    const secs = await this.noteSections(n.file, ['摘要', 'Abstract']);
+    const t = secs['摘要'] || secs['Abstract'] || '';
+    return t === '（无）' ? '' : t;
+  }
+  /* 读笔记里的若干「## 标题」小节 */
+  async noteSections(file, names) {
+    let data = '';
+    try { data = await this.app.vault.cachedRead(file); } catch (e) { return {}; }
+    const out = {};
+    for (const nm of names) {
+      const re = new RegExp('\\n##\\s*' + nm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\n([\\s\\S]*?)(?=\\n## |$)', 'i');
+      const m = ('\n' + data).match(re);
+      if (m) out[nm] = m[1].trim();
+    }
+    return out;
+  }
+  /* 写入/替换笔记里的「## 标题」小节（放在「## 摘要」后面） */
+  async writeNoteSections(file, parts) {
+    await this.app.vault.process(file, (data) => {
+      for (const [nm, content] of Object.entries(parts)) {
+        const block = '## ' + nm + '\n' + String(content).trim() + '\n';
+        const re = new RegExp('(^|\\n)##\\s*' + nm + '\\s*\\n[\\s\\S]*?(?=\\n## |$)');
+        if (re.test(data)) { data = data.replace(re, (m, pre) => pre + block.replace(/\n$/, '')); continue; }
+        const am = data.match(/\n##\s*摘要\s*\n[\s\S]*?(?=\n## |$)/);
+        if (am) { const end = am.index + am[0].length; data = data.slice(0, end).replace(/\s*$/, '') + '\n\n' + block + data.slice(end); }
+        else data = data.replace(/\s*$/, '') + '\n\n' + block;
+      }
+      return data;
+    });
+    this.refreshReaders();
+  }
+  async openPdfPage(pdf, page) {
+    if (!pdf) return;
+    await this.app.workspace.openLinkText(pdf.path + (page ? '#page=' + page : ''), '', false);
+  }
+  async openWorkbenchProject(name) {
+    await this.activateView();
+    const l = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
+    if (l && l.view && l.view.openProject) l.view.openProject(name);
+  }
+  async activateReader(focus, tab) {
+    const ws = this.app.workspace;
+    let leaf = ws.getLeavesOfType(READER_VIEW)[0];
+    if (!leaf) {
+      leaf = ws.getRightLeaf ? ws.getRightLeaf(false) : ws.getLeaf('split');
+      if (!leaf) return null;
+      await leaf.setViewState({ type: READER_VIEW, active: !!focus });
+    }
+    if (focus !== false) ws.revealLeaf(leaf);
+    if (tab && leaf.view && leaf.view.setTab) leaf.view.setTab(tab);
+    return leaf;
+  }
+
+  /* ---------- 选中文字 ---------- */
+  setupSelectionTranslate() {
+    this._popups = new Map();
+    const hook = (win) => {
+      const doc = win.document;
+      if (this._popups.has(doc)) return;
+      const pop = new TranslatePopup(this, doc);
+      this._popups.set(doc, pop);
+      let t = null;
+      const check = (e) => {
+        if (e && pop.contains(e.target)) return;
+        if (e && e.target && e.target.closest && e.target.closest('.rw-gl-text')) return;
+        clearTimeout(t);
+        t = setTimeout(() => this.onSelection(doc, pop), TOUCH ? 450 : 30);
+      };
+      this.registerDomEvent(doc, 'mouseup', check);
+      this.registerDomEvent(doc, 'keyup', (e) => { if (e.key === 'Shift') check(e); if (e.key === 'Escape' && pop.isOpen()) pop.hide(); });
+      if (TOUCH) this.registerDomEvent(doc, 'selectionchange', () => check());
+      this.registerDomEvent(doc, 'mousedown', (e) => { if (pop.isOpen() && !pop.contains(e.target) && !pop.isPinned()) pop.hide(); });
+    };
+    hook(window);
+    if (this.app.workspace.on) this.registerEvent(this.app.workspace.on('window-open', (w) => { try { hook(w.win || w); } catch (e) { /* ignore */ } }));
+    this.register(() => { for (const p of this._popups.values()) p.hide(); });
+  }
+  selectionContext(doc, loose) {
+    const sel = doc.getSelection ? doc.getSelection() : null;
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+    const text = cleanPdfText(sel.toString());
+    if (!text || text.length < 2) return null;
+    let node = sel.anchorNode;
+    if (node && node.nodeType === 3) node = node.parentElement;
+    if (!node || !node.closest) return null;
+    if (node.closest('input, textarea, .rw-tp, .modal, .rw-rd-tbox, .rw-chat-input, .prompt, .rw-mf')) return null;
+    const scope = this.settings.transScope || 'pdf';
+    const inPdf = node.closest('.pdf-viewer, .pdfViewer, .pdf-container, .pdf-content-container, .textLayer');
+    if (!inPdf && !loose) {
+      if (scope !== 'all') return null;
+      if (!node.closest('.markdown-preview-view, .markdown-reading-view, .markdown-source-view, .rw-reader')) return null;
+    }
+    if (/^[\s\d.,;:()\[\]{}%+\-=*/\\|<>'"`~!@#$^&_]+$/.test(text)) return null;
+    const pageEl = node.closest('.page[data-page-number]');
+    const page = pageEl ? pageEl.getAttribute('data-page-number') : '';
+    let file = null;
+    try { this.app.workspace.iterateAllLeaves((l) => { if (!file && l.view && l.view.containerEl && l.view.containerEl.contains(node) && l.view.file) file = l.view.file; }); } catch (e) { /* ignore */ }
+    if (!file && this.app.workspace.getActiveFile) file = this.app.workspace.getActiveFile();
+    const paper = file ? this.paperOf(file) : null;
+    const range = sel.getRangeAt(0);
+    let rect = range.getBoundingClientRect();
+    if ((!rect || (!rect.width && !rect.height)) && range.getClientRects().length) rect = range.getClientRects()[0];
+    const pdf = paper ? paper.pdf : (file && file.extension === 'pdf' ? file : null);
+    // Remarkble 锚点：选区在页面上的位置（按比例存，缩放后照样对得上）
+    let anchor = null;
+    if (pageEl && pdf) {
+      const lines = mergeClientRects(pageEl.getBoundingClientRect(), range.getClientRects());
+      if (lines.length) anchor = { page: Number(page), lines };
+    }
+    return { text, page, rect, pdf, note: paper ? paper.note : null, noteObj: paper ? paper.noteObj : null, file, anchor };
+  }
+  onSelection(doc, pop) {
+    const trig = this.settings.transTrigger || 'auto';
+    if (trig === 'off') return;
+    const ctx = this.selectionContext(doc);
+    if (!ctx) return;
+    if (pop.isOpen() && pop.ctx && pop.ctx.text === ctx.text) return;
+    if (trig === 'gloss' && ctx.anchor) { this.glossFromContext(ctx); this.clearSelection(doc); return; }
+    if (trig === 'button') pop.showBubble(ctx.rect, ctx);
+    else pop.show(ctx.rect, ctx);
+  }
+  clearSelection(doc) { try { doc.getSelection().removeAllRanges(); } catch (e) { /* ignore */ } }
+  popupFor(doc) {
+    let pop = this._popups && this._popups.get(doc);
+    if (!pop) { pop = new TranslatePopup(this, doc); if (this._popups) this._popups.set(doc, pop); }
+    return pop;
+  }
+  curDoc() { return (typeof activeDocument !== 'undefined' && activeDocument) || document; }
+  translateSelectionCommand() {
+    const doc = this.curDoc();
+    const ctx = this.selectionContext(doc, true);
+    if (!ctx) return new Notice('先选中要翻译的文字');
+    this.popupFor(doc).show(ctx.rect, ctx);
+  }
+  glossSelectionCommand() {
+    const doc = this.curDoc();
+    const ctx = this.selectionContext(doc, true);
+    if (!ctx) return new Notice('先在 PDF 里选中单词或句子');
+    if (!ctx.anchor) return new Notice('没有定位到 PDF 页面：请在 Obsidian 的 PDF 阅读页里选中文字');
+    this.popupFor(doc).hide();
+    this.glossFromContext(ctx);
+    this.clearSelection(doc);
+  }
+  directAiReady() { const s = this.settings; return !!((s.llmBase || '').trim() && (s.llmKey || '').trim()); }
+  /* 拼请求体：模型、思考模式（DeepSeek）、最大输出 */
+  aiUrl() { const base = (this.settings.llmBase || '').trim().replace(/\/+$/, ''); return /\/chat\/completions$/.test(base) ? base : base + '/chat/completions'; }
+  aiIsDeepseek() { return /deepseek/i.test(this.settings.llmBase || '') || /^deepseek/i.test(this.settings.llmModel || ''); }
+  aiBody(messages, o) {
+    o = o || {};
+    const s = this.settings;
+    const b = { model: o.model || s.llmModel || 'deepseek-flash', messages };
+    let think = s.llmThinking || 'auto';
+    if (o.thinking) think = o.thinking;
+    else if (think === 'auto' && o.quick) think = 'off'; // 翻译这类小活不用深度思考，快很多
+    if (this.aiIsDeepseek() && (think === 'off' || think === 'on')) b.thinking = { type: think === 'off' ? 'disabled' : 'enabled' };
+    if (think !== 'on' && !(think === 'auto' && this.aiIsDeepseek())) b.temperature = o.temperature != null ? o.temperature : 0.3;
+    const mt = Number(s.llmMaxTokens);
+    if (mt > 0) b.max_tokens = Math.round(mt);
+    if (o.stream) b.stream = true;
+    return b;
+  }
+  /* 回答为空时，说清楚是怎么回事 */
+  aiEmptyReason(info) {
+    info = info || {};
+    if (info.error) return /risk|sensitive|safety/i.test(info.error) ? '触发了接口的内容安全过滤（' + info.error + '），换个问法或换个模型试试' : 'AI 接口报错：' + info.error;
+    if (info.finish === 'length') return '回答被截断：' + (info.reasoning ? '深度思考用完了全部输出额度（思考了 ' + info.reasoning + ' 字），还没开始写正文。' : '到了最大输出长度。') + '可以在 设置 → 科研工作台 → AI 里关闭「深度思考」或调大「最大输出」。';
+    if (info.finish === 'content_filter' || info.finish === 'sensitive') return '内容被接口的安全过滤拦下了，换个问法试试';
+    if (info.reasoning) return '模型只给出了思考过程（' + info.reasoning + ' 字），没有正文';
+    return 'AI 没有返回内容' + (info.finish ? '（结束原因：' + info.finish + '）' : '') + (info.raw ? '；接口返回：' + info.raw : '');
+  }
+  async directChat(messages, o) {
+    o = o || {};
+    const s = this.settings;
+    const r = await requestUrl({ url: this.aiUrl(), method: 'POST', contentType: 'application/json', headers: { Authorization: 'Bearer ' + (s.llmKey || '').trim() }, body: JSON.stringify(this.aiBody(messages, o)), throw: false });
+    let j = null; try { j = r.json; } catch (e) { j = null; }
+    if (r.status >= 400) throw new Error('AI 接口 HTTP ' + r.status + '：' + String((j && j.error && (j.error.message || j.error)) || r.text || '').slice(0, 200));
+    const ch = j && j.choices && j.choices[0];
+    const msg = ch && (ch.message || ch.delta) || {};
+    const content = String(msg.content || '').trim();
+    const reasoning = String(msg.reasoning_content || msg.reasoning || '');
+    if (o.info) Object.assign(o.info, { finish: ch && ch.finish_reason, reasoning: reasoning.length, reasoningText: reasoning, error: j && j.error ? String(j.error.message || j.error) : '', raw: !ch ? String(r.text || '').slice(0, 160) : '' });
+    if (!content && o.strict !== false) {
+      const info = { finish: ch && ch.finish_reason, reasoning: reasoning.length, error: j && j.error ? String(j.error.message || j.error) : '', raw: !ch ? String(r.text || '').slice(0, 160) : '' };
+      // 深度思考把额度用完了：自动关掉思考重来一次
+      if (!o.retried && this.aiIsDeepseek() && (this.settings.llmThinking || 'auto') !== 'on' && (info.finish === 'length' || info.reasoning) && !info.error) return this.directChat(messages, Object.assign({}, o, { retried: true, thinking: 'off' }));
+      throw new Error(this.aiEmptyReason(info));
+    }
+    return content;
+  }
+  async aiAction(action, text, o) {
+    o = o || {};
+    if (!this.directAiReady()) throw new Error('还没配置 AI：到 设置 → 科研工作台 → AI 填接口地址和密钥');
+    const user = (o.title ? '论文：' + o.title + '\n\n' : '') + (o.context ? '上下文（仅供理解，不要处理）：\n' + String(o.context).slice(0, 8000) + '\n\n' : '') + (o.instructions ? '用户额外要求（需要遵守，但不要把这段当作原文处理）：\n' + o.instructions + '\n\n' : '') + '待处理文本（只处理这一段）：\n' + String(text).slice(0, 6000);
+    const content = await this.directChat([{ role: 'system', content: o.system || AI_ACTION_PROMPTS[action] || AI_ACTION_PROMPTS.explain }, { role: 'user', content: user }]);
+    return { content, via: this.settings.llmModel || 'AI' };
+  }
+  /* 论文全文：用 pdf.js 从 PDF 抽文字（有缓存）；没有 PDF 就用笔记正文 */
+  async paperText(c) {
+    this._ptext = this._ptext || new Map();
+    if (c.pdf) {
+      const k = c.pdf.path + '|' + c.pdf.stat.mtime;
+      if (this._ptext.has(k)) return this._ptext.get(k);
+      try {
+        const pdfjs = await obsidian.loadPdfJs();
+        const buf = await this.app.vault.readBinary(c.pdf);
+        const doc = await pdfjs.getDocument({ data: new Uint8Array(buf) }).promise;
+        const parts = [];
+        let total = 0;
+        for (let i = 1; i <= Math.min(doc.numPages, 80) && total < 150000; i++) {
+          const page = await doc.getPage(i);
+          const tc = await page.getTextContent();
+          let s = '';
+          for (const it of tc.items) s += (it.str || '') + (it.hasEOL ? '\n' : ' ');
+          s = cleanPdfText(s.replace(/[ \t]+\n/g, '\n'));
+          parts.push('[第 ' + i + ' 页] ' + s);
+          total += s.length;
+        }
+        try { doc.destroy(); } catch (e) { /* ignore */ }
+        const text = parts.join('\n\n');
+        this._ptext.set(k, text);
+        return text;
+      } catch (e) { console.warn('[科研工作台] 读取 PDF 全文失败', e); }
+    }
+    if (c.note) { try { return await this.app.vault.cachedRead(c.note); } catch (e) { return ''; } }
+    if (c.html) {
+      const k = c.html.path + '|' + c.html.stat.mtime;
+      if (this._ptext.has(k)) return this._ptext.get(k);
+      try {
+        let t = await this.app.vault.cachedRead(c.html);
+        t = t.replace(/<script\b[\s\S]*?<\/script>/gi, ' ').replace(/<style\b[\s\S]*?<\/style>/gi, ' ').replace(/<annotation\b[\s\S]*?<\/annotation>/gi, ' ')
+          .replace(/<(br|p|div|h[1-6]|li|tr|section|article|table|blockquote)\b[^>]*>/gi, '\n').replace(/<[^>]+>/g, ' ')
+          .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&')
+          .replace(/[ \t]+/g, ' ').replace(/\n[ \t]+/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+        this._ptext.set(k, t);
+        return t;
+      } catch (e) { return ''; }
+    }
+    return '';
+  }
+  /* ---------- Remarkble：译文标在 PDF 原文上方 ---------- */
+  glossDir() { return normalizePath(((this.manifest && this.manifest.dir) || (this.app.vault.configDir || '.obsidian') + '/plugins/research-workbench') + '/glosses'); }
+  async glossStore(pdfPath) {
+    this._gl = this._gl || new Map();
+    if (this._gl.has(pdfPath)) return this._gl.get(pdfPath);
+    let st = await this.dataRead(this.dataFind('译文标注', pdfPath));
+    if (!st || !Array.isArray(st.glosses)) {
+      const old = await this.legacyRead(this.glossDir() + '/' + md5(pdfPath) + '.json');
+      st = old && Array.isArray(old.glosses) ? old : { path: pdfPath, glosses: [] };
+      if (old) { st.path = pdfPath; this._gl.set(pdfPath, st); await this.saveGloss(pdfPath); }
+    }
+    st.path = pdfPath;
+    if (this._gl.has(pdfPath)) return this._gl.get(pdfPath);
+    this._gl.set(pdfPath, st);
+    return st;
+  }
+  saveGlossSoon(pdfPath) {
+    this._glT = this._glT || {};
+    clearTimeout(this._glT[pdfPath]);
+    this._glT[pdfPath] = setTimeout(() => this.saveGloss(pdfPath), 400);
+  }
+  async saveGloss(pdfPath) {
+    const st = this._gl && this._gl.get(pdfPath);
+    if (!st) return;
+    const keep = st.glosses.filter((g) => !g.pending && !g.failed);
+    if (!keep.length) { await this.dataRemove('译文标注', pdfPath); return; }
+    const name = pdfPath.split('/').pop().replace(/\.pdf$/i, '');
+    await this.dataWrite('译文标注', name, pdfPath, { path: pdfPath, glosses: keep }, 'PDF「' + name + '」上标注的译文');
+  }
+  async glossFromContext(ctx, preset) {
+    if (!ctx || !ctx.anchor || !ctx.pdf) { new Notice('没有定位到 PDF 页面'); return; }
+    const st = await this.glossStore(ctx.pdf.path);
+    const norm = (t) => cleanPdfText(t).toLowerCase();
+    let g = st.glosses.find((x) => x.page === ctx.anchor.page && norm(x.text) === norm(ctx.text));
+    if (g && g.pending) return;
+    const prev = g && !g.failed ? { translation: g.translation, engine: g.engine } : null;
+    if (!g) { g = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), createdAt: Date.now() }; st.glosses.push(g); }
+    Object.assign(g, { page: ctx.anchor.page, lines: ctx.anchor.lines, text: ctx.text, pending: true, failed: false, translation: '翻译中…', engine: this.settings.transService || 'google' });
+    this.repaintGlosses(ctx.pdf.path);
+    try {
+      const r = preset || { translation: await this.translate(ctx.text, this.settings.glossService || this.settings.transService), engine: this.settings.glossService || this.settings.transService };
+      Object.assign(g, { translation: r.translation, engine: r.engine, pending: false, failed: false });
+      this.recordTranslation({ src: ctx.text, dst: r.translation, service: r.engine, pdf: ctx.pdf.path, note: ctx.note ? ctx.note.path : '', page: String(ctx.anchor.page) });
+      this.saveGlossSoon(ctx.pdf.path);
+    } catch (e) {
+      if (prev) { Object.assign(g, prev, { pending: false }); new Notice('翻译失败：' + e.message); }
+      else Object.assign(g, { translation: '翻译失败：' + e.message, pending: false, failed: true });
+    }
+    this.repaintGlosses(ctx.pdf.path);
+    this.refreshReaders('trans');
+  }
+  async removeGloss(pdfPath, id) {
+    const st = await this.glossStore(pdfPath);
+    st.glosses = st.glosses.filter((g) => g.id !== id);
+    this.saveGlossSoon(pdfPath);
+    this.repaintGlosses(pdfPath);
+    this.refreshReaders('trans');
+  }
+  async clearGlosses(pdfPath) {
+    const st = await this.glossStore(pdfPath);
+    st.glosses = [];
+    await this.saveGloss(pdfPath);
+    this.repaintGlosses(pdfPath);
+    this.refreshReaders('trans');
+  }
+  /* 找到所有打开的 PDF 视图，挂上监听（翻页、缩放时重画） */
+  pdfViews() {
+    const out = [];
+    try { this.app.workspace.iterateAllLeaves((l) => { const v = l.view; if (v && v.file && (v.file.extension || '').toLowerCase() === 'pdf' && v.containerEl) out.push(v); }); } catch (e) { /* ignore */ }
+    return out;
+  }
+  scanPdfViews() {
+    this._glObs = this._glObs || new WeakMap();
+    for (const v of this.pdfViews()) {
+      const el = v.containerEl;
+      if (!this._glObs.has(el)) {
+        let t = null;
+        const mo = new MutationObserver((recs) => {
+          if (recs.every((r) => r.target.closest && r.target.closest('.rw-gl-layer'))) return;
+          if (recs.every((r) => [...r.addedNodes, ...r.removedNodes].every((n) => n.classList && (n.classList.contains('rw-gl-layer') || n.classList.contains('rw-gl'))))) return;
+          clearTimeout(t);
+          t = setTimeout(() => this.paintView(v), 120);
+        });
+        mo.observe(el, { childList: true, subtree: true });
+        this._glObs.set(el, mo);
+        this.register(() => mo.disconnect());
+      }
+      this.paintView(v);
+    }
+  }
+  repaintGlosses(pdfPath) { for (const v of this.pdfViews()) if (!pdfPath || v.file.path === pdfPath) this.paintView(v); }
+  repaintAllGlosses() { this.repaintGlosses(null); }
+  async paintView(v) {
+    const pdfPath = v.file.path;
+    const st = await this.glossStore(pdfPath);
+    const show = this.settings.glossShow !== false;
+    for (const pageEl of v.containerEl.querySelectorAll('.page[data-page-number]')) {
+      const pn = Number(pageEl.getAttribute('data-page-number'));
+      const list = show ? st.glosses.filter((g) => g.page === pn && g.lines && g.lines.length) : [];
+      this.paintPage(pageEl, list, pdfPath);
+    }
+  }
+  paintPage(pageEl, list, pdfPath) {
+    let layer = pageEl.querySelector(':scope > .rw-gl-layer');
+    if (!list.length) { if (layer) layer.remove(); return; }
+    const box = pageEl.getBoundingClientRect();
+    const s = this.settings;
+    const sig = list.map((g) => [g.id, g.translation, g.pending ? 1 : 0, g.dx || 0, g.dy || 0, g.size || 1, g.place || '', g.gap == null ? '' : g.gap].join(':')).join('|') + '#' + Math.round(box.height) + '#' + s.glossColor + s.glossScale + s.glossPlace + s.glossGap;
+    if (layer && layer.dataset.sig === sig && layer.isConnected) return;
+    if (!layer) { layer = pageEl.ownerDocument.createElement('div'); layer.className = 'rw-gl-layer'; pageEl.appendChild(layer); }
+    layer.dataset.sig = sig;
+    clear(layer);
+    const color = s.glossColor || '#9f1239';
+    const scale = Number(s.glossScale) || 0.5;
+    const gap = s.glossGap != null && s.glossGap !== '' ? Number(s.glossGap) : 0.18;
+    const H = box.height || 1000, W = box.width || 800;
+    for (const g of list) {
+      const wrap = h(layer, 'div', { cls: 'rw-gl' + (g.pending ? ' is-pending' : '') + (g.failed ? ' is-failed' : '') });
+      wrap.style.color = g.failed ? '#b45309' : color;
+      for (const ln of g.lines) {
+        const u = h(wrap, 'div', { cls: 'rw-gl-u' });
+        u.style.left = ln.x * 100 + '%'; u.style.top = ln.y * 100 + '%'; u.style.width = ln.w * 100 + '%'; u.style.height = ln.h * 100 + '%';
+      }
+      const below = (g.place || s.glossPlace || 'above') === 'below';
+      const ref = below ? g.lines[g.lines.length - 1] : g.lines[0];
+      const minX = Math.min(...g.lines.map((l) => l.x));
+      const maxR = Math.max(...g.lines.map((l) => l.x + l.w));
+      const t = h(wrap, 'div', { cls: 'rw-gl-text', text: g.translation || '', title: g.failed ? '翻译失败，点击删除' : (TRANS_SERVICES[g.engine] || { label: g.engine || '' }).label + ' · 拖动可移动位置 · 点击：字号 / 上下 / 复制 / 删除' });
+      const linePx = Math.max(8, ref.h * H);
+      t.style.fontSize = Math.max(7, Math.min(48, linePx * scale * (g.size || 1))) + 'px';
+      const oneLine = g.lines.length === 1;
+      const cx = (oneLine ? ref.x + ref.w / 2 : (minX + maxR) / 2) + (g.dx || 0);
+      const width = Math.max(oneLine ? ref.w : maxR - minX, 0.08);
+      const ty = (below ? ref.y + ref.h : ref.y) + (g.dy || 0);
+      t.style.left = cx * 100 + '%';
+      t.style.top = ty * 100 + '%';
+      t.style.maxWidth = Math.min(width + 0.06, 0.96) * 100 + '%';
+      const gg = g.gap != null && g.gap !== '' ? Number(g.gap) : gap;
+      t.style.transform = below ? 'translate(-50%, ' + (linePx * gg).toFixed(1) + 'px)' : 'translate(-50%, calc(-100% - ' + (linePx * gg).toFixed(1) + 'px))';
+      t.dataset.gid = g.id;
+      if (g.dx || g.dy) t.classList.add('is-moved');
+      // 拖动调整位置（按页面比例保存，缩放后仍在原处）
+      t.addEventListener('mousedown', (e) => { e.stopPropagation(); e.preventDefault(); });
+      t.style.touchAction = 'none';
+      t.addEventListener('pointerdown', (e) => {
+        e.stopPropagation(); e.preventDefault();
+        if (g.pending || (e.pointerType === 'mouse' && e.button !== 0)) return;
+        const x0 = e.clientX, y0 = e.clientY, dx0 = g.dx || 0, dy0 = g.dy || 0;
+        let moved = false;
+        const doc = pageEl.ownerDocument;
+        const mv = (ev) => {
+          const ddx = ev.clientX - x0, ddy = ev.clientY - y0;
+          if (!moved && Math.abs(ddx) + Math.abs(ddy) < (ev.pointerType === 'mouse' ? 4 : 8)) return;
+          moved = true; t.classList.add('is-dragging');
+          t.style.left = (cx - dx0 + dx0 + ddx / W) * 100 + '%';
+          t.style.top = (ty + ddy / H) * 100 + '%';
+        };
+        const up = (ev) => {
+          doc.removeEventListener('pointermove', mv, true); doc.removeEventListener('pointerup', up, true); doc.removeEventListener('pointercancel', up, true);
+          t.classList.remove('is-dragging');
+          if (moved) { g.dx = +(dx0 + (ev.clientX - x0) / W).toFixed(4); g.dy = +(dy0 + (ev.clientY - y0) / H).toFixed(4); this.saveGlossSoon(pdfPath); this.repaintGlosses(pdfPath); }
+          else if (g.failed) this.removeGloss(pdfPath, g.id);
+          else this.glossToolbar(pdfPath, g, t);
+        };
+        doc.addEventListener('pointermove', mv, true); doc.addEventListener('pointerup', up, true); doc.addEventListener('pointercancel', up, true);
+      });
+      t.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); });
+      t.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); if (!g.pending) this.glossMenu(e, pdfPath, g); });
+    }
+  }
+  /* 译文样式面板：单击 PDF 上的译文，或阅读视图工具栏的「Aa」打开。
+     默认改「全部译文」（并作为以后新译文的默认），也可以切到「只改这一条」。滑块拖动时实时生效。 */
+  glossToolbar(pdfPath, g, textEl) { this.glossStylePanel(textEl.ownerDocument, () => { const el = textEl.ownerDocument.querySelector('.rw-gl-text[data-gid="' + g.id + '"]') || textEl; return el.getBoundingClientRect(); }, { pdfPath, g }); }
+  glossStylePanel(doc, rectFn, o) {
+    o = o || {};
+    if (this._glBar) this._glBar.close();
+    const s = this.settings;
+    const g = o.g || null;
+    const DEF = { scale: 0.5, gap: 0.18, place: 'above', color: '#9f1239' };
+    const gScale = () => (Number(s.glossScale) || DEF.scale);
+    const gGap = () => (s.glossGap != null && s.glossGap !== '' ? Number(s.glossGap) : DEF.gap);
+    let scope = g ? (s.glossEditScope === 'one' ? 'one' : 'all') : 'all';
+    const bar = doc.createElement('div');
+    bar.className = 'rw-gl-panel';
+    doc.body.appendChild(bar);
+    bar.addEventListener('mousedown', (e) => e.stopPropagation());
+    const repaint = () => { cancelAnimationFrame(this._glRaf); this._glRaf = requestAnimationFrame(() => { this.repaintAllGlosses(); setTimeout(place, 30); }); };
+    /* 改「全部」时，清掉各条译文在这一项上的单独设置，保证真的全部一致 */
+    const clearOverrides = (key) => {
+      for (const [path, st] of this._gl || []) {
+        let changed = false;
+        for (const x of st.glosses) if (x[key] != null && x[key] !== '' && x[key] !== 0) { x[key] = key === 'gap' ? null : key === 'size' ? 0 : ''; changed = true; }
+        if (changed) this.saveGlossSoon(path);
+      }
+    };
+    const draw = () => {
+      clear(bar);
+      const head = h(bar, 'div', { cls: 'rw-gl-panel-head' });
+      if (g) {
+        const seg = h(head, 'div', { cls: 'rw-seg' });
+        for (const [v, t] of [['all', '全部译文'], ['one', '只改这一条']]) {
+          const b = h(seg, 'button', { cls: 'rw-seg-btn' + (scope === v ? ' is-active' : ''), text: t });
+          b.addEventListener('click', () => { scope = v; s.glossEditScope = v; this.saveSettingsSoon(); draw(); });
+        }
+      } else h(head, 'b', { text: '全部译文的样式' });
+      h(head, 'span', { cls: 'rw-tp-sp' });
+      const x = h(head, 'button', { cls: 'rw-tp-btn', title: '关闭（Esc）' }); ic(x, 'x'); x.addEventListener('click', () => close());
+      const one = scope === 'one' && g;
+      const row = (label, min, max, step, val, fmt, onInput) => {
+        const r = h(bar, 'div', { cls: 'rw-gl-row' });
+        h(r, 'span', { cls: 'rw-gl-row-label', text: label });
+        const inp = h(r, 'input', { attr: { type: 'range', min: String(min), max: String(max), step: String(step) } });
+        inp.value = String(val);
+        const out = h(r, 'span', { cls: 'rw-gl-row-val', text: fmt(val) });
+        inp.addEventListener('input', () => { const v = Number(inp.value); out.textContent = fmt(v); onInput(v); repaint(); });
+        return inp;
+      };
+      // 字号（原文行高的倍数）
+      const curScale = one ? gScale() * (g.size || 1) : gScale();
+      row('字号', 0.25, 1.6, 0.05, curScale, (v) => Math.round(v * 100) + '% 行高', (v) => {
+        if (one) g.size = +(v / gScale()).toFixed(3); else { s.glossScale = v; clearOverrides('size'); this.saveSettingsSoon(); }
+        if (one) this.saveGlossSoon(o.pdfPath);
+      });
+      // 与原文的距离（行高的倍数）
+      const curGap = one && g.gap != null && g.gap !== '' ? Number(g.gap) : gGap();
+      row('距离', -1, 3, 0.05, curGap, (v) => (v >= 0 ? '' : '') + v.toFixed(2) + ' 行', (v) => {
+        if (one) { g.gap = v; this.saveGlossSoon(o.pdfPath); } else { s.glossGap = v; clearOverrides('gap'); this.saveSettingsSoon(); }
+      });
+      // 上方 / 下方
+      const pr = h(bar, 'div', { cls: 'rw-gl-row' });
+      h(pr, 'span', { cls: 'rw-gl-row-label', text: '位置' });
+      const curPlace = one ? (g.place || s.glossPlace || 'above') : (s.glossPlace || 'above');
+      const seg2 = h(pr, 'div', { cls: 'rw-seg' });
+      for (const [v, t] of [['above', '原文上方'], ['below', '原文下方']]) {
+        const b = h(seg2, 'button', { cls: 'rw-seg-btn' + (curPlace === v ? ' is-active' : ''), text: t });
+        b.addEventListener('click', () => {
+          if (one) { g.place = v; g.dy = 0; this.saveGlossSoon(o.pdfPath); } else { s.glossPlace = v; clearOverrides('place'); this.saveSettingsSoon(); }
+          repaint(); draw();
+        });
+      }
+      if (!one) {
+        const cr = h(bar, 'div', { cls: 'rw-gl-row' });
+        h(cr, 'span', { cls: 'rw-gl-row-label', text: '颜色' });
+        const ci = h(cr, 'input', { attr: { type: 'color' } });
+        ci.value = s.glossColor || DEF.color;
+        ci.addEventListener('input', () => { s.glossColor = ci.value; this.saveSettingsSoon(); repaint(); });
+      }
+      const foot = h(bar, 'div', { cls: 'rw-gl-row rw-gl-foot' });
+      const rb = h(foot, 'button', { cls: 'rw-btn rw-btn-sm', text: one ? '这一条恢复默认' : '恢复默认样式' });
+      rb.addEventListener('click', () => {
+        if (one) { Object.assign(g, { dx: 0, dy: 0, size: 0, place: '', gap: null }); this.saveGlossSoon(o.pdfPath); }
+        else { Object.assign(s, { glossScale: DEF.scale, glossGap: DEF.gap, glossPlace: DEF.place, glossColor: DEF.color }); this.saveSettingsSoon(); }
+        repaint(); draw();
+      });
+      if (g) {
+        h(foot, 'span', { cls: 'rw-tp-sp' });
+        const mb = h(foot, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(mb, 'more-horizontal'); h(mb, 'span', { text: '复制 / 摘录 / 删除' });
+        mb.addEventListener('click', (e) => this.glossMenu(e, o.pdfPath, g));
+      } else h(foot, 'span', { cls: 'rw-muted', text: '单击某条译文可以只改它；拖动译文可以移位置' });
+    };
+    const place = () => {
+      if (!bar.isConnected) return;
+      const r = rectFn();
+      const w = bar.offsetWidth || 320, hh = bar.offsetHeight || 200;
+      const win = doc.defaultView || window;
+      bar.style.left = Math.max(6, Math.min(r.left + r.width / 2 - w / 2, win.innerWidth - w - 6)) + 'px';
+      const below = r.bottom + 8 + hh < win.innerHeight;
+      bar.style.top = (below ? r.bottom + 8 : Math.max(6, r.top - hh - 8)) + 'px';
+    };
+    draw();
+    place();
+    const close = () => { bar.remove(); doc.removeEventListener('mousedown', onDown, true); doc.removeEventListener('keydown', onKey, true); if (this._glBar && this._glBar.bar === bar) this._glBar = null; };
+    const onDown = (e) => { if (!bar.contains(e.target) && !(g && e.target.closest && e.target.closest('.rw-gl-text[data-gid="' + g.id + '"]')) && !(o.keepOn && o.keepOn.contains(e.target)) && !(e.target.closest && e.target.closest('.menu'))) close(); };
+    const onKey = (e) => { if (e.key === 'Escape') close(); };
+    setTimeout(() => { doc.addEventListener('mousedown', onDown, true); doc.addEventListener('keydown', onKey, true); }, 0);
+    this._glBar = { bar, close };
+  }
+  async resetGlossOverrides() {
+    let n = 0;
+    const pre = normalizePath(this.dataDir() + '/译文标注') + '/';
+    for (const f of this.app.vault.getFiles().filter((x) => x.path.startsWith(pre))) { const j = await this.dataRead(f); if (j && j.path) await this.glossStore(j.path); }
+    for (const [path, st] of this._gl || []) {
+      let ch = false;
+      for (const g of st.glosses) if (g.size || g.place || (g.gap != null && g.gap !== '')) { g.size = 0; g.place = ''; g.gap = null; ch = true; n++; }
+      if (ch) await this.saveGloss(path);
+    }
+    this.repaintAllGlosses();
+    return n;
+  }
+  glossMenu(e, pdfPath, g) {
+    const m = new Menu();
+    const upd = (patch) => { Object.assign(g, patch); this.saveGlossSoon(pdfPath); this.repaintGlosses(pdfPath); };
+    m.addItem((i) => i.setTitle('字号放大').setIcon('a-arrow-up').onClick(() => upd({ size: Math.min(3, +((g.size || 1) * 1.2).toFixed(2)) })));
+    m.addItem((i) => i.setTitle('字号缩小').setIcon('a-arrow-down').onClick(() => upd({ size: Math.max(0.4, +((g.size || 1) / 1.2).toFixed(2)) })));
+    const below = (g.place || this.settings.glossPlace || 'above') === 'below';
+    const dg = this.settings.glossGap != null && this.settings.glossGap !== '' ? Number(this.settings.glossGap) : 0.18;
+    const cg = g.gap != null && g.gap !== '' ? Number(g.gap) : dg;
+    m.addItem((i) => i.setTitle('离原文远一点').setIcon('unfold-vertical').onClick(() => upd({ gap: +Math.min(4, cg + 0.25).toFixed(2) })));
+    m.addItem((i) => i.setTitle('离原文近一点').setIcon('fold-vertical').onClick(() => upd({ gap: +Math.max(-1.5, cg - 0.25).toFixed(2) })));
+    m.addItem((i) => i.setTitle(below ? '放到原文上方' : '放到原文下方').setIcon(below ? 'arrow-up' : 'arrow-down').onClick(() => upd({ place: below ? 'above' : 'below', dy: 0 })));
+    if (g.dx || g.dy || g.size || g.place || g.gap != null) m.addItem((i) => i.setTitle('恢复默认位置、字号和距离').setIcon('rotate-ccw').onClick(() => upd({ dx: 0, dy: 0, size: 0, place: '', gap: null })));
+    m.addSeparator();
+    m.addItem((i) => i.setTitle('复制译文').setIcon('copy').onClick(() => this.copyText(g.translation)));
+    m.addItem((i) => i.setTitle('写入划线摘录').setIcon('quote').onClick(() => { const f = this.app.vault.getAbstractFileByPath(pdfPath); const c = f ? this.paperOf(f) : null; this.addExcerpt({ text: g.text, translation: g.translation, pdf: f, page: g.page, note: c && c.note }); }));
+    m.addItem((i) => i.setTitle('问 AI（文献阅读右侧）').setIcon('message-circle').onClick(async () => {
+      const f = this.app.vault.getAbstractFileByPath(pdfPath); const c = f ? this.paperOf(f) : null;
+      await this.askAboutQuote({ text: g.text, page: g.page, pdf: f, note: c && c.note, noteObj: c && c.noteObj });
+    }));
+    m.addSeparator();
+    m.addItem((i) => i.setTitle('删除这条译文').setIcon('trash-2').onClick(() => this.removeGloss(pdfPath, g.id)));
+    m.showAtMouseEvent(e);
+  }
+
+  /* ---------- 流式调用（OpenAI 兼容），浏览器跨域不行时退回 requestUrl ---------- */
+  async directStream(messages, onDelta, signal, o) {
+    o = o || {};
+    const s = this.settings;
+    if (!this.directAiReady()) throw new Error('还没配置 AI：到 设置 → 科研工作台 → AI 填接口地址和密钥');
+    const info = o.info || {};
+    const onReason = o.onReason || (() => {});
+    const fallback = async () => {
+      const ci = {};
+      const t = await this.directChat(messages, { info: ci, thinking: o.thinking, retried: o.retried, model: o.model });
+      if (ci.reasoningText) { info.reasoningText = ci.reasoningText; onReason(ci.reasoningText); }
+      onDelta(t); return t;
+    };
+    const body = JSON.stringify(this.aiBody(messages, { stream: true, temperature: 0.4, thinking: o.thinking, model: o.model }));
+    let res;
+    try { res = await fetch(this.aiUrl(), { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (s.llmKey || '').trim() }, body, signal }); }
+    catch (e) { if (e && e.name === 'AbortError') throw e; return fallback(); }
+    if (!res.ok) { const t = await res.text().catch(() => ''); let m = t; try { const j = JSON.parse(t); m = (j.error && (j.error.message || j.error)) || t; } catch (e2) { /* 原样 */ } throw new Error('AI 接口 HTTP ' + res.status + '：' + String(m).slice(0, 200)); }
+    if (!res.body || !res.body.getReader) return fallback();
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', full = '', reason = '', sawData = false, raw = '';
+    info.finish = ''; info.error = '';
+    const handle = (j) => {
+      if (j.error) { info.error = String(j.error.message || j.error); return; }
+      const ch = j.choices && j.choices[0];
+      if (!ch) return;
+      const d = ch.delta || ch.message || {};
+      const r = d.reasoning_content || d.reasoning;
+      if (r) { reason += r; onReason(reason); }
+      if (d.content) { full += d.content; onDelta(d.content); }
+      if (ch.finish_reason) info.finish = ch.finish_reason;
+    };
+    const line = (ln) => {
+      ln = ln.trim();
+      if (!ln || ln.startsWith(':')) return false;
+      if (!ln.startsWith('data:')) { if (raw.length < 4000) raw += ln + '\n'; return false; }
+      sawData = true;
+      const d = ln.slice(5).trim();
+      if (d === '[DONE]') return true;
+      try { handle(JSON.parse(d)); } catch (e) { /* 不完整的行 */ }
+      return false;
+    };
+    let ended = false;
+    while (!ended) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) { const ln = buf.slice(0, i); buf = buf.slice(i + 1); if (line(ln)) { ended = true; break; } }
+    }
+    if (!ended && buf.trim()) line(buf);
+    // 接口没按流式返回（一整块 JSON，或报错 JSON）
+    if (!sawData && raw.trim()) { try { handle(JSON.parse(raw)); } catch (e) { info.raw = raw.slice(0, 160); } }
+    info.reasoning = reason.length; info.reasoningText = reason;
+    if (!full.trim()) {
+      if (!o.retried && this.aiIsDeepseek() && (s.llmThinking || 'auto') !== 'on' && !info.error && (info.finish === 'length' || reason)) {
+        if (o.onRetry) o.onRetry();
+        return this.directStream(messages, onDelta, signal, Object.assign({}, o, { retried: true, thinking: 'off', info }));
+      }
+      throw new Error(this.aiEmptyReason(info));
+    }
+    return full;
+  }
+
+  /* ---------- Mindflow 问答树 ---------- */
+  mfSubscribe(fn) { this._mfL = this._mfL || new Set(); this._mfL.add(fn); return () => this._mfL.delete(fn); }
+  mfEmit(ev) { for (const f of this._mfL || []) { try { f(ev); } catch (e) { console.error(e); } } }
+  mfKey(ctx) { return ctx ? (ctx.note ? ctx.note.path : ctx.pdf ? ctx.pdf.path : ctx.html ? ctx.html.path : '') : ''; }
+  async mfSession(ctx) {
+    const key = this.mfKey(ctx);
+    const s = await this.mfStore.get(key, this.paperTitle(ctx));
+    this._mfCtx = this._mfCtx || new Map();
+    this._mfCtx.set(key, ctx);
+    return s;
+  }
+  mfIsRunning(s, nodeId) { return !!(this._mfRun && this._mfRun.has(s.key + ':' + nodeId)); }
+  mfStop(s, nodeId) { const c = this._mfRun && this._mfRun.get(s.key + ':' + nodeId); if (c) c.abort(); }
+  /* 问答里贴的图片：存进库（工作台数据/AI问答图片/年-月/），太大的先缩小 */
+  async mfSaveImage(blob, name) {
+    let type = blob.type || 'image/png';
+    let data = await blob.arrayBuffer();
+    try {
+      if (typeof createImageBitmap === 'function' && typeof document !== 'undefined') {
+        const bmp = await createImageBitmap(blob);
+        const max = 1800;
+        if (bmp.width > max || bmp.height > max || data.byteLength > 1.5 * 1024 * 1024) {
+          const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
+          const cv = document.createElement('canvas');
+          cv.width = Math.round(bmp.width * k); cv.height = Math.round(bmp.height * k);
+          cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
+          const out = await new Promise((r) => cv.toBlob(r, 'image/jpeg', 0.9));
+          if (out) { data = await out.arrayBuffer(); type = 'image/jpeg'; }
+        }
+        if (bmp.close) bmp.close();
+      }
+    } catch (e) { /* 缩小失败就存原图 */ }
+    const ext = type.includes('jpeg') || type.includes('jpg') ? 'jpg' : type.includes('gif') ? 'gif' : type.includes('webp') ? 'webp' : 'png';
+    const dir = normalizePath(this.dataDir() + '/AI问答图片/' + fmtDate(new Date()).slice(0, 7));
+    await this.ensureFolder(dir);
+    const base = (sanitize(String(name || '').replace(/\.[^.]+$/, '')).slice(0, 30) || '图片') + '-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    const path = normalizePath(dir + '/' + base + '.' + ext);
+    await this.app.vault.createBinary(path, data);
+    return path;
+  }
+  async mfImageDataUrl(path) {
+    const f = this.app.vault.getAbstractFileByPath(path);
+    if (!(f instanceof TFile)) return '';
+    const buf = await this.app.vault.readBinary(f);
+    const ext = (f.extension || 'png').toLowerCase();
+    const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'gif' ? 'image/gif' : ext === 'webp' ? 'image/webp' : 'image/png';
+    return 'data:' + mime + ';base64,' + (obsidian.arrayBufferToBase64 ? obsidian.arrayBufferToBase64(buf) : btoa(String.fromCharCode(...new Uint8Array(buf))));
+  }
+  async mfAsk(ctx, s, nodeId, text, quote, images) {
+    const node = s.nodes[nodeId];
+    images = Array.isArray(images) ? images.filter(Boolean) : [];
+    if (!node || (!text && !quote && !images.length)) return;
+    if (this.mfIsRunning(s, nodeId)) return;
+    if (!node.parentId && !node.messages.length) node.title = trunc(quote && quote.text ? quote.text : text || '图片提问', 30);
+    node.messages.push(Object.assign({ id: uid(), role: 'user', content: text, quote: quote ? quote.text : '', quotePage: quote ? quote.page || '' : '', at: Date.now() }, images.length ? { images } : {}));
+    this.mfStore.save(s);
+    this.mfEmit({ type: 'change', key: s.key });
+    await this.mfGenerate(ctx, s, nodeId);
+  }
+  async mfFollowUp(ctx, s, parentId, anchor, question) {
+    if (!s.nodes[parentId]) return null;
+    const child = { id: uid(), parentId, anchor: Object.assign({ text: anchor.text, msgId: anchor.msgId }, anchor.plain ? { plain: anchor.plain } : {}), title: trunc(anchor.text || question, 30), createdAt: Date.now(), messages: [{ id: uid(), role: 'user', content: question, at: Date.now() }] };
+    s.nodes[child.id] = child;
+    this.mfStore.save(s);
+    this.mfEmit({ type: 'change', key: s.key });
+    this.mfGenerate(ctx, s, child.id);
+    return child;
+  }
+  /* 发给 AI 的上下文：论文全文 + 从根到当前窗口的对话链（祖先窗口截到被划线的那条回答） */
+  async mfMessages(ctx, s, nodeId) {
+    const title = this.paperTitle(ctx);
+    const text = await this.paperText(ctx);
+    const lim = Number(this.settings.aiContextChars) || 60000;
+    const sys = '你是论文阅读助手，正在陪用户精读论文《' + title + '》。回答要基于论文内容，用简体中文，条理清楚；引用论文时注明页码（正文里有 [第 N 页] 标记）；公式用 LaTeX（行内 $…$，独立 $$…$$）。论文里没有的内容要说明是你的补充。' + (text ? '\n\n=== 论文正文（可能截断） ===\n' + text.slice(0, lim) : '\n\n（没有读到论文正文，只能根据标题和用户提供的内容回答。）');
+    const out = [{ role: 'system', content: sys }];
+    const chain = mfChain(s, nodeId);
+    chain.forEach((node, ci) => {
+      const next = chain[ci + 1];
+      let msgs = node.messages;
+      if (next && next.anchor) { const k = msgs.findIndex((m) => m.id === next.anchor.msgId); if (k >= 0) msgs = msgs.slice(0, k + 1); }
+      msgs.forEach((m, mi) => {
+        if (m.role === 'assistant') { if (m.content && !m.error) out.push({ role: 'assistant', content: m.content }); return; }
+        let c = m.content || '';
+        if (m.quote) c = '关于论文中的这段原文' + (m.quotePage ? '（第 ' + m.quotePage + ' 页）' : '') + '：\n> ' + m.quote.replace(/\n/g, '\n> ') + '\n\n' + (c || '请详细解释这段，并说明它和全文论点的关系。');
+        if (mi === 0 && node.anchor) c = '针对你上面回答里的这段：「' + node.anchor.text + '」\n' + (c || '请详细解释这段。');
+        if (m.images && m.images.length) { out.push({ role: 'user', content: c || '请结合这篇论文解释这张图。', images: m.images }); return; }
+        out.push({ role: 'user', content: c || '请继续。' });
+      });
+    });
+    // 图片：只带最近 6 张（太多会很贵 / 超长），转成多模态格式
+    const withImg = out.filter((m) => m.images);
+    let budget = 6;
+    for (let i = withImg.length - 1; i >= 0; i--) {
+      const m = withImg[i];
+      const keep = m.images.slice(-budget);
+      budget -= keep.length;
+      const parts = [{ type: 'text', text: m.content }];
+      for (const pth of keep) { const url = await this.mfImageDataUrl(pth); if (url) parts.push({ type: 'image_url', image_url: { url } }); }
+      if (keep.length < m.images.length) parts[0].text += '\n（还附了 ' + (m.images.length - keep.length) + ' 张更早的图，这里省略）';
+      m.content = parts.length > 1 ? parts : m.content;
+      delete m.images;
+      if (budget <= 0) { for (let j = i - 1; j >= 0; j--) { const mm = withImg[j]; mm.content += '\n（这里附过 ' + mm.images.length + ' 张图，已省略）'; delete mm.images; } break; }
+    }
+    // 保证 user / assistant 交替
+    const asParts = (c) => (Array.isArray(c) ? c : [{ type: 'text', text: String(c || '') }]);
+    const merged = [];
+    for (const m of out) {
+      const last = merged[merged.length - 1];
+      if (last && last.role === m.role && m.role !== 'system') {
+        if (Array.isArray(last.content) || Array.isArray(m.content)) last.content = asParts(last.content).concat(asParts(m.content));
+        else last.content += '\n\n' + m.content;
+      } else merged.push(Object.assign({}, m));
+    }
+    return merged;
+  }
+  async mfGenerate(ctx, s, nodeId) {
+    const node = s.nodes[nodeId];
+    if (!node) return;
+    const msgs = await this.mfMessages(ctx, s, nodeId);
+    const hasImg = msgs.some((m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url'));
+    const model = hasImg && String(this.settings.llmVisionModel || '').trim() ? String(this.settings.llmVisionModel).trim() : this.settings.llmModel || '';
+    const ans = { id: uid(), role: 'assistant', content: '', at: Date.now(), model };
+    node.messages.push(ans);
+    this._mfRun = this._mfRun || new Map();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : { signal: undefined, abort() {} };
+    this._mfRun.set(s.key + ':' + nodeId, ac);
+    this.mfEmit({ type: 'change', key: s.key });
+    let t = 0;
+    try {
+      const emit = (force) => { const now = Date.now(); if (force || now - t > 90) { t = now; this.mfEmit({ type: 'delta', key: s.key, nodeId, msgId: ans.id, content: ans.content, reasoning: ans.reasoning || '' }); } };
+      await this.directStream(msgs, (d) => { ans.content += d; emit(); }, ac.signal, {
+        model: model !== this.settings.llmModel ? model : undefined,
+        onReason: (r) => { ans.reasoning = r; emit(); },
+        onRetry: () => { ans.reasoning = ''; ans.retried = true; emit(true); },
+      });
+      if (!ans.content) ans.error = 'AI 没有返回内容';
+    } catch (e) {
+      if (e && e.name === 'AbortError') { if (!ans.content) ans.content = '（已停止）'; }
+      else ans.error = e.message || String(e);
+    } finally {
+      this._mfRun.delete(s.key + ':' + nodeId);
+      this.mfStore.save(s);
+      this.mfEmit({ type: 'change', key: s.key });
+    }
+  }
+  mfRegenerate(s, nodeId, msgId) {
+    const node = s.nodes[nodeId];
+    const i = node ? node.messages.findIndex((m) => m.id === msgId) : -1;
+    if (i < 0 || this.mfIsRunning(s, nodeId)) return;
+    for (const c of mfChildren(s, nodeId)) if (c.anchor && node.messages.slice(i).some((m) => m.id === c.anchor.msgId)) for (const id of mfSubtree(s, c.id)) delete s.nodes[id];
+    node.messages = node.messages.slice(0, i);
+    this.mfGenerate((this._mfCtx && this._mfCtx.get(s.key)) || null, s, nodeId);
+  }
+  mfDeleteRound(s, nodeId, msgId) {
+    const node = s.nodes[nodeId];
+    const i = node.messages.findIndex((m) => m.id === msgId);
+    if (i < 0) return;
+    let from = i;
+    if (i > 0 && node.messages[i - 1].role === 'user') from = i - 1;
+    for (const c of mfChildren(s, nodeId)) if (c.anchor && c.anchor.msgId === msgId) for (const id of mfSubtree(s, c.id)) delete s.nodes[id];
+    node.messages.splice(from, i - from + 1);
+    this.mfStore.save(s);
+    this.mfEmit({ type: 'change', key: s.key });
+  }
+  mfDeleteNode(s, id) {
+    const n = s.nodes[id];
+    if (!n || !n.parentId) return;
+    const ids = mfSubtree(s, id);
+    if (ids.includes(s.cur)) s.cur = n.parentId;
+    for (const x of ids) { this.mfStop(s, x); delete s.nodes[x]; }
+    this.mfStore.save(s);
+    this.mfEmit({ type: 'change', key: s.key });
+  }
+  mfReset(s) {
+    for (const id of Object.keys(s.nodes)) this.mfStop(s, id);
+    const root = { id: uid(), parentId: null, anchor: null, title: '关于这篇论文', createdAt: Date.now(), messages: [] };
+    s.nodes = { [root.id]: root }; s.rootId = root.id; s.cur = root.id;
+    this.mfStore.save(s, true);
+    this.mfEmit({ type: 'change', key: s.key });
+  }
+  async mfExportToNote(ctx, s) {
+    let note = ctx && ctx.note;
+    if (!note && ctx && ctx.pdf) note = await this.createLitNoteForPdf(ctx.pdf);
+    if (!note) return new Notice('找不到文献笔记');
+    const lines = ['## AI 问答树 · ' + today(), ''];
+    const walk = (node, prefix, depth) => {
+      let k = 0;
+      const rounds = [];
+      let cur = null;
+      for (const m of node.messages) { if (m.role === 'user') { cur = { q: m, a: null }; rounds.push(cur); } else if (cur) { cur.a = m; cur = null; } }
+      rounds.forEach((r) => {
+        k++;
+        const label = prefix + k;
+        const hd = '#'.repeat(Math.min(6, 3 + depth));
+        const q = r.q.content || (r.q.quote ? '解释：' + trunc(r.q.quote, 40) : node.title);
+        lines.push(hd + ' ' + label + ' ' + q.replace(/\n/g, ' '));
+        if (k === 1 && node.anchor) lines.push('> 划线：' + node.anchor.text.replace(/\n/g, ' '));
+        if (r.q.quote) lines.push('> 原文' + (r.q.quotePage ? '（p.' + r.q.quotePage + '）' : '') + '：' + r.q.quote.replace(/\n/g, ' '));
+        lines.push('', (r.a && r.a.content) || '（无回答）', '');
+        let j = 0;
+        for (const c of mfChildren(s, node.id)) if (c.anchor && r.a && c.anchor.msgId === r.a.id) { j++; walk(c, label + '.' , depth + 1); }
+      });
+    };
+    walk(s.nodes[s.rootId], '', 0);
+    // 没挂到任何回答下的追问
+    await this.app.vault.process(note, (d) => d.replace(/\s*$/, '') + '\n\n' + lines.join('\n'));
+    new Notice('已把问答树写进「' + note.basename + '」');
+  }
+
+  /* ---------- 文献阅读视图 ---------- */
+  async openPaperReader(target, page) {
+    let ctx = target;
+    if (target && target.extension) ctx = this.paperOf(target) || { pdf: target.extension === 'pdf' ? target : null, note: null };
+    if (target && target.file && target.type === 'literature') ctx = this.paperOf(target.file);
+    if (!ctx || (!ctx.note && !ctx.pdf)) return new Notice('找不到这篇文献');
+    const path = ctx.note ? ctx.note.path : ctx.pdf.path;
+    const ws = this.app.workspace;
+    let leaf = ws.getLeavesOfType(PAPER_READER_VIEW).find((l) => l.view && l.view.path === path);
+    if (leaf) { ws.revealLeaf(leaf); if (page && leaf.view.pane) leaf.view.pane.goto(page); return leaf; }
+    leaf = ws.getLeaf('tab');
+    await leaf.setViewState({ type: PAPER_READER_VIEW, active: true, state: { path, page: page || 1 } });
+    ws.revealLeaf(leaf);
+    return leaf;
+  }
+  paperReaderFor(ctx) {
+    const k = this.mfKey(ctx);
+    return this.app.workspace.getLeavesOfType(PAPER_READER_VIEW).map((l) => l.view).find((v) => v && v.ctx && this.mfKey(v.ctx) === k) || null;
+  }
+  /* PDF 里选中 → 问 AI：送进这篇文献阅读视图右侧的问答 */
+  async askAboutQuote(ctx, o) {
+    o = o || {};
+    const c = { pdf: ctx.pdf, note: ctx.note, noteObj: ctx.noteObj };
+    const q = { text: ctx.text, page: ctx.page, label: o.label || '' };
+    const go = async (mf) => {
+      if (o.send) {
+        for (let i = 0; i < 30 && !mf.session; i++) await new Promise((r) => setTimeout(r, 100));
+        if (!mf.session) return mf.setQuote(q);
+        mf.quote = q; mf.tab = 'chat';
+        await mf.send(o.prompt || '');
+        return;
+      }
+      if (o.prompt) mf.draft = o.prompt;
+      mf.setQuote(q);
+    };
+    if (ctx.htmlView && ctx.htmlView.mf) {
+      const hv = ctx.htmlView;
+      if (hv.leaf && this.app.workspace.revealLeaf) this.app.workspace.revealLeaf(hv.leaf);
+      if (hv.openSide) hv.openSide();
+      await go(hv.mf);
+      return;
+    }
+    let v = this.paperReaderFor(c);
+    if (!v) {
+      if (!c.pdf && !c.note) return new Notice('找不到这篇文献');
+      await this.openPaperReader(c, ctx.page ? Number(ctx.page) : null);
+      v = this.paperReaderFor(c);
+      for (let i = 0; i < 20 && v && !v.mf; i++) await new Promise((r) => setTimeout(r, 100));
+    }
+    if (v && v.mf) {
+      if (v.leaf && this.app.workspace.revealLeaf) this.app.workspace.revealLeaf(v.leaf);
+      const wrapEl = v.contentEl.querySelector('.rw-pr');
+      if (wrapEl && wrapEl.classList.contains('is-narrow')) { if (wrapEl.classList.contains('is-side-hidden') && v.toggleSide) v.toggleSide(); }
+      else if (this.settings.prSideHidden) { this.settings.prSideHidden = false; await v.load(v.pane && v.pane.cur); await go(v.mf); return; }
+      await go(v.mf);
+    }
+  }
+  /* ---------- 划词按钮（预设提问） ---------- */
+  selPresets(all) {
+    if (!Array.isArray(this.settings.selPresets)) this.settings.selPresets = DEFAULT_SEL_PRESETS.map((x) => Object.assign({}, x));
+    return all ? this.settings.selPresets : this.settings.selPresets.filter((x) => x.on !== false && String(x.name || '').trim());
+  }
+  selPresetTitle(sp) {
+    const m = (SEL_PRESET_MODES.find((x) => x[0] === sp.mode) || SEL_PRESET_MODES[0])[1];
+    return m + (sp.prompt ? '：' + trunc(sp.prompt, 80) : '');
+  }
+  async runSelPreset(sp, ctx, pop, rect) {
+    if (!ctx || !ctx.text) return;
+    if (sp.mode === 'inline') {
+      if (!pop) pop = this.popupFor(this.curDoc());
+      if (!pop.isOpen() || !pop.el.classList.contains('rw-tp') || pop.el.classList.contains('rw-tp-bubble') || pop.ctx !== ctx) pop.show(rect || ctx.rect, ctx);
+      pop.ctx = ctx;
+      return pop.runAi('explain', pop.bodyEl, sp);
+    }
+    if (pop) pop.hide();
+    try { (ctx.doc || this.curDoc()).getSelection().removeAllRanges(); } catch (e) { /* ignore */ }
+    if (ctx.htmlView) ctx.htmlView.clearSel();
+    if (sp.mode === 'send' && !this.directAiReady()) return new Notice('先在 设置 → 科研工作台 → AI 填接口地址和密钥');
+    await this.askAboutQuote(ctx, { send: sp.mode === 'send', prompt: sp.prompt || '', label: sp.name });
+  }
+  paintGlossesFor(pdfPath, pageEl) {
+    this.glossStore(pdfPath).then((st) => {
+      const pn = Number(pageEl.getAttribute('data-page-number'));
+      const list = this.settings.glossShow !== false ? st.glosses.filter((g) => g.page === pn && g.lines && g.lines.length) : [];
+      this.paintPage(pageEl, list, pdfPath);
+    });
+  }
+
+  /* ---------- 我的文献（表格）：AI 分析列 ---------- */
+  pgColumns() {
+    if (!Array.isArray(this.settings.pgColumns) || !this.settings.pgColumns.length) this.settings.pgColumns = PG_DEFAULT_COLUMNS.map((c) => Object.assign({}, c));
+    return this.settings.pgColumns;
+  }
+  pgFile() { return normalizePath(((this.manifest && this.manifest.dir) || (this.app.vault.configDir || '.obsidian') + '/plugins/research-workbench') + '/papergrid-cells.json'); }
+  async pgLoad() {
+    if (this._pg) return this._pg;
+    const f = this.app.vault.getAbstractFileByPath(normalizePath(this.dataDir() + '/文献分析表数据.md'));
+    let obj = await this.dataRead(f);
+    let d = obj && obj.cells ? obj.cells : null;
+    if (obj && Array.isArray(obj.columns) && obj.columns.length && !(this.settings.pgColumns || []).length) this.settings.pgColumns = obj.columns;
+    if (!d) { d = (await this.legacyRead(this.pgFile())) || {}; this._pg = d; if (Object.keys(d).length) this.pgSaveSoon(); }
+    this._pg = d;
+    return d;
+  }
+  pgSaveSoon() {
+    clearTimeout(this._pgT);
+    this._pgT = setTimeout(async () => {
+      if (!this._pg) return;
+      const clean = {};
+      for (const [k, v] of Object.entries(this._pg)) { const o = {}; for (const [c, x] of Object.entries(v)) if (x && x.status === 'done') o[c] = x; if (Object.keys(o).length) clean[k] = o; }
+      await this.dataWrite('', '文献分析表数据.md', 'table', { cells: clean, columns: this.pgColumns() }, '「我的文献」表格里 AI 分析的结果');
+    }, 800);
+  }
+  pgCell(path, colId) { return (this._pg && this._pg[path] && this._pg[path][colId]) || null; }
+  pgSetCell(path, colId, v) { const d = this._pg || (this._pg = {}); d[path] = d[path] || {}; d[path][colId] = v; this.pgSaveSoon(); this.pgEmit(); }
+  pgEmit() { clearTimeout(this._pgE); this._pgE = setTimeout(() => this.refreshViews(), 120); }
+  /* 排队生成，最多同时 2 个 */
+  pgEnqueue(jobs) {
+    this._pgQ = this._pgQ || [];
+    for (const j of jobs) {
+      const cur = this.pgCell(j.n.file.path, j.col.id);
+      if (cur && (cur.status === 'running' || cur.status === 'queued')) continue;
+      this.pgSetCell(j.n.file.path, j.col.id, Object.assign({}, cur || {}, { status: 'queued' }));
+      this._pgQ.push(j);
+    }
+    this.pgPump();
+  }
+  pgPump() {
+    this._pgActive = this._pgActive || 0;
+    while (this._pgActive < 2 && this._pgQ.length) {
+      const j = this._pgQ.shift();
+      this._pgActive++;
+      this.pgRun(j.n, j.col).finally(() => { this._pgActive--; this.pgPump(); });
+    }
+  }
+  async pgRun(n, col) {
+    const path = n.file.path;
+    this.pgSetCell(path, col.id, Object.assign({}, this.pgCell(path, col.id) || {}, { status: 'running' }));
+    try {
+      const c = this.paperOf(n.file);
+      const text = await this.paperText(c);
+      if (!text) throw new Error('读不到论文正文：没有 PDF，笔记也是空的');
+      const sys = '你是学术文献分析助手。根据给出的论文内容，回答指定的分析维度。只输出 JSON，不要其他文字：{"answer":"中文回答","evidence":[{"section":"所在章节或页码，如 第3页 / III. Method","quote":"论文原文摘句（保持原语言，不超过 60 词）"}]}。answer 用中文，按要求的长度；evidence 给 1～3 条最能支持回答的原文；论文里找不到就在 answer 里说明“文中未提及”，evidence 为空数组。';
+      const user = '分析维度：' + col.name + '\n要求：' + col.prompt + '\n\n论文《' + this.paperTitle(c) + '》正文（按页标注，可能截断）：\n' + text.slice(0, Number(this.settings.aiContextChars) || 60000);
+      const raw = await this.directChat([{ role: 'system', content: sys }, { role: 'user', content: user }]);
+      const j = parseAiJson(raw);
+      const answer = String((j && j.answer) || raw || '').trim();
+      const evidence = Array.isArray(j && j.evidence) ? j.evidence.filter((e) => e && e.quote).slice(0, 5).map((e) => ({ section: String(e.section || ''), quote: String(e.quote) })) : [];
+      if (!answer) throw new Error('AI 没有返回内容');
+      this.pgSetCell(path, col.id, { status: 'done', answer, evidence, at: Date.now(), model: this.settings.llmModel || '' });
+    } catch (e) {
+      this.pgSetCell(path, col.id, Object.assign({}, this.pgCell(path, col.id) || {}, { status: 'error', error: e.message || String(e) }));
+    }
+  }
+  async pgExportMarkdown(list) {
+    await this.pgLoad();
+    const cols = this.pgColumns();
+    const esc = (t) => String(t || '').replace(/\|/g, '\\|').replace(/\n+/g, '<br>');
+    const lines = ['# 文献分析表', '', '> 由科研工作台生成于 ' + today() + '，共 ' + list.length + ' 篇', '', '| 文献 | ' + cols.map((c) => esc(c.name)).join(' | ') + ' |', '|' + ' --- |'.repeat(cols.length + 1)];
+    for (const n of list) {
+      const meta = [str(n.fm.authors).split(/[;,]/)[0], str(n.fm.year)].filter(Boolean).join(', ');
+      lines.push('| [[' + n.file.path + '|' + esc(n.title) + ']]' + (meta ? '<br>' + esc(meta) : '') + ' | ' + cols.map((c) => { const x = this.pgCell(n.file.path, c.id); return x && x.status === 'done' ? esc(x.answer) : ''; }).join(' | ') + ' |');
+    }
+    const path = normalizePath(this.settings.rootFolder + '/文献分析表.md');
+    const f = this.app.vault.getAbstractFileByPath(path);
+    if (f) await this.app.vault.modify(f, lines.join('\n') + '\n'); else await this.app.vault.create(path, lines.join('\n') + '\n');
+    new Notice('已导出到 ' + path);
+    const nf = this.app.vault.getAbstractFileByPath(path);
+    if (nf) this.openFile(nf);
+  }
+
+  /* ---------- 笔记摘录 ---------- */
+  async allExcerpts() {
+    const out = [];
+    for (const n of this.buildIndex().notes.filter((x) => x.type === 'literature')) {
+      const list = await this.readExcerpts(n.file);
+      for (const x of list) out.push(Object.assign(x, { n }));
+    }
+    return out;
+  }
+  async updateExcerpt(file, ex, patch) {
+    await this.app.vault.process(file, (data) => {
+      const blocks = excerptBlocks(data);
+      const b = blocks.find((x) => (ex.id && x.id === ex.id) || (!ex.id && x.idx === ex.idx && x.text === ex.text));
+      if (!b) return data;
+      const nx = Object.assign({}, b, patch);
+      if (!nx.id) nx.id = uid();
+      return data.slice(0, b.start) + excerptToMd(nx) + data.slice(b.end);
+    });
+    this.refreshReaders();
+    this.refreshViews();
+  }
+  async deleteExcerpt(file, ex) {
+    await this.app.vault.process(file, (data) => {
+      const blocks = excerptBlocks(data);
+      const b = blocks.find((x) => (ex.id && x.id === ex.id) || (!ex.id && x.idx === ex.idx && x.text === ex.text));
+      if (!b) return data;
+      return data.slice(0, b.start).replace(/\n+$/, '\n') + data.slice(b.end).replace(/^\n+/, '\n');
+    });
+    this.refreshReaders();
+    this.refreshViews();
+  }
+
+  mdComp() { if (!this._mdc) { this._mdc = new obsidian.Component(); this._mdc.load(); } return this._mdc; }
+  /* ---------- 存在库里的工作台数据（译文标注 / AI 问答 / 文献分析表），随库一起同步 ---------- */
+  dataDir() { return normalizePath(this.settings.dataFolder || ((this.settings.rootFolder || '科研') + '/工作台数据')); }
+  dataName(name, key) { return (sanitize(String(name || '数据')).replace(/[#^[\]|]/g, '').slice(0, 40).trim() || '数据') + '-' + md5(key).slice(0, 8) + '.md'; }
+  /* 在某个子文件夹里按 key 的哈希找到数据文件（文件名前半部分可能随标题变化） */
+  dataFind(sub, key) {
+    const dir = this.app.vault.getAbstractFileByPath(normalizePath(this.dataDir() + '/' + sub));
+    const tail = '-' + md5(key).slice(0, 8) + '.md';
+    if (dir && dir.children) for (const f of dir.children) if (f instanceof TFile && f.name.endsWith(tail)) return f;
+    // 没有 children（例如刚同步来、索引还没好）：在全部文件里找
+    const pre = normalizePath(this.dataDir() + '/' + sub) + '/';
+    return this.app.vault.getFiles().find((f) => f.path.startsWith(pre) && f.name.endsWith(tail)) || null;
+  }
+  parseDataText(text) {
+    const m = String(text || '').match(/```json\s*\n([\s\S]*?)\n```/);
+    if (!m) return null;
+    try { return JSON.parse(m[1]); } catch (e) { return null; }
+  }
+  async dataRead(file) {
+    if (!file) return null;
+    try { return this.parseDataText(await this.app.vault.read(file)); } catch (e) { return null; }
+  }
+  async dataWrite(sub, name, key, obj, note) {
+    const folder = normalizePath(this.dataDir() + (sub ? '/' + sub : ''));
+    const body = '---\ntype: rw-data\nkind: ' + (sub || 'table') + '\n---\n> ' + (note || '科研工作台的数据文件') + '（自动生成，请不要手动修改；删除它会丢失对应数据）\n\n```json\n' + JSON.stringify(obj) + '\n```\n';
+    this._dataSelf = this._dataSelf || new Map();
+    let f = sub ? this.dataFind(sub, key) : this.app.vault.getAbstractFileByPath(normalizePath(folder + '/' + name));
+    try {
+      if (f) { this._dataSelf.set(f.path, Date.now()); await this.app.vault.modify(f, body); }
+      else {
+        await this.ensureFolder(folder);
+        const path = normalizePath(folder + '/' + (sub ? this.dataName(name, key) : name));
+        this._dataSelf.set(path, Date.now());
+        await this.app.vault.create(path, body);
+      }
+    } catch (e) { console.warn('[科研工作台] 保存数据失败', e); }
+  }
+  async dataRemove(sub, key) {
+    const f = this.dataFind(sub, key);
+    if (f) { try { this._dataSelf = this._dataSelf || new Map(); this._dataSelf.set(f.path, Date.now()); await this.app.vault.delete(f); } catch (e) { /* ignore */ } }
+  }
+  /* 旧版本存在插件目录里的数据，读一次搬到库里 */
+  async legacyRead(file) {
+    const ad = this.app.vault.adapter;
+    try { if (ad && ad.exists && (await ad.exists(file))) { const j = JSON.parse(await ad.read(file)); try { await ad.remove(file); } catch (e) { /* ignore */ } return j; } } catch (e) { /* ignore */ }
+    return null;
+  }
+  /* 其他设备同步过来（或在别处修改）了数据文件 → 重新读进来并刷新界面 */
+  async onDataFileChanged(f) {
+    if (!f || !(f instanceof TFile) || !f.path.startsWith(this.dataDir() + '/')) return;
+    const self = this._dataSelf && this._dataSelf.get(f.path);
+    if (self && Date.now() - self < 2500) return;
+    const obj = await this.dataRead(f);
+    if (!obj) return;
+    if (obj.glosses && obj.path) {
+      this._gl = this._gl || new Map();
+      this._gl.set(obj.path, obj);
+      this.repaintGlosses(obj.path);
+      this.refreshReaders('trans');
+    } else if (obj.nodes && obj.key) {
+      const old = this.mfStore.cache.get(obj.key);
+      if (old) { for (const k of Object.keys(old)) delete old[k]; Object.assign(old, obj); } else this.mfStore.cache.set(obj.key, obj);
+      this.mfEmit({ type: 'reload', key: obj.key });
+    } else if (obj.cells) {
+      this._pg = obj.cells;
+      if (Array.isArray(obj.columns) && obj.columns.length) { this.settings.pgColumns = obj.columns; }
+      this.pgEmit();
+    }
+  }
+
+  /* ---------- 文献 PDF ---------- */
+  /* 找这条文献对应的 PDF：pdf 属性（库内链接要真的存在）→ 同名 PDF → 正文里链接的第一个 PDF */
+  /* 主 PDF：优先工作台库内的，其次 Zotero / 电脑路径 / 网络 */
+  pdfOf(n) { const all = this.pdfsOf(n); return all.length ? all[0] : null; }
+  pdfsOf(n) {
+    if (n && n.pdfOnly) return [{ kind: 'vault', file: n.file, label: n.file.path }];
+    const file = n.file;
+    const mt = file.stat ? file.stat.mtime : 0;
+    if (n._pdfAt === mt && n._pdfs !== undefined) return n._pdfs;
+    const res = this.resolvePdfs(n);
+    n._pdfs = res; n._pdfAt = mt;
+    return res;
+  }
+  resolvePdfs(n) {
+    const out = [];
+    const order = { vault: 0, zotero: 1, path: 2, url: 3 };
+    const add = (x) => { if (x && !out.some((y) => y.kind === x.kind)) out.push(x); };
+    this.resolvePdf(n, add);
+    return out.sort((a, b) => order[a.kind] - order[b.kind]);
+  }
+  resolvePdf(n, add) {
+    const file = n.file;
+    const fm = n.fm || {};
+    const mc = this.app.metadataCache;
+    const vaultPdf = (lp) => {
+      const d = mc.getFirstLinkpathDest(lp, file.path) || this.app.vault.getAbstractFileByPath(normalizePath(lp));
+      return d && d instanceof TFile && (d.extension || '').toLowerCase() === 'pdf' ? d : null;
+    };
+    for (const key of ['pdf', 'file']) {
+      const v = str(fm[key]).trim();
+      if (!v) continue;
+      if (/^zotero:\/\/open-pdf/i.test(v)) { add({ kind: 'zotero', url: v, label: 'Zotero 里的 PDF（点击在 Zotero 中打开）' }); continue; }
+      if (/^https?:\/\//i.test(v)) { if (key === 'pdf') add({ kind: 'url', url: v, label: '网络上的 PDF：' + v }); continue; }
+      if (/^file:\/\//i.test(v) || /^[a-zA-Z]:[\\/]/.test(v) || (v.startsWith('/') && !v.startsWith('//'))) {
+        const fp = /^file:/i.test(v) ? decodeURI(v.replace(/^file:\/\/\/?/i, '')) : v;
+        if (!/\.pdf$/i.test(fp)) continue;
+        if (IS_MOBILE) continue;
+        try { const fs = require('fs'); if (!fs.existsSync(fp)) continue; } catch (e) { /* 拿不到 fs 就相信它 */ }
+        add({ kind: 'path', path: fp, label: '电脑上的 PDF（库外）：' + fp }); continue;
+      }
+      const m = v.match(/\[\[([^\]|#]+)/);
+      const d = vaultPdf((m ? m[1] : v).trim());
+      if (d) add({ kind: 'vault', file: d, label: '工作台库内的 PDF：' + d.path });
+    }
+    // 同文件夹同名 PDF
+    const dir = file.parent && file.parent.path && file.parent.path !== '/' ? file.parent.path + '/' : '';
+    const same = this.app.vault.getAbstractFileByPath(dir + file.basename + '.pdf');
+    if (same && same instanceof TFile) add({ kind: 'vault', file: same, label: '工作台库内的 PDF：' + same.path });
+    // 正文里链接/嵌入的 PDF
+    const cache = mc.getFileCache(file) || {};
+    for (const l of [].concat(cache.embeds || [], cache.links || [])) {
+      if (!/\.pdf$/i.test((l.link || '').split('#')[0])) continue;
+      const d = vaultPdf(l.link.split('#')[0]);
+      if (d) { add({ kind: 'vault', file: d, label: '工作台库内的 PDF：' + d.path }); break; }
+    }
+  }
+  openPdf(pdf) {
+    if (!pdf) return;
+    if (pdf.kind === 'vault') return this.settings.pdfOpenIn === 'obsidian' ? this.openFile(pdf.file) : this.openPaperReader(pdf.file);
+    if (pdf.kind === 'zotero') return openExternalUrl(pdf.url);
+    if (pdf.kind === 'url') return this.openUrl(pdf.url);
+    if (pdf.kind === 'path') return openFsPath(pdf.path);
+  }
+  pickPdfFor(n) { new PdfPickModal(this.app, this, n).open(); }
+
+  /* ---------- 项目文件夹 ---------- */
+  projectDir(name) { return normalizePath(this.settings.rootFolder + '/项目/' + name); }
+  listDir(path) {
+    const f = this.app.vault.getAbstractFileByPath(path);
+    const kids = (f && f.children) || [];
+    const ok = (x) => !x.name.startsWith('.') && !x.name.startsWith('~$');
+    const folders = kids.filter((x) => x.children && ok(x)).sort((a, b) => {
+      const aa = this.isAutoFolder(a.name) ? 1 : 0, bb = this.isAutoFolder(b.name) ? 1 : 0;
+      return aa - bb || a.name.localeCompare(b.name, 'zh');
+    });
+    const files = kids.filter((x) => x instanceof TFile && ok(x)).sort((a, b) => b.stat.mtime - a.stat.mtime);
+    return { folders, files };
+  }
+  /* 工作台按类型自动归档用的文件夹名（文献/汇报/数据/实验…） */
+  isAutoFolder(name) {
+    return Object.values(FILE_CATS).some((c) => c.folder === name) || Object.values(NOTE_TYPES).some((t) => t.folder === name);
+  }
+  countFiles(path) {
+    const pre = normalizePath(path) + '/';
+    let n = 0;
+    for (const f of this.app.vault.getFiles()) if (f.path.startsWith(pre) && !f.name.startsWith('~$')) n++;
+    return n;
+  }
+  /* 项目里所有文件夹（相对路径，深度优先），用于选择导入/移动位置 */
+  projectFolderList(project) {
+    const base = this.projectDir(project);
+    const out = [];
+    const walk = (path, rel, depth) => {
+      if (depth > 6 || out.length > 300) return;
+      for (const f of this.listDir(path).folders) {
+        const r = rel ? rel + '/' + f.name : f.name;
+        out.push({ rel: r, path: f.path, name: f.name, depth, auto: !rel && this.isAutoFolder(f.name) });
+        walk(f.path, r, depth + 1);
+      }
+    };
+    walk(base, '', 0);
+    return out;
+  }
+  async createFolderIn(parent, name) {
+    name = sanitize(String(name || '').trim()).replace(/[\\/]/g, '-');
+    if (!name) return null;
+    const p = normalizePath(parent + '/' + name);
+    if (this.app.vault.getAbstractFileByPath(p)) { new Notice('已经有同名文件夹：' + name); return p; }
+    await this.ensureFolder(p);
+    new Notice('📁 已新建文件夹：' + name);
+    this.refreshViews();
+    return p;
+  }
+  async renameFolder(f, name) {
+    name = sanitize(String(name || '').trim()).replace(/[\\/]/g, '-');
+    if (!name || name === f.name) return;
+    const parent = f.path.split('/').slice(0, -1).join('/');
+    const np = normalizePath(parent + '/' + name);
+    if (this.app.vault.getAbstractFileByPath(np)) return new Notice('已经有同名文件夹：' + name);
+    await this.app.fileManager.renameFile(f, np);
+    new Notice('已重命名为：' + name + '（笔记里的链接会自动更新）');
+    this.refreshViews();
+  }
+  async deleteFolder(f) {
+    const n = this.countFiles(f.path);
+    const ok = await this.confirmDelete({ title: '删除文件夹', lines: ['确定删除文件夹「' + f.name + '」吗？', n ? '里面的 ' + n + ' 个文件会一起移到回收站。' : '这是个空文件夹。', '位置：' + f.path] });
+    if (!ok) return;
+    await this.trash(f);
+    new Notice('🗑 已删除文件夹：' + f.name);
+    this.refreshViews();
+  }
+  async moveFileTo(file, folder) {
+    folder = normalizePath(folder);
+    if (file.parent && file.parent.path === folder) return;
+    await this.ensureFolder(folder);
+    const np = file.extension === 'md' ? this.uniquePath(folder, file.basename) : this.uniqueFilePath(folder, file.name);
+    await this.app.fileManager.renameFile(file, np);
+    new Notice('已移动：' + file.name + ' → ' + folder.split('/').slice(-2).join('/'));
+    this.refreshViews();
+  }
+  async renameFileTo(file, name) {
+    name = sanitize(String(name || '').trim());
+    if (!name) return;
+    const ext = file.extension;
+    if (ext && !name.toLowerCase().endsWith('.' + ext.toLowerCase())) name += '.' + ext;
+    const np = normalizePath((file.parent && file.parent.path !== '/' ? file.parent.path + '/' : '') + name);
+    if (np === file.path) return;
+    if (this.app.vault.getAbstractFileByPath(np)) return new Notice('已经有同名文件');
+    await this.app.fileManager.renameFile(file, np);
+    this.refreshViews();
+  }
+  async deleteFileWithConfirm(f) {
+    const ok = await this.confirmDelete({ title: '删除文件', lines: ['确定删除「' + f.name + '」吗？（' + fmtSize(f.stat.size) + '）', '位置：' + f.path] });
+    if (!ok) return;
+    await this.trash(f);
+    new Notice('🗑 已删除：' + f.name);
+    this.refreshViews();
+  }
+  pickFolder(project, o, cb) { new FolderPickModal(this.app, this, project, o || {}, cb).open(); }
+
+  pickFiles(ctx) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.style.display = 'none';
+    document.body.appendChild(input);
+    input.addEventListener('change', () => {
+      if (input.files && input.files.length) this.importFilesModal(input.files, ctx || {});
+      input.remove();
+    });
+    input.click();
+  }
+  importFilesModal(fileList, ctx) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    new ImportFilesModal(this.app, this, files, ctx || {}).open();
+  }
+  async importFiles(items, o) {
+    let ok = 0;
+    let notesMade = 0;
+    const fails = [];
+    for (const it of items) {
+      try {
+        if (it.cat.startsWith('note:')) {
+          await this.importMdAsNote(it, it.cat.slice(5), o.project, o.folder);
+          ok++;
+          notesMade++;
+          continue;
+        }
+        const folder = o.folder || this.catFolder(o.project, it.cat);
+        await this.ensureFolder(folder);
+        let entry;
+        if (o.mode === 'link' && it.path) {
+          const fm = { type: 'resource', project: o.project ? '[[' + o.project + ']]' : '', category: it.cat, name: it.name, path: it.path, size: it.size, date: today() };
+          const body = '# ' + it.name + '\n\n> [!info] 库外文件\n> 位置：`' + it.path + '`\n> [用默认程序打开](' + fileUrl(it.path) + ')\n\n## 备注\n';
+          const nf = await this.app.vault.create(this.uniquePath(folder, sanitize(it.name) + '（链接）'), fmBlock(fm) + body);
+          entry = { kind: 'link', file: nf, name: it.name, ext: it.ext, extPath: it.path, cat: it.cat, projectName: o.project, size: it.size };
+        } else {
+          const buf = await it.f.arrayBuffer();
+          const tf = await this.app.vault.createBinary(this.uniqueFilePath(folder, it.name), buf);
+          entry = { kind: 'file', file: tf, name: tf.name, ext: it.ext, cat: it.cat, projectName: o.project, size: it.size };
+        }
+        ok++;
+        if (o.makeLit && it.ext === 'pdf' && it.cat === 'literature') { await this.createNoteForEntry(entry, 'literature', false); notesMade++; }
+        if (o.makeMeeting && it.cat === 'meeting' && FILE_CATS.meeting.exts.includes(it.ext)) { await this.createNoteForEntry(entry, 'meeting', false); notesMade++; }
+      } catch (e) {
+        console.error('[科研工作台] 导入失败', it.name, e);
+        fails.push(it.name + '：' + e.message);
+      }
+    }
+    new Notice('📥 已导入 ' + ok + ' 个文件' + (notesMade ? '，新建 ' + notesMade + ' 条笔记' : '') + (o.project ? ' → ' + o.project : '') + (o.folder && o.project ? ' / ' + (o.folder === this.projectDir(o.project) ? '自由空间' : o.folder.slice(this.projectDir(o.project).length + 1)) : '') + (fails.length ? '\n失败：' + fails.join('；') : ''), 6000);
+    this.refreshViews();
+    return { ok, fails };
+  }
+  /* 拖入的 .md 作为笔记导入：保留原内容，补上 type / project / status / date */
+  async importMdAsNote(it, type, project, folderOverride) {
+    const folder = folderOverride || this.noteFolder(project, type);
+    await this.ensureFolder(folder);
+    const text = await it.f.text();
+    const base = sanitize(it.name.replace(/\.(md|markdown)$/i, '')) || '未命名';
+    const file = await this.app.vault.create(this.uniquePath(folder, base), text);
+    await this.writeNoteProps(file, type, project, dateFromName(base) || today());
+    return file;
+  }
+  /* 老笔记补属性时用的默认状态：会议默认「已整理」，其他用第一个状态 */
+  defaultStatusFor(type) { return type === 'meeting' ? '已整理' : NOTE_TYPES[type].statuses[0]; }
+  async writeNoteProps(file, type, project, date) {
+    await this.app.fileManager.processFrontMatter(file, (fm) => {
+      fm.type = type;
+      if (project && !fm.project) fm.project = '[[' + project + ']]';
+      if (!fm.status || !NOTE_TYPES[type].statuses.includes(String(fm.status))) fm.status = this.defaultStatusFor(type);
+      if (!fm.date) fm.date = date;
+    });
+  }
+  /* 为“按文件夹识别”的笔记一键写入属性 */
+  async fillProps(notes) {
+    notes = (notes || []).filter((n) => n.inferred);
+    if (!notes.length) return 0;
+    if (notes.length > 1) {
+      const ok = await this.confirmDelete({ title: '补全属性', lines: ['将为 ' + notes.length + ' 条笔记在开头写入 type / status / date（以及能推断出的 project）属性。', '正文内容不会改动。写入后这些笔记也能被 AI 助手和其他插件正确识别。'], confirmText: '写入属性', noTrashNote: true });
+      if (!ok) return 0;
+    }
+    let c = 0;
+    for (const n of notes) {
+      try { await this.writeNoteProps(n.file, n.type, n.projectName, n.date || today()); c++; } catch (e) { console.warn('[科研工作台] 写入属性失败', n.file.path, e); }
+    }
+    new Notice('✅ 已为 ' + c + ' 条笔记补全属性');
+    this.refreshViews();
+    return c;
+  }
+  /* 把任意 md 设为某类笔记（只改属性，不移动文件） */
+  async convertMdToNote(file, type, project) {
+    const cache = this.app.metadataCache.getFileCache(file);
+    const fm = (cache && cache.frontmatter) || {};
+    await this.writeNoteProps(file, type, project, str(fm.created).slice(0, 10) || dateFromName(file.basename) || fmtDate(new Date(file.stat.ctime)));
+    new Notice('「' + file.basename + '」已设为' + NOTE_TYPES[type].label);
+    this.refreshViews();
+  }
+  entryLink(x) { return x.kind === 'file' ? '[[' + x.file.path + ']]' : fileUrl(x.extPath); }
+  async createNoteForEntry(x, type, open) {
+    const link = this.entryLink(x);
+    const shown = x.kind === 'file' ? '[[' + x.file.path + '|' + x.name + ']]' : '[' + x.name + '](' + fileUrl(x.extPath) + ')';
+    const title = sanitize(x.noteTitle || x.name.replace(/\.[^.]+$/, ''));
+    const o = { type, title, project: x.projectName && this.buildIndex().byName.has(x.projectName) ? x.projectName : '', open, silent: !open, fm: {} };
+    if (type === 'literature') { o.fm.pdf = link; o.prepend = '📄 原文：' + shown + (x.explain ? '\n📝 讲解稿：[[' + x.explain.path + '|' + x.explain.basename + ']]' : ''); }
+    else if (type === 'meeting') { o.fm.audio = link; o.prepend = x.kind === 'file' ? '🎙 录音 / 视频：' + shown + '\n\n!' + '[[' + x.file.path + ']]' : '🎙 录音 / 视频：' + shown; }
+    else { o.fm.file = link; o.prepend = '📎 文件：' + shown; }
+    return this.createNote(o);
+  }
+  fullPath(file) {
+    const ad = this.app.vault.adapter;
+    if (ad && ad.getFullPath) return ad.getFullPath(file.path);
+    if (ad && ad.basePath) return ad.basePath + '/' + file.path;
+    return file.path;
+  }
+  openWithDefault(file) {
+    if (this.app.openWithDefaultApp) return this.app.openWithDefaultApp(file.path);
+    return openFsPath(this.fullPath(file));
+  }
+  openAny(file) {
+    if (OBSIDIAN_EXTS.includes((file.extension || '').toLowerCase())) return this.openFile(file);
+    return this.openWithDefault(file);
+  }
+  openEntry(x) {
+    if (x.kind === 'link' && IS_MOBILE) return new Notice('这个文件存在电脑上（库外链接），手机上打不开');
+    if (x.kind === 'link') return openFsPath(x.extPath);
+    return this.openAny(x.file);
+  }
+  revealEntry(x) {
+    if (IS_MOBILE) return new Notice('手机上没有文件夹窗口，可在文件列表里找到：' + (x.file ? x.file.path : x.extPath));
+    if (x.kind === 'link') return showFsPath(x.extPath);
+    if (this.app.showInFolder) return this.app.showInFolder(x.file.path);
+    return showFsPath(this.fullPath(x.file));
+  }
+  async copyText(t) {
+    try { await navigator.clipboard.writeText(t); new Notice('已复制'); } catch (e) { new Notice('复制失败：' + e.message); }
+  }
+  copyEntryPath(x) { return this.copyText(x.kind === 'link' ? x.extPath : this.fullPath(x.file)); }
+  async moveEntry(x, project, cat) {
+    const folder = this.catFolder(project, cat);
+    await this.ensureFolder(folder);
+    if (x.kind === 'link') {
+      await this.app.fileManager.processFrontMatter(x.file, (fm) => { fm.project = project ? '[[' + project + ']]' : ''; fm.category = cat; });
+      if (x.file.parent && x.file.parent.path !== folder) await this.app.fileManager.renameFile(x.file, this.uniquePath(folder, x.file.basename));
+    } else {
+      if (x.file.parent && x.file.parent.path === folder) return;
+      await this.app.fileManager.renameFile(x.file, this.uniqueFilePath(folder, x.name));
+    }
+    new Notice('已移动：' + x.name + ' → ' + folder);
+    this.refreshViews();
+  }
+  /* 打开 frontmatter 里的链接值：zotero:// / http / file:/// / [[库内文件]] */
+  openLinkValue(v, source) {
+    v = str(v).trim();
+    if (!v) return;
+    if (/^https?:\/\//i.test(v)) return this.openUrl(v);
+    if (/^zotero:\/\//i.test(v)) return openExternalUrl(v);
+    if (/^file:\/\//i.test(v)) return openFsPath(decodeURI(v.replace(/^file:\/\/\/?/i, '')));
+    const m = v.match(/\[\[([^\]|#]+)/);
+    const lp = (m ? m[1] : v).trim();
+    const dest = this.app.metadataCache.getFirstLinkpathDest(lp, source ? source.path : '');
+    if (dest) return this.openAny(dest);
+    if (/^[a-zA-Z]:[\\/]|^\//.test(lp)) return openFsPath(lp);
+    new Notice('找不到文件：' + lp);
+  }
+
+  /* ---------- Zotero（本机 Local API，需要 Zotero 7 正在运行） ---------- */
+  async zGet(path) {
+    const port = this.settings.zoteroPort || 23119;
+    let r = null;
+    let lastErr = null;
+    for (const host of ['127.0.0.1', 'localhost']) {
+      try {
+        r = await requestUrl({ url: 'http://' + host + ':' + port + path, method: 'GET', headers: ZOTERO_HEADERS, throw: false });
+        break;
+      } catch (e) { lastErr = e; }
+    }
+    if (!r) {
+      // 区分「Zotero 没开」和「Zotero 开着但没开启本地接口」：后者连得上但返回空响应
+      const msg = String((lastErr && lastErr.message) || '');
+      let running = /EMPTY_RESPONSE|CONNECTION_RESET|socket hang up|ECONNRESET/i.test(msg);
+      if (!running) {
+        try {
+          const ping = await requestUrl({ url: 'http://127.0.0.1:' + port + '/connector/ping', method: 'GET', headers: ZOTERO_HEADERS, throw: false });
+          running = ping && ping.status > 0 && ping.status < 500;
+        } catch (e) { /* 确实没在运行 */ }
+      }
+      const err = new Error((running ? 'Zotero 正在运行，但本地接口没有响应（' : '无法连接 127.0.0.1:' + port + '（') + msg + '）');
+      err.code = running ? 'disabled' : 'offline';
+      throw err;
+    }
+    if (r.status === 403) {
+      const err = new Error('Zotero 本地 API 未开启（403）');
+      err.code = 'disabled';
+      throw err;
+    }
+    if (r.status >= 400) {
+      const err = new Error('Zotero 返回 ' + r.status + '：' + String(r.text || '').slice(0, 160));
+      err.code = r.status === 404 ? 'disabled' : 'error';
+      throw err;
+    }
+    try { return r.json; } catch (e) { return JSON.parse(r.text); }
+  }
+  async zoteroStatus() {
+    try { await this.zGet('/api/users/0/items/top?limit=1'); return { ok: true }; } catch (e) { return { ok: false, code: e.code, message: e.message }; }
+  }
+  async zSearch(qv, collection) {
+    let qs = 'limit=60&sort=dateModified&direction=desc';
+    if (qv) qs += '&q=' + encodeURIComponent(qv) + '&qmode=titleCreatorYear';
+    const path = collection ? '/api/users/0/collections/' + collection + '/items/top?' + qs : '/api/users/0/items/top?' + qs;
+    const items = (await this.zGet(path)) || [];
+    return items.filter((i) => i && i.data && !['attachment', 'note', 'annotation'].includes(i.data.itemType));
+  }
+  async zCollections() {
+    const raw = (await this.zGet('/api/users/0/collections?limit=500')) || [];
+    const byKey = new Map(raw.map((c) => [c.key, c]));
+    const label = (c) => {
+      const parts = [];
+      let cur = c;
+      let guard = 0;
+      while (cur && guard++ < 20) { parts.unshift(cur.data.name); cur = cur.data.parentCollection ? byKey.get(cur.data.parentCollection) : null; }
+      return parts.join(' / ');
+    };
+    return raw.map((c) => ({ key: c.key, label: label(c) })).sort((a, b) => a.label.localeCompare(b.label, 'zh'));
+  }
+  async zChildren(key) { return (await this.zGet('/api/users/0/items/' + key + '/children')) || []; }
+  zoteroImportedKeys() {
+    const s = new Set();
+    for (const n of this.buildIndex().notes) if (n.type === 'literature' && n.fm.zotero_key) s.add(String(n.fm.zotero_key));
+    return s;
+  }
+  async zAnnotationsFor(itemKey) {
+    const kids = await this.zChildren(itemKey);
+    const pdfs = kids.filter((k) => k.data && k.data.itemType === 'attachment' && /pdf|epub/i.test(k.data.contentType || ''));
+    const out = [];
+    for (const att of pdfs) {
+      let anns = [];
+      try { anns = (await this.zChildren(att.key)).filter((a) => a.data && a.data.itemType === 'annotation'); } catch (e) { /* ignore */ }
+      anns.sort((a, b) => String(a.data.annotationSortIndex || '').localeCompare(String(b.data.annotationSortIndex || '')));
+      out.push({ att, anns });
+    }
+    return { pdfs, groups: out };
+  }
+  formatAnnotations(groups) {
+    const COLORS = { '#ffd400': '🟡', '#ff6666': '🔴', '#5fb236': '🟢', '#2ea8e5': '🔵', '#a28ae5': '🟣', '#e56eee': '🟣', '#f19837': '🟠', '#aaaaaa': '⚪' };
+    const lines = [];
+    let n = 0;
+    for (const g of groups) {
+      for (const a of g.anns) {
+        const d = a.data;
+        const page = d.annotationPageLabel || '';
+        const dot = COLORS[String(d.annotationColor || '').toLowerCase()] || '▪️';
+        const link = 'zotero://open-pdf/library/items/' + g.att.key + (page ? '?page=' + encodeURIComponent(page) : '') + (a.key ? (page ? '&' : '?') + 'annotation=' + a.key : '');
+        if (d.annotationText) lines.push('> ' + dot + ' ' + String(d.annotationText).replace(/\n+/g, '\n> '));
+        else lines.push('> ' + dot + ' （' + (d.annotationType === 'image' ? '图片' : d.annotationType || '') + '批注）');
+        lines.push('> — [p. ' + (page || '?') + '](' + link + ')');
+        if (d.annotationComment) lines.push('', '💬 ' + String(d.annotationComment).replace(/\n+/g, ' '));
+        lines.push('');
+        n++;
+      }
+    }
+    const head = '*同步于 ' + today() + '，共 ' + n + ' 条批注；点击页码在 Zotero 中跳转到原文*';
+    return { text: '<!-- zotero-annotations:start -->\n' + head + '\n\n' + lines.join('\n') + '\n<!-- zotero-annotations:end -->', count: n };
+  }
+  zItemFields(item) {
+    const d = item.data || {};
+    const meta = item.meta || {};
+    const authorsArr = (d.creators || []).filter((c) => !c.creatorType || ['author', 'inventor', 'presenter', 'programmer', 'artist', 'director'].includes(c.creatorType));
+    const cs = authorsArr.length ? authorsArr : d.creators || [];
+    const nameOf = (c) => c.name || (/[一-龥]/.test(c.lastName || '') ? (c.lastName || '') + (c.firstName || '') : [c.lastName, c.firstName].filter(Boolean).join(', '));
+    const year = ((meta.parsedDate || d.date || '').match(/\d{4}/) || [''])[0];
+    const first = cs[0] ? cs[0].lastName || cs[0].name || '' : '';
+    const journal = d.publicationTitle || d.proceedingsTitle || d.conferenceName || d.bookTitle || d.university || d.publisher || d.websiteTitle || '';
+    let citekey = d.citationKey || ((d.extra || '').match(/Citation Key:\s*(\S+)/i) || [])[1] || '';
+    if (!citekey) citekey = (String(first).replace(/[^\p{L}\p{N}]/gu, '') + year + String((d.title || '').split(/\s+/)[0] || '').replace(/[^\p{L}\p{N}]/gu, '')).toLowerCase();
+    return {
+      title: d.title || '(无标题)',
+      fileTitle: sanitize((first ? first + ' ' : '') + (year ? year + ' - ' : '') + (d.title || item.key)).slice(0, 90),
+      authors: cs.map(nameOf).filter(Boolean).join('; '),
+      year, journal, citekey,
+      doi: d.DOI || ((d.extra || '').match(/DOI:\s*(\S+)/i) || [])[1] || '',
+      url: d.url || '',
+      abstract: d.abstractNote || '',
+      tags: (d.tags || []).map((t) => t.tag).filter(Boolean).slice(0, 12),
+      itemType: d.itemType || '',
+    };
+  }
+  async importZoteroItems(items, o) {
+    const existing = this.zoteroImportedKeys();
+    let made = 0;
+    let anns = 0;
+    const fails = [];
+    for (const item of items) {
+      if (existing.has(item.key)) continue;
+      try {
+        const f = this.zItemFields(item);
+        let pdfLink = '';
+        let annBlock = null;
+        try {
+          const { pdfs, groups } = await this.zAnnotationsFor(item.key);
+          if (pdfs.length) pdfLink = 'zotero://open-pdf/library/items/' + pdfs[0].key;
+          if (o.annotations && groups.some((g) => g.anns.length)) { annBlock = this.formatAnnotations(groups); anns += annBlock.count; }
+        } catch (e) { console.warn('[科研工作台] 读取附件失败', e); }
+        const zlink = 'zotero://select/library/items/' + item.key;
+        const prepend = ['> [!info] Zotero', '> [在 Zotero 中查看](' + zlink + ')' + (pdfLink ? ' · [打开 PDF](' + pdfLink + ')' : '') + (f.doi ? ' · [DOI](https://doi.org/' + f.doi + ')' : ''), '', '## 摘要', f.abstract || '（无）'].join('\n');
+        const append = '## Zotero 批注\n' + (annBlock ? annBlock.text : '<!-- zotero-annotations:start -->\n*暂无批注。在 Zotero 里高亮后，点工作台的「同步批注」即可更新到这里*\n<!-- zotero-annotations:end -->');
+        await this.createNote({
+          type: 'literature', title: f.fileTitle, heading: f.title, project: o.project, status: o.status, open: false, silent: true,
+          fm: { authors: f.authors, year: f.year ? Number(f.year) : '', journal: f.journal, doi: f.doi, citekey: f.citekey, zotero_key: item.key, zotero: zlink, pdf: pdfLink, url: f.url, item_type: f.itemType, tags: f.tags },
+          prepend, append,
+        });
+        made++;
+      } catch (e) {
+        console.error('[科研工作台] Zotero 导入失败', item.key, e);
+        fails.push(((item.data && item.data.title) || item.key) + '：' + e.message);
+      }
+    }
+    if (!made && !fails.length) { new Notice('所选文献之前都已导入过'); return { made, anns, fails }; }
+    new Notice('📚 从 Zotero 导入 ' + made + ' 篇文献' + (anns ? '，' + anns + ' 条批注' : '') + (o.project ? ' → ' + o.project : '') + (fails.length ? '\n失败：' + fails.join('；') : ''), 6000);
+    this.refreshViews();
+    return { made, anns, fails };
+  }
+  async syncZoteroAnnotations(notes) {
+    if (IS_MOBILE) return new Notice('Zotero 只能在电脑上连接（它的本地接口只开在电脑上）。手机上可以正常查看已导入的文献笔记。', 6000);
+    if (!notes) notes = this.buildIndex().notes.filter((n) => n.type === 'literature' && n.fm.zotero_key);
+    if (!notes.length) { new Notice('没有从 Zotero 导入的文献笔记'); return { updated: 0 }; }
+    const st = await this.zoteroStatus();
+    if (!st.ok) { new Notice('连不上 Zotero：' + (st.code === 'disabled' ? '请在 Zotero 设置 → 高级 中开启「允许其他应用程序通讯」' : '请先打开 Zotero 7')); return { updated: 0, error: st.code }; }
+    let updated = 0;
+    let total = 0;
+    for (const n of notes) {
+      try {
+        const { pdfs, groups } = await this.zAnnotationsFor(String(n.fm.zotero_key));
+        const block = this.formatAnnotations(groups);
+        total += block.count;
+        await this.app.vault.process(n.file, (data) => {
+          const re = /<!-- zotero-annotations:start -->[\s\S]*?<!-- zotero-annotations:end -->/;
+          if (re.test(data)) return data.replace(re, block.text);
+          return data.replace(/\s*$/, '') + '\n\n## Zotero 批注\n' + block.text + '\n';
+        });
+        if (pdfs.length && !n.fm.pdf) await this.setField(n.file, 'pdf', 'zotero://open-pdf/library/items/' + pdfs[0].key);
+        updated++;
+      } catch (e) { console.warn('[科研工作台] 同步批注失败', n.file.path, e); }
+    }
+    new Notice('🔄 已同步 ' + updated + ' 篇文献的 Zotero 批注（共 ' + total + ' 条）');
+    return { updated, total };
+  }
+  zoteroImportModal(preset) { if (IS_MOBILE) return new Notice('Zotero 只能在电脑上连接（它的本地接口只开在电脑上）。手机上可以正常查看已导入的文献笔记。', 6000); new ZoteroImportModal(this.app, this, preset || {}).open(); }
+
+  /* ---------- 删除（进回收站） ---------- */
+  confirmDelete(o) { return new Promise((res) => new ConfirmDeleteModal(this.app, o, res).open()); }
+  async trash(f) {
+    if (!f) return;
+    if (this.app.fileManager.trashFile) await this.app.fileManager.trashFile(f);
+    else await this.app.vault.trash(f, true);
+  }
+  async deleteNote(n) {
+    const ok = await this.confirmDelete({ title: '删除笔记', lines: ['确定删除「' + n.title + '」吗？', '位置：' + n.file.path] });
+    if (!ok) return false;
+    await this.trash(n.file);
+    new Notice('🗑 已删除笔记：' + n.title);
+    this.refreshViews();
+    return true;
+  }
+  async deleteEntry(x) {
+    const lines = x.kind === 'link'
+      ? ['确定删除「' + x.name + '」的链接记录吗？', '只删除工作台里的这条记录，电脑上的原文件（' + x.extPath + '）不会被删除。']
+      : ['确定删除文件「' + x.name + '」吗？（' + fmtSize(x.size) + '）', '位置：' + x.file.path];
+    const ok = await this.confirmDelete({ title: x.kind === 'link' ? '删除链接记录' : '删除文件', lines });
+    if (!ok) return false;
+    await this.trash(x.file);
+    new Notice('🗑 已删除：' + x.name);
+    this.refreshViews();
+    return true;
+  }
+  renameProjectPrompt(p) {
+    new TextPromptModal(this.app, '把项目「' + p.title + '」改名为', p.name, async (v) => { await this.renameProject(p, v); }).open();
+  }
+  /* 重命名项目：项目主页、项目文件夹一起改名，并把所有指向它的 [[旧名]]（笔记的 project / parent 属性、正文链接、科研日志）改成新名 */
+  async renameProject(p, newName) {
+    const name = sanitize(String(newName || '').trim());
+    const old = p.name;
+    if (!name || name === old) return false;
+    const projRoot = normalizePath(this.settings.rootFolder + '/项目');
+    const oldFolder = normalizePath(projRoot + '/' + old);
+    const newFolder = normalizePath(projRoot + '/' + name);
+    const idx = this.buildIndex();
+    if (idx.byName.has(name) || this.app.vault.getAbstractFileByPath(newFolder)) { new Notice('已经有叫「' + name + '」的项目或文件夹了，换个名字'); return false; }
+    const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const linkRe = new RegExp('\\[\\[' + esc(old) + '(?=\\]\\]|\\||#)', 'g');
+    const fixVal = (v) => {
+      if (Array.isArray(v)) return v.map(fixVal);
+      if (typeof v !== 'string') return v;
+      if (v.trim() === old) return name;
+      return v.replace(linkRe, '[[' + name);
+    };
+    // 改名前记下：哪些笔记通过属性归属这个项目，哪些文件链接到项目主页
+    const homePath = p.file.path;
+    const fmRefs = new Set(idx.notes.filter((n) => n.projectName === old).map((n) => n.file));
+    for (const x of idx.projects) if (x.parentName === old) fmRefs.add(x.file);
+    const linkers = new Set();
+    const rl = this.app.metadataCache.resolvedLinks || {};
+    for (const src of Object.keys(rl)) if (rl[src] && rl[src][homePath]) { const f = this.app.vault.getAbstractFileByPath(src); if (f instanceof TFile) linkers.add(f); }
+    const folder = this.app.vault.getAbstractFileByPath(oldFolder);
+    const homeInFolder = homePath.startsWith(oldFolder + '/');
+    const inDetail = this.app.workspace.getLeavesOfType(VIEW_TYPE).map((l) => l.view).filter((v) => v && v.tab === 'detail' && v.detailProject === old);
+    try {
+      await this.actWith({}, async () => {
+        // ① 项目主页改名
+        const homeDir = homePath.split('/').slice(0, -1).join('/');
+        await this.app.fileManager.renameFile(p.file, normalizePath(homeDir + '/' + name + '.md'));
+        // ② 项目文件夹改名（主页在文件夹里时）
+        if (folder && homeInFolder && !this.app.vault.getAbstractFileByPath(newFolder)) await this.app.fileManager.renameFile(folder, newFolder);
+        // ③ 属性里的 [[旧名]] → [[新名]]（Obsidian 没开「自动更新链接」时也能对上）
+        for (const f of fmRefs) {
+          if (!(f instanceof TFile) || !this.app.vault.getAbstractFileByPath(f.path)) continue;
+          await this.app.fileManager.processFrontMatter(f, (fm) => { for (const k of ['project', 'parent', 'projects']) if (fm[k] != null) fm[k] = fixVal(fm[k]); });
+        }
+        // ④ 正文里的 [[旧名]]（包括项目主页标题、科研日志）
+        const home = p.file;
+        for (const f of new Set([...linkers, home])) {
+          if (!(f instanceof TFile) || f.extension !== 'md' || !this.app.vault.getAbstractFileByPath(f.path)) continue;
+          await this.app.vault.process(f, (d) => {
+            let out = d.replace(linkRe, '[[' + name);
+            if (f === home) out = out.replace(new RegExp('^# ' + esc(old) + '[ \\t]*$', 'm'), '# ' + name);
+            return out;
+          });
+        }
+        const fm = (this.app.metadataCache.getFileCache(home) || {}).frontmatter || {};
+        if (str(fm.title) === old) await this.app.fileManager.processFrontMatter(home, (x) => { x.title = name; });
+      });
+    } catch (e) {
+      console.error('[科研工作台] 重命名项目失败', e);
+      new Notice('重命名没有完成：' + (e.message || e));
+      this.refreshViews();
+      return false;
+    }
+    // 工作台里记着旧名的地方
+    for (const l of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+      const v = l.view;
+      if (!v) continue;
+      if (v.detailProject === old || inDetail.includes(v)) { v.detailProject = name; if (inDetail.includes(v)) v.tab = 'detail'; }
+      if (v.logProject === old) v.logProject = name;
+      if (v.filters) for (const k of Object.keys(v.filters)) if (v.filters[k] && v.filters[k].project === old) v.filters[k].project = name;
+      if (v.actF && v.actF.project === old) v.actF.project = name;
+    }
+    if (this.settings.lastProject === old) { this.settings.lastProject = name; this.saveSettingsSoon(); }
+    new Notice('✏️ 项目已改名：' + old + ' → ' + name);
+    this.refreshViews();
+    return true;
+  }
+
+  async deleteProject(p) {
+    const idx = this.buildIndex();
+    const folderPath = normalizePath(this.settings.rootFolder + '/项目/' + p.name);
+    const folder = this.app.vault.getAbstractFileByPath(folderPath);
+    const inFolder = (f) => f.path.startsWith(folderPath + '/');
+    const notesIn = idx.notes.filter((n) => inFolder(n.file)).length;
+    const filesIn = idx.files.filter((x) => x.kind === 'file' && inFolder(x.file)).length + idx.files.filter((x) => x.kind === 'link' && inFolder(x.file)).length;
+    const outside = idx.notes.filter((n) => n.projectName === p.name && !inFolder(n.file)).length;
+    const homeInFolder = inFolder(p.file);
+    const choices = [];
+    if (folder && homeInFolder) choices.push(['folder', '删除整个项目文件夹：项目主页 + ' + notesIn + ' 条笔记 + ' + filesIn + ' 个文件']);
+    choices.push(['home', '只删除项目主页，保留该项目的笔记和文件（它们会变成“未归属项目”）']);
+    const lines = ['确定删除项目「' + p.title + '」吗？'];
+    if (outside) lines.push('另有 ' + outside + ' 条笔记放在项目文件夹外，不会被删除，只会失去项目归属。');
+    lines.push('如果只是项目结束了，也可以把状态改成「已完成」来归档，而不必删除。');
+    const choice = await this.confirmDelete({ title: '删除项目', lines, choices, confirmText: '删除项目' });
+    if (!choice) return false;
+    if (choice === 'folder' && folder) await this.trash(folder);
+    else await this.trash(p.file);
+    new Notice('🗑 已删除项目：' + p.title + (choice === 'folder' ? '（含全部笔记和文件）' : ''));
+    this.refreshViews();
+    return choice;
+  }
+
+  async writeAgentGuide() {
+    for (const name of ['CLAUDE.md', 'AGENTS.md']) {
+      const f = this.app.vault.getAbstractFileByPath(name);
+      if (f instanceof TFile) await this.app.vault.modify(f, AGENT_GUIDE);
+      else await this.app.vault.create(name, AGENT_GUIDE);
+    }
+    new Notice('已生成 CLAUDE.md 与 AGENTS.md');
+  }
+};

@@ -1,0 +1,7 @@
+data.json
+mindflow/
+glosses/
+.DS_Store
+node_modules/
+*.log
+.env
