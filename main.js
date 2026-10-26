@@ -9106,6 +9106,32 @@ function plainExcerpt(md, n) {
   return t.length > n ? t.slice(0, n) + '…' : t;
 }
 
+/* 摘要里保留 $公式$（交给 setMathText 渲染） */
+function mathExcerpt(md) {
+  return String(md || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/\$\$([\s\S]+?)\$\$/g, (m, t) => ' $' + t.replace(/\s+/g, ' ').trim() + '$ ')
+    .split('\n').filter((l) => !/^\s*\|/.test(l)).join(' ')
+    .replace(/[#>*`]/g, '').replace(/\s+/g, ' ').trim();
+}
+/* 追问时实际问的话：没自己写（用的默认追问语）就算空 */
+function mfAskedText(plugin, node, userMsg) {
+  const t = String((userMsg && userMsg.content) || '').trim();
+  if (!t) return '';
+  if (node && node.anchor) {
+    const def = String((plugin && plugin.settings && plugin.settings.defaultFollowUp) || '请详细解释这段内容。').trim();
+    if (t === def || t === '请详细解释这段内容。') return '';
+  }
+  return t;
+}
+/* 窗口的显示名：划线追问 = 划的那段原文；直接问 = 问题 */
+function mfNodeText(plugin, node) {
+  if (!node) return '';
+  if (node.anchor && node.anchor.text) return node.anchor.text;
+  const u = (node.messages || []).find((m) => m.role === 'user');
+  return (u && u.content) || node.title || '未命名问题';
+}
+
 // ── 会话树工具 ─────────────────────────────────────────────
 function chainOf(s, nodeId) {
   const out = [];
@@ -10253,7 +10279,7 @@ class MindflowChatView extends obsidian.ItemView {
     if (!list.length) listEl.createDiv({ cls: 'cmf-hist-empty', text: '还没有对话' });
     for (const s of list) {
       const item = listEl.createDiv({ cls: 'cmf-hist-item' + (this.session && this.session.id === s.id ? ' is-active' : '') });
-      item.createDiv({ cls: 'cmf-hist-title', text: s.title || '未命名对话' });
+      setMathText(item.createDiv({ cls: 'cmf-hist-title' }), s.title || '未命名对话', 60);
       const meta = item.createDiv({ cls: 'cmf-hist-time' });
       if (starred.has(s.id)) {
         const st = meta.createSpan({ cls: 'cmf-hist-star', attr: { 'aria-label': '已收藏' } });
@@ -10347,8 +10373,16 @@ class MindflowChatView extends obsidian.ItemView {
     const titleEl = head.createDiv({ cls: 'cmf-head-title' });
     if (node) {
       const chain = chainOf(this.session, node.id);
-      if (chain.length > 1) titleEl.createDiv({ cls: 'cmf-head-path', text: chain.slice(0, -1).map((n) => truncate(n.title, 12)).join(' › ') });
-      titleEl.createDiv({ cls: 'cmf-head-main', text: node.title || '未命名问题' });
+      if (chain.length > 1) {
+        const pathEl = titleEl.createDiv({ cls: 'cmf-head-path' });
+        chain.slice(0, -1).forEach((n, k) => {
+          if (k) pathEl.appendText(' › ');
+          setMathText(pathEl.createSpan({ cls: n.anchor ? 'cmf-path-mark' : '' }), mfNodeText(this.plugin, n), 14);
+        });
+      }
+      const mainEl = titleEl.createDiv({ cls: 'cmf-head-main' + (node.anchor && node.anchor.text ? ' is-anchor' : '') });
+      setMathText(node.anchor && node.anchor.text ? mainEl.createSpan({ cls: 'cmf-head-mark' }) : mainEl, mfNodeText(this.plugin, node), 80);
+      titleEl.setAttr('aria-label', (node.anchor && node.anchor.text ? '划线：' + node.anchor.text + '\n' : '') + (mfAskedText(this.plugin, node, node.messages.find((m) => m.role === 'user')) || ''));
     } else {
       titleEl.createDiv({ cls: 'cmf-head-main', text: '新对话' });
     }
@@ -11217,7 +11251,13 @@ class MindflowChatView extends obsidian.ItemView {
     card.empty();
     card.toggleClass('is-open', open);
     const head = card.createDiv({ cls: 'cmf-card-head' });
-    const t = head.createDiv({ cls: 'cmf-card-title', text: c.title || '追问' });
+    const t = head.createDiv({ cls: 'cmf-card-title' });
+    const cu = c.messages.find((m) => m.role === 'user');
+    const cAsk = mfAskedText(this.plugin, c, cu);
+    if (c.anchor && c.anchor.text) {
+      setMathText(t.createDiv({ cls: 'cmf-card-mark' }), c.anchor.text, 120);
+      if (cAsk) setMathText(t.createDiv({ cls: 'cmf-card-ask' }), cAsk, 80);
+    } else setMathText(t, (cu && cu.content) || c.title || '追问', 80);
     t.setAttr('aria-label', '在主窗口打开');
     const fold = head.createDiv({ cls: 'cmf-icon-btn cmf-card-fold', attr: { 'aria-label': open ? '收起' : '展开预览' } });
     obsidian.setIcon(fold, open ? 'chevron-up' : 'chevron-down');
@@ -11236,7 +11276,8 @@ class MindflowChatView extends obsidian.ItemView {
       const go = card.createDiv({ cls: 'cmf-card-go', text: '进入这个对话 →' });
       go.addEventListener('click', () => this.openNode(c.id));
     } else {
-      card.createDiv({ cls: 'cmf-card-snippet', text: ans && ans.content ? plainExcerpt(ans.content, 70) : running ? '思考中…' : '' });
+      const sn = card.createDiv({ cls: 'cmf-card-snippet' });
+      if (ans && ans.content) setMathText(sn, mathExcerpt(ans.content), 80); else sn.setText(running ? '思考中…' : '');
     }
     fold.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -11339,9 +11380,13 @@ class MindflowChatView extends obsidian.ItemView {
         const line = main.createDiv({ cls: 'cmf-tree-line' });
         const question = (r.user && r.user.content) || node.title || '未命名问题';
         if (i === 0 && node.anchor && node.anchor.text) {
-          line.createSpan({ cls: 'cmf-tree-mark', text: truncate(node.anchor.text, 16) });
+          // 划线追问：主行显示划的原文（黄色，公式渲染），下面小字是当时问的话
+          setMathText(line.createDiv({ cls: 'cmf-tree-mark' }), node.anchor.text, 90);
+          const asked = mfAskedText(this.plugin, node, r.user);
+          if (asked) setMathText(main.createDiv({ cls: 'cmf-tree-ask' }), asked, 60);
+        } else {
+          setMathText(line.createDiv({ cls: 'cmf-tree-title' }), (i > 0 ? '↳ ' : '') + question, 70);
         }
-        line.createSpan({ cls: 'cmf-tree-title', text: truncate(question, 60) });
         if (running && i === rounds.length - 1) item.createSpan({ cls: 'cmf-tree-run', text: '…' });
         item.setAttr(
           'aria-label',

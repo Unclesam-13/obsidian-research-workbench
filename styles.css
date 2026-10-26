@@ -2246,3 +2246,15 @@ body.is-mobile .rw-htmlview-frame { margin-bottom: var(--rw-nav-inset, 0px); }
 .rw-mf-img-x svg { width: 12px; height: 12px; }
 .rw-mf-attach { flex: 0 0 auto; align-self: flex-end; }
 .rw-mf-composer.is-drop { outline: 2px dashed var(--interactive-accent); outline-offset: 2px; }
+
+/* v0.21.10 Mindflow 标签页：问答树 / 追问卡片 / 标题显示划线原文，公式渲染 */
+.cmf-tree-main { flex: 1; min-width: 0; }
+.cmf-tree-line { display: block; }
+.cmf-tree-line .cmf-tree-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; white-space: normal; overflow: hidden; line-height: 1.45; }
+.cmf-tree-mark { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; max-width: 100%; white-space: normal; overflow: hidden; line-height: 1.5; font-size: 12.5px; padding: 1px 5px; box-decoration-break: clone; -webkit-box-decoration-break: clone; }
+.cmf-tree-ask { margin-top: 2px; font-size: 11px; color: var(--text-faint); white-space: normal; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; font-weight: 400; }
+.cmf-card-mark { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; padding: 1px 5px; border-radius: 3px; background: rgba(var(--color-yellow-rgb, 230, 200, 60), 0.35); color: var(--text-normal); line-height: 1.5; }
+.cmf-card-ask { margin-top: 4px; font-size: 11.5px; font-weight: 400; color: var(--text-muted); }
+.cmf-card-snippet .rw-inline-math mjx-container, .cmf-tree-item .rw-inline-math mjx-container, .cmf-head-title .rw-inline-math mjx-container { font-size: 95% !important; }
+.cmf-head-mark { padding: 0 5px; border-radius: 3px; background: rgba(var(--color-yellow-rgb, 230, 200, 60), 0.35); }
+.cmf-path-mark { padding: 0 3px; border-radius: 3px; background: rgba(var(--color-yellow-rgb, 230, 200, 60), 0.22); }
