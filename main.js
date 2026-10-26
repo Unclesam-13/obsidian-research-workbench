@@ -10130,6 +10130,7 @@ class MindflowChatView extends obsidian.ItemView {
       this.register(() => ro.disconnect());
     }
     this.registerDomEvent(document, 'selectionchange', () => this.onSelectionChange());
+    this.watchTouch();
     // Ctrl+C / 系统复制：带上公式的 LaTeX 源码（默认复制会把公式丢掉）
     this.registerDomEvent(document, 'copy', (e) => {
       const r = this.readSelection();
@@ -10975,15 +10976,34 @@ class MindflowChatView extends obsidian.ItemView {
   onSelectionChange() {
     this.updateMathSelection();
     if (!this.compact || this.popEl) return;
+    this.watchTouch();
     clearTimeout(this.selTimer);
-    this.selTimer = setTimeout(() => {
-      const r = this.readSelection();
-      if (r) {
-        this.pendingSelRange = r.range.cloneRange();
-        this.showPill(r.anchor);
-      }
-      else this.hidePill();
-    }, 300);
+    // 还在拖选区的时候不弹：选区一变就先收起，等手指离开、选区停住一会儿再弹出
+    const sel = document.getSelection();
+    const sig = sel && sel.rangeCount && !sel.isCollapsed ? (() => { const r = sel.getRangeAt(0); return [r.startContainer, r.startOffset, r.endContainer, r.endOffset]; })() : null;
+    const same = (a, b) => a && b && a.every((x, i) => x === b[i]);
+    if (this.pillEl && !same(sig, this._pillSig)) this.hidePill();
+    this.selTimer = setTimeout(() => this.settleSelection(), 700);
+  }
+
+  /* 记录手指是否还按在屏幕上（拖选区时） */
+  watchTouch() {
+    if (this._touchWatch) return;
+    this._touchWatch = true;
+    const down = () => { this._touching = true; clearTimeout(this.selTimer); };
+    const up = () => { this._touching = false; if (this.compact && !this.popEl) { clearTimeout(this.selTimer); this.selTimer = setTimeout(() => this.settleSelection(), 450); } };
+    this.registerDomEvent(document, 'touchstart', down, { capture: true, passive: true });
+    this.registerDomEvent(document, 'touchend', up, { capture: true, passive: true });
+    this.registerDomEvent(document, 'touchcancel', up, { capture: true, passive: true });
+  }
+
+  settleSelection() {
+    if (this._touching) return; // 手指还没抬起，等 touchend 再说
+    const r = this.readSelection();
+    if (!r) { this.hidePill(); return; }
+    this.pendingSelRange = r.range.cloneRange();
+    this._pillSig = [r.range.startContainer, r.range.startOffset, r.range.endContainer, r.range.endOffset];
+    this.showPill(r.anchor);
   }
 
   updateMathSelection() {
