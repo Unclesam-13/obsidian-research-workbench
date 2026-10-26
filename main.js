@@ -2245,6 +2245,13 @@ class WorkbenchView extends ItemView {
       m.addItem((i) => i.setTitle('选中的 ' + target.length + ' 篇：一键全文翻译（机器翻译）').setIcon('languages').onClick(() => run((pdf) => pl.ftTranslate(pdf, 'machine'))));
       m.showAtMouseEvent(e);
     }, 'rw-btn-sm').title = '勾选文献后：批量转 Markdown / 全文翻译';
+    if (selN.length) {
+      const db = this.btn(bar, '删除（' + selN.length + '）', 'trash-2', async () => {
+        const done = await pl.deleteLiterature(selN);
+        if (done) { for (const pth of done) this.pgSel.delete(pth); this.render(); }
+      }, 'rw-btn-sm rw-btn-danger');
+      db.title = '删除勾选的 ' + selN.length + ' 篇文献（进回收站，可找回）';
+    }
     const run = Object.values(pl._pg || {}).reduce((a, r) => a + Object.values(r).filter((x) => x.status === 'running' || x.status === 'queued').length, 0);
     h(wrap, 'div', { cls: 'rw-muted rw-pgt-sum', text: list.length + ' 篇文献 · ' + cols.length + ' 个 AI 分析列' + (run ? ' · 正在分析 ' + run + ' 个格子…' : '') + ' · 点标题进入阅读（PDF + AI 问答）' });
     if (!list.length) { h(wrap, 'div', { cls: 'rw-empty', text: '没有文献。从 Zotero 导入，或把 PDF 拖进来。' }); return; }
@@ -16146,6 +16153,57 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     new Notice('🗑 已删除笔记：' + n.title);
     this.refreshViews();
     return true;
+  }
+  /* 文献表格：批量删除勾选的文献（进回收站）。返回删掉的表格行路径，取消返回 null */
+  async deleteLiterature(list) {
+    list = (list || []).filter(Boolean);
+    if (!list.length) return null;
+    const idx = this.buildIndex();
+    const selPaths = new Set(list.map((n) => n.file.path));
+    const items = list.map((n) => {
+      const c = this.paperOf(n.file) || {};
+      const pdf = n.pdfOnly ? n.file : c.pdf || null;
+      return { n, note: n.pdfOnly ? null : n.file, pdf };
+    });
+    // 别的（没勾选的）文献笔记也在用的 PDF 不删
+    const sharedPdf = (pdf) => idx.notes.some((x) => x.type === 'literature' && !selPaths.has(x.file.path) && this.pdfsOf(x).some((p) => p.kind === 'vault' && p.file.path === pdf.path));
+    const pdfs = items.filter((it) => it.pdf && !it.n.pdfOnly && !sharedPdf(it.pdf)).map((it) => it.pdf);
+    const orphanPdfs = items.filter((it) => it.n.pdfOnly).map((it) => it.pdf);
+    const ftDirs = [];
+    for (const it of items) if (it.pdf) { const fi = this.ftInfo(it.pdf); const d = fi.dir && this.app.vault.getAbstractFileByPath(fi.dir); if (d && d.children) ftDirs.push(d); }
+    const noteN = items.filter((it) => it.note).length;
+    const lines = ['确定删除勾选的 ' + list.length + ' 篇文献吗？'];
+    for (const it of items.slice(0, 6)) lines.push('· ' + trunc(it.n.title || it.n.file.basename, 60));
+    if (items.length > 6) lines.push('…… 等共 ' + items.length + ' 篇');
+    if (orphanPdfs.length) lines.push('其中 ' + orphanPdfs.length + ' 篇还没有笔记，删除的就是 PDF 本身。');
+    const choices = [];
+    if (noteN) {
+      choices.push(['note', '只删文献笔记（' + noteN + ' 条）' + (orphanPdfs.length ? ' + 没有笔记的 PDF（' + orphanPdfs.length + ' 个）' : '') + '，有笔记的 PDF 和全文转换结果保留']);
+      if (pdfs.length || ftDirs.length) choices.push(['all', '文献笔记 + 库里的 PDF（' + (pdfs.length + orphanPdfs.length) + ' 个）+ 全文转换结果（Markdown / 译文 / HTML，' + ftDirs.length + ' 份）一起删除']);
+    } else if (ftDirs.length) {
+      choices.push(['note', '只删这些 PDF（' + orphanPdfs.length + ' 个）']);
+      choices.push(['all', 'PDF + 全文转换结果（' + ftDirs.length + ' 份）一起删除']);
+    }
+    if (items.some((it) => !it.pdf && !it.n.pdfOnly && this.pdfsOf(it.n).some((p) => p.kind !== 'vault'))) lines.push('Zotero 里的 PDF 不在库里，不会被删除。');
+    const choice = await this.confirmDelete({ title: '删除文献', lines, choices: choices.length ? choices : null, confirmText: '删除 ' + list.length + ' 篇' });
+    if (!choice) return null;
+    const all = choice === 'all';
+    const targets = [];
+    for (const it of items) if (it.note) targets.push(it.note);
+    targets.push(...orphanPdfs);
+    if (all) { targets.push(...pdfs); targets.push(...ftDirs); }
+    let ok = 0, fail = 0;
+    const seen = new Set();
+    for (const f of targets) {
+      if (!f || seen.has(f.path)) continue;
+      seen.add(f.path);
+      if (!this.app.vault.getAbstractFileByPath(f.path)) continue;
+      try { await this.trash(f); ok++; } catch (e) { fail++; console.error('[科研工作台] 删除失败', f.path, e); }
+    }
+    if (this._pg) { for (const pth of selPaths) delete this._pg[pth]; if (this.pgSaveSoon) this.pgSaveSoon(); }
+    new Notice('🗑 已删除 ' + list.length + ' 篇文献' + (all ? '（含 PDF / 全文）' : '') + '，共 ' + ok + ' 项进了回收站' + (fail ? '，' + fail + ' 项失败' : ''));
+    this.refreshViews();
+    return [...selPaths];
   }
   async deleteEntry(x) {
     const lines = x.kind === 'link'
