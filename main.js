@@ -1,7 +1,7 @@
 'use strict';
 /*
  * 科研工作台 Research Workbench — Obsidian plugin
- * 多项目 × 科研流程（灵感 → 文献综述 → 实验 → 数据分析 → 论文写作 → 投稿发表）
+ * 多项目 × 科研流程（灵感 → 文献综述 → 实验与数据 → 论文写作 → 投稿发表；类型和流程可自定义）
  * 所有数据都是普通 Markdown + YAML frontmatter，插件只负责读取、汇总和修改属性。
  */
 const obsidian = require('obsidian');
@@ -14,8 +14,7 @@ const VIEW_TYPE = 'research-workbench-view';
 const STAGES = [
   { id: '灵感', icon: 'lightbulb', color: '#eab308', noteType: 'idea', desc: '捕捉想法 · 评估可行性' },
   { id: '文献综述', icon: 'book-open', color: '#3b82f6', noteType: 'literature', desc: '检索 · 精读 · 综述' },
-  { id: '实验', icon: 'flask-conical', color: '#10b981', noteType: 'experiment', desc: '方案设计 · 执行记录' },
-  { id: '数据分析', icon: 'bar-chart-3', color: '#8b5cf6', noteType: 'data', desc: '处理 · 统计 · 出图' },
+  { id: '实验与数据', icon: 'flask-conical', color: '#10b981', noteType: 'experiment', desc: '方案 · 记录 · 数据处理 · 出图' },
   { id: '论文写作', icon: 'pen-line', color: '#ec4899', noteType: 'draft', desc: '大纲 · 初稿 · 修改' },
   { id: '投稿发表', icon: 'send', color: '#f97316', noteType: 'submission', desc: '投稿 · 审稿 · 返修' },
 ];
@@ -57,33 +56,126 @@ const KINDS = {
       { id: '提交答辩', icon: 'send', color: '#f97316', noteType: 'submission', desc: '提交 · 答辩 · 结果' },
     ],
   },
+  review: {
+    label: '综述论文', icon: 'library', color: '#0ea5e9', slot: 1,
+    desc: '综述 / 调研类论文：没有实验，重在检索、归类、对比和写作',
+    stages: [
+      { id: '确定主题', icon: 'lightbulb', color: '#eab308', noteType: 'idea', desc: '范围 · 问题 · 提纲' },
+      { id: '检索筛选', icon: 'search', color: '#60a5fa', noteType: 'literature', desc: '关键词 · 数据库 · 纳入标准' },
+      { id: '精读归类', icon: 'book-open', color: '#3b82f6', noteType: 'literature', desc: '分类 · 对比表 · 趋势' },
+      { id: '撰写综述', icon: 'pen-line', color: '#ec4899', noteType: 'draft', desc: '框架 · 初稿 · 修改' },
+      { id: '投稿发表', icon: 'send', color: '#f97316', noteType: 'submission', desc: '投稿 · 审稿 · 返修' },
+    ],
+  },
+  method: {
+    label: '方法论文', icon: 'cpu', color: '#7c3aed', slot: 2,
+    desc: '提出新方法 / 算法：建模推导、仿真或实验验证，再写成论文',
+    stages: [
+      { id: '问题与灵感', icon: 'lightbulb', color: '#eab308', noteType: 'idea', desc: '问题定义 · 想法' },
+      { id: '文献调研', icon: 'book-open', color: '#3b82f6', noteType: 'literature', desc: '相关工作 · 基线' },
+      { id: '方法设计', icon: 'sigma', color: '#6366f1', noteType: 'idea', desc: '建模 · 推导 · 算法' },
+      { id: '实验与数据', icon: 'flask-conical', color: '#10b981', noteType: 'experiment', desc: '仿真 · 实验 · 对比 · 出图' },
+      { id: '论文写作', icon: 'pen-line', color: '#ec4899', noteType: 'draft', desc: '大纲 · 初稿 · 修改' },
+      { id: '投稿发表', icon: 'send', color: '#f97316', noteType: 'submission', desc: '投稿 · 审稿 · 返修' },
+    ],
+  },
   collection: {
     label: '资料库', icon: 'archive', color: '#e87ba4', slot: 5,
     desc: '只存放文件和资料，没有流程：课程资料、数据集、别人分享的材料、讲座 PPT…',
     stages: [],
   },
 };
-const KIND_ORDER = ['paper', 'direction', 'study', 'grant', 'collection'];
+const KIND_ORDER = ['paper', 'review', 'method', 'direction', 'study', 'grant', 'collection'];
+/* 内置的类型（设置里可以改名、改流程、删除，也可以新建类型；改过的存在 settings.projectKinds） */
+const DEFAULT_KINDS = JSON.parse(JSON.stringify(KINDS));
+const DEFAULT_KIND_ORDER = KIND_ORDER.slice();
+const STAGE_PALETTE = ['#eab308', '#3b82f6', '#10b981', '#8b5cf6', '#ec4899', '#f97316', '#0ea5e9', '#6366f1', '#14b8a6', '#ef4444'];
+const NOTE_TYPE_ICON = { idea: 'lightbulb', literature: 'book-open', experiment: 'flask-conical', data: 'flask-conical', draft: 'pen-line', submission: 'send', meeting: 'users', '': 'circle-dot' };
+/* 按阶段名猜它对应哪类笔记（自定义阶段没选时用） */
+function guessStageNoteType(name) {
+  const t = String(name || '');
+  if (/投稿|发表|提交|审稿|答辩/.test(t)) return 'submission';
+  if (/写|撰|稿|定稿|修改/.test(t)) return 'draft';
+  if (/实验|仿真|数据|复现|测试|验证|测量/.test(t)) return 'experiment';
+  if (/汇报|组会|会议|讨论/.test(t)) return 'meeting';
+  if (/文献|调研|阅读|精读|综述|检索|资料|梳理/.test(t)) return 'literature';
+  if (/灵感|选题|想法|问题|方法|设计|论证/.test(t)) return 'idea';
+  return '';
+}
+/* 用阶段名生成阶段定义：先找已有类型里同名的阶段，没有就按名字猜 */
+function stageDefFromName(name, i, given) {
+  const id = String(name || '').trim();
+  for (const k of Object.keys(KINDS)) { const hit = (KINDS[k].stages || []).find((x) => x.id === id); if (hit) return Object.assign({}, hit, given || {}); }
+  const nt = given && given.noteType != null ? given.noteType : guessStageNoteType(id);
+  return Object.assign({ id, icon: NOTE_TYPE_ICON[nt] || 'circle-dot', color: STAGE_PALETTE[i % STAGE_PALETTE.length], noteType: nt, desc: '' }, given || {});
+}
+/* 把设置里的类型列表装进 KINDS / KIND_ORDER（启动和改设置后调用） */
+function applyKinds(list) {
+  for (const k of Object.keys(KINDS)) delete KINDS[k];
+  KIND_ORDER.length = 0;
+  const src = Array.isArray(list) && list.length ? list : DEFAULT_KIND_ORDER.map((k) => Object.assign({ key: k }, DEFAULT_KINDS[k]));
+  src.forEach((d, i) => {
+    if (!d || !d.key || !d.label) return;
+    const base = DEFAULT_KINDS[d.key] || {};
+    KINDS[d.key] = {
+      label: String(d.label), icon: d.icon || base.icon || 'folder', color: d.color || base.color || STAGE_PALETTE[i % STAGE_PALETTE.length],
+      slot: base.slot || (i % 5) + 1, desc: d.desc != null ? String(d.desc) : base.desc || '',
+      stages: (d.stages || []).filter((x) => x && String(x.id || '').trim()).map((x, j) => {
+        const id = String(x.id).trim();
+        const known = (base.stages || []).find((y) => y.id === id);
+        return Object.assign({}, known || stageDefFromNameLocal(id, j), { id, noteType: x.noteType != null ? x.noteType : known ? known.noteType : guessStageNoteType(id), desc: x.desc != null ? x.desc : known ? known.desc : '' });
+      }),
+    };
+    KIND_ORDER.push(d.key);
+    KIND_ALIASES[d.key] = d.key; KIND_ALIASES[String(d.label)] = d.key;
+  });
+  if (!KINDS.paper) { KINDS.paper = JSON.parse(JSON.stringify(DEFAULT_KINDS.paper)); KIND_ORDER.unshift('paper'); }
+}
+function stageDefFromNameLocal(id, j) {
+  for (const k of Object.keys(DEFAULT_KINDS)) { const hit = DEFAULT_KINDS[k].stages.find((x) => x.id === id); if (hit) return Object.assign({}, hit); }
+  const nt = guessStageNoteType(id);
+  return { id, icon: NOTE_TYPE_ICON[nt] || 'circle-dot', color: STAGE_PALETTE[j % STAGE_PALETTE.length], noteType: nt, desc: '' };
+}
+/* 类型列表 → 可存进设置的样子 */
+function kindsToSettings() {
+  return KIND_ORDER.map((k) => ({ key: k, label: KINDS[k].label, icon: KINDS[k].icon, color: KINDS[k].color, desc: KINDS[k].desc, stages: KINDS[k].stages.map((x) => ({ id: x.id, noteType: x.noteType || '', desc: x.desc || '' })) }));
+}
 const KIND_ALIASES = {
   paper: 'paper', 论文: 'paper', 写论文: 'paper',
   direction: 'direction', 研究方向: 'direction', 方向: 'direction', 课题: 'direction',
   study: 'study', 研读: 'study', 研读他人工作: 'study', 研究他人工作: 'study', 复现: 'study',
   grant: 'grant', 基金: 'grant', '基金 / 申报': 'grant', '基金/申报': 'grant', 申报: 'grant',
   collection: 'collection', 资料库: 'collection', 资料: 'collection', 其他: 'collection', 文件: 'collection',
+  review: 'review', 综述论文: 'review', 综述: 'review',
+  method: 'method', 方法论文: 'method', 方法: 'method',
 };
 function normKind(v) {
   if (v == null || v === '') return 'paper';
   const s = String(Array.isArray(v) ? v[0] : v).trim();
-  return KIND_ALIASES[s] || KIND_ALIASES[s.toLowerCase()] || 'paper';
+  const k = KIND_ALIASES[s] || KIND_ALIASES[s.toLowerCase()];
+  return k && KINDS[k] ? k : 'paper';
 }
 function stagesOfKind(k) { return (KINDS[k] || KINDS.paper).stages; }
-function stagesOf(p) { return stagesOfKind(p.pkind); }
+/* 项目自己的流程（项目主页 stages 属性）优先，否则用类型的流程 */
+function stagesOf(p) {
+  if (p && Array.isArray(p.customStages)) return p._cs || (p._cs = p.customStages.map((n, i) => stageDefFromName(n, i)));
+  return stagesOfKind(p.pkind);
+}
+/* 读项目主页的 stages 属性：列表 / 用 → 或逗号分隔的文字；写了「无」= 没有流程 */
+function parseCustomStages(v) {
+  if (v == null) return null;
+  let arr = Array.isArray(v) ? v.map((x) => String(x == null ? '' : x)) : String(v).split(/→|->|,|，|、|\n/);
+  arr = arr.map((x) => x.trim()).filter(Boolean);
+  if (arr.length === 1 && /^(无|none|无流程)$/i.test(arr[0])) return [];
+  if (!arr.length) return Array.isArray(v) ? [] : null;
+  return arr;
+}
 function stageIdxOf(p) { return stagesOf(p).findIndex((s) => s.id === p.stage); }
 function stageDefOf(p) { return stagesOf(p)[stageIdxOf(p)] || null; }
 
 const STAGE_ALIASES = {
   idea: '灵感', literature: '文献综述', 文献: '文献综述', review: '文献综述',
-  experiment: '实验', analysis: '数据分析', 数据: '数据分析', data: '数据分析',
+  experiment: '实验与数据', analysis: '实验与数据', 数据: '实验与数据', data: '实验与数据', 实验: '实验与数据', 数据分析: '实验与数据', 实验与数据分析: '实验与数据',
   writing: '论文写作', 写作: '论文写作', submission: '投稿发表', 投稿: '投稿发表',
 };
 
@@ -91,8 +183,8 @@ const ACT_PROP_LABELS = { status: '状态', stage: '阶段', kind: '类型', pro
 const NOTE_TYPES = {
   idea:       { label: '灵感',     folder: '灵感', icon: 'lightbulb',     stage: '灵感',     statuses: ['待评估', '值得做', '已立项', '搁置'], desc: '随手记录研究想法，评估后转化为项目' },
   literature: { label: '文献',     folder: '文献', icon: 'book-open',     stage: '文献综述', statuses: ['待读', '在读', '已读', '已整理'], desc: '文献阅读笔记与综述素材' },
-  experiment: { label: '实验',     folder: '实验', icon: 'flask-conical', stage: '实验',     statuses: ['计划中', '进行中', '已完成', '需重做'], desc: '实验方案、过程记录与结果' },
-  data:       { label: '数据',     folder: '数据', icon: 'bar-chart-3',   stage: '数据分析', statuses: ['待分析', '分析中', '已出图', '已归档'], desc: '数据处理、统计分析与图表' },
+  experiment: { label: '实验',     folder: '实验', icon: 'flask-conical', stage: '实验与数据',     statuses: ['计划中', '进行中', '已完成', '需重做'], desc: '实验方案、过程记录与结果' },
+  data:       { label: '数据',     folder: '数据', icon: 'bar-chart-3',   stage: '实验与数据', statuses: ['待分析', '分析中', '已出图', '已归档'], desc: '数据处理、统计分析与图表' },
   draft:      { label: '写作',     folder: '写作', icon: 'pen-line',      stage: '论文写作', statuses: ['大纲', '初稿', '修改中', '定稿'], desc: '论文各章节草稿' },
   submission: { label: '投稿',     folder: '投稿', icon: 'send',          stage: '投稿发表', statuses: ['准备中', '已投稿', '审稿中', '返修', '接收', '拒稿'], desc: '投稿记录、审稿意见与回复' },
   meeting:    { label: '会议纪要', folder: '会议', icon: 'users',         stage: null,       statuses: ['待整理', '已整理'], desc: '组会、合作讨论与导师沟通' },
@@ -130,6 +222,9 @@ const IS_MOBILE = !!(obsidian.Platform && obsidian.Platform.isMobile);
 const TOUCH = IS_MOBILE || (typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(hover: none)').matches);
 const OBSIDIAN_EXTS = ['md', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'canvas', 'mp3', 'wav', 'm4a', 'ogg', 'flac', 'webm', 'mp4', 'mov', 'mkv'];
 /* 在某个笔记标签页里拖入文件时，默认归入的分类 */
+/* 「实验与数据」页：实验记录和数据分析笔记放在一起看；数据笔记的旧状态对应到同一套看板列 */
+const EXP_TAB_DEF = { label: '实验与数据', folder: '实验', icon: 'flask-conical', stage: '实验与数据', statuses: ['计划中', '进行中', '分析中', '已完成', '需重做'], desc: '实验方案、过程记录和对应的数据、处理与出图放在一起；数据文件可以挂到实验记录上' };
+const EXP_STATUS_ALIAS = { 待分析: '计划中', 已出图: '已完成', 已归档: '已完成' };
 const TAB_TO_CAT = { idea: 'other', literature: 'literature', experiment: 'data', data: 'data', draft: 'writing', submission: 'writing', meeting: 'meeting' };
 
 /* Zotero 会拒绝带浏览器 User-Agent 的请求（Obsidian 的请求就是这种），必须带放行标记 */
@@ -143,8 +238,7 @@ const TABS = [
   { id: 'projects', label: '项目', icon: 'folder-kanban' },
   { id: 'idea', label: '灵感', icon: 'lightbulb' },
   { id: 'literature', label: '文献', icon: 'book-open' },
-  { id: 'experiment', label: '实验', icon: 'flask-conical' },
-  { id: 'data', label: '数据', icon: 'bar-chart-3' },
+  { id: 'experiment', label: '实验与数据', icon: 'flask-conical' },
   { id: 'draft', label: '写作', icon: 'pen-line' },
   { id: 'submission', label: '投稿', icon: 'send' },
   { id: 'meeting', label: '会议', icon: 'users' },
@@ -461,23 +555,25 @@ const KIND_BODY = {
 };
 function projectTemplate(o) {
   const kind = KINDS[o.kind] ? o.kind : 'paper';
-  const stages = stagesOfKind(kind);
-  const body = KIND_BODY[kind];
+  const stages = Array.isArray(o.customStages) ? o.customStages.map((n, i) => stageDefFromName(n, i)) : stagesOfKind(kind);
+  const body = KIND_BODY[kind] || (stagesOfKind(kind).length ? KIND_BODY.paper : KIND_BODY.collection);
   return [
     '---',
     'type: project',
     'kind: ' + KINDS[kind].label,
-    'stage: ' + (stages.length ? o.stage || stages[0].id : ''),
+    'stage: ' + (stages.length ? (stages.some((x) => x.id === o.stage) ? o.stage : stages[0].id) : ''),
     'status: ' + (o.status || '进行中'),
     'priority: ' + (o.priority || '中'),
     'deadline: ' + (o.deadline || ''),
     'next: ' + q(o.next || ''),
     'description: ' + q(o.description || ''),
     'parent: ' + (o.parent ? q('[[' + o.parent + ']]') : ''),
+  ].concat(Array.isArray(o.customStages) ? ['stages: [' + o.customStages.map((x) => q(x)).join(', ') + ']'] : []).concat([
     'created: ' + today(),
     'tags: [科研项目]',
     '---',
     '# ' + o.name,
+  ]).concat([
     '',
     '> [!abstract] ' + KINDS[kind].label,
     '> ' + (o.description || '一句话说明这个项目要做什么。'),
@@ -487,12 +583,12 @@ function projectTemplate(o) {
     '- ' + today() + ' 创建项目',
     '',
     '## ✅ 待办',
-    '- [ ] ' + ({ paper: '明确研究问题与创新点', direction: '找 3 篇该方向的高质量综述', study: '收集论文、代码和数据', grant: '确认申报要求和截止日期', collection: '整理资料' }[kind]),
+    '- [ ] ' + ({ paper: '明确研究问题与创新点', review: '确定综述范围和检索关键词', method: '写清楚要解决的问题和基线方法', direction: '找 3 篇该方向的高质量综述', study: '收集论文、代码和数据', grant: '确认申报要求和截止日期', collection: '整理资料' }[kind] || (stages[0] ? '开始「' + stages[0].id + '」' : '整理资料')),
     '',
     '## 🔗 相关笔记',
     '本项目下的笔记和文件会自动汇总到「科研工作台」中。',
     '',
-  ]).join('\n');
+  ])).join('\n');
 }
 
 const NOTE_FM_DEFAULTS = {
@@ -548,11 +644,15 @@ description: "一句话描述"
 
 | kind | 用途 | stage 可选值（按顺序） |
 |---|---|---|
-| 论文 | 写一篇论文 | 灵感 → 文献综述 → 实验 → 数据分析 → 论文写作 → 投稿发表 |
+| 论文 | 写一篇论文 | 灵感 → 文献综述 → 实验与数据 → 论文写作 → 投稿发表 |
+| 综述论文 | 综述 / 调研类论文（没有实验） | 确定主题 → 检索筛选 → 精读归类 → 撰写综述 → 投稿发表 |
+| 方法论文 | 提出新方法 / 算法 | 问题与灵感 → 文献调研 → 方法设计 → 实验与数据 → 论文写作 → 投稿发表 |
 | 研究方向 | 长期方向 / 课题，可挂多个下属项目 | 入门调研 → 系统梳理 → 形成选题 → 持续跟踪 |
 | 研读他人工作 | 精读 / 复现某篇论文、某个团队的工作 | 收集资料 → 精读理解 → 复现验证 → 总结汇报 |
 | 基金 / 申报 | 基金、开题、中期等申报材料 | 选题论证 → 材料准备 → 撰写 → 修改定稿 → 提交答辩 |
 | 资料库 | 只存文件，没有流程 | （留空） |
+
+类型和流程可以在工作台里自定义（设置 → 项目类型与流程），以用户设置为准。单个项目可以用 \`stages: [阶段1, 阶段2, …]\` 属性设自己的流程，\`stages: [无]\` 表示没有流程。
 
 ## 笔记 frontmatter
 每条笔记必须有 \`type\`、\`project\`、\`status\`、\`date\`：
@@ -572,6 +672,11 @@ date: YYYY-MM-DD
 | draft | 论文草稿 | 大纲 / 初稿 / 修改中 / 定稿 | section, target |
 | submission | 投稿记录 | 准备中 / 已投稿 / 审稿中 / 返修 / 接收 / 拒稿 | journal, submitted, decision |
 | meeting | 会议纪要 | 待整理 / 已整理 | attendees |
+
+## 附件、分类、会议简介（可选属性）
+- \`attachments: ["[[路径/文件.pptx]]", ...]\`：这条笔记的附件（PPT、讲稿、理解笔记、录音、数据…），文献和实验记录最常用；也可以直接放进「<笔记所在文件夹>/附件/<笔记名>/」
+- \`collections: [ISAC, ISAC/波形设计]\`：文献的「我的分类」，可以有多个，用 / 表示子分类
+- 会议纪要：\`summary: "一句话简介"\`、\`time: "14:00"\`、\`audio: "[[录音]]"\`
 
 ## 文件（非笔记）
 项目里的 PDF、PPT、Excel、录音等文件按分类放在项目文件夹下，工作台「文件」页会自动列出：
@@ -902,7 +1007,7 @@ class WorkbenchView extends ItemView {
       ic(b, t.icon);
       h(b, 'span', { text: t.label });
       let c = null;
-      if (NOTE_TYPES[t.id]) c = counts[t.id] || 0;
+      if (NOTE_TYPES[t.id]) c = (counts[t.id] || 0) + (t.id === 'experiment' ? counts.data || 0 : 0);
       if (t.id === 'projects') c = this.index.projects.filter((p) => p.status !== '已完成').length;
       if (t.id === 'files') c = this.index.files.length;
       if (c) h(b, 'span', { cls: 'rw-tab-count', text: c });
@@ -925,6 +1030,7 @@ class WorkbenchView extends ItemView {
   }
 
   switchTab(id, filter) {
+    if (id === 'data') id = 'experiment';
     this.tab = id;
     if (filter) this.filters[id] = Object.assign({}, this.filters[id] || {}, filter);
     if (id !== 'detail') this.plugin.settings.lastTab = id;
@@ -978,7 +1084,7 @@ class WorkbenchView extends ItemView {
     try {
       if (this.tab === 'home') this.renderHome(el);
       else if (this.tab === 'projects') this.renderProjects(el);
-      else if (NOTE_TYPES[this.tab]) this.renderNotesTab(el, this.tab);
+      else if (NOTE_TYPES[this.tab]) this.renderNotesTab(el, this.tab === 'data' ? 'experiment' : this.tab);
       else if (this.tab === 'files') this.renderFiles(el);
       else if (this.tab === 'detail' && this.detailProject && this.index.byName.has(this.detailProject)) this.renderDetail(el, this.index.byName.get(this.detailProject));
       else if (this.tab === 'plan') this.renderPlan(el);
@@ -1141,9 +1247,7 @@ class WorkbenchView extends ItemView {
       for (const k of ks) {
         const list = shown.filter((p) => p.pkind === k);
         if (ks.length > 1 || kindsPresent.length <= 1) this.kindHeader(bp.body, k, list.length);
-        if (!stagesOfKind(k).length) this.renderCollection(bp.body, list);
-        else if (st.homeView === 'matrix') this.renderMatrix(bp.body, list, k);
-        else this.renderBoard(bp.body, list, k);
+        this.renderFlowGroups(bp.body, list, k, st.homeView === 'matrix');
       }
     }
 
@@ -1224,9 +1328,39 @@ class WorkbenchView extends ItemView {
     h(hd, 'span', { cls: 'rw-kind-name', text: d.label });
     h(hd, 'span', { cls: 'rw-tab-count', text: n });
     h(hd, 'span', { cls: 'rw-muted', text: d.stages.length ? d.stages.map((s) => s.id).join(' → ') : '无流程，只存放文件' });
+    const gear = h(hd, 'button', { cls: 'rw-iconbtn', title: '编辑「' + d.label + '」的流程 / 管理项目类型' });
+    ic(gear, 'settings-2');
+    gear.addEventListener('click', () => new KindsEditorModal(this.app, this.plugin, k).open());
     const add = h(hd, 'button', { cls: 'rw-iconbtn', title: '新建' + d.label + '项目' });
     ic(add, 'plus');
     add.addEventListener('click', () => this.plugin.newProjectModal({ kind: k }));
+  }
+
+  /* 同一类型里：用类型流程的项目一块；单独设了流程的项目按各自的流程分块 */
+  renderFlowGroups(parent, list, k, matrix) {
+    const groups = [];
+    const def = list.filter((p) => !Array.isArray(p.customStages));
+    groups.push({ stages: stagesOfKind(k), list: def, custom: false });
+    for (const p of list.filter((x) => Array.isArray(x.customStages))) {
+      const sig = p.customStages.join('→');
+      let g = groups.find((x) => x.custom && x.sig === sig);
+      if (!g) { g = { stages: stagesOf(p), list: [], custom: true, sig }; groups.push(g); }
+      g.list.push(p);
+    }
+    const noFlow = [];
+    for (const g of groups) {
+      if (!g.list.length && (g.custom || groups.length > 1)) continue;
+      if (!g.stages.length) { noFlow.push(...g.list); continue; }
+      if (g.custom) {
+        const hd = h(parent, 'div', { cls: 'rw-flow-head' });
+        ic(hd, 'route');
+        h(hd, 'span', { text: '自定义流程 · ' + g.list.map((p) => p.title).join('、') });
+        h(hd, 'span', { cls: 'rw-muted', text: g.stages.map((x) => x.id).join(' → ') });
+      }
+      if (matrix) this.renderMatrix(parent, g.list, k, g.stages);
+      else this.renderBoard(parent, g.list, k, g.stages);
+    }
+    if (noFlow.length || (!stagesOfKind(k).length && !list.length)) this.renderCollection(parent, noFlow);
   }
 
   /* 没有流程的项目（资料库）：只排成卡片 */
@@ -1236,9 +1370,9 @@ class WorkbenchView extends ItemView {
   }
 
   /* 看板：列 = 阶段，卡片 = 项目 */
-  renderBoard(parent, projects, kind) {
+  renderBoard(parent, projects, kind, stagesList) {
     const board = h(parent, 'div', { cls: 'rw-board' });
-    for (const stage of stagesOfKind(kind || 'paper')) {
+    for (const stage of stagesList || stagesOfKind(kind || 'paper')) {
       const col = h(board, 'div', { cls: 'rw-col' });
       col.style.setProperty('--sc', stage.color);
       const hd = h(col, 'div', { cls: 'rw-col-head' });
@@ -1253,7 +1387,7 @@ class WorkbenchView extends ItemView {
       this.makeDropZone(col, async (path) => {
         const p = this.index.projects.find((x) => x.file.path === path);
         if (!p || p.stage === stage.id) return;
-        if (!stagesOf(p).some((x) => x.id === stage.id)) { new Notice('「' + p.title + '」是' + KINDS[p.pkind].label + '项目，流程不同；可右键 →「类型 →」修改项目类型'); return; }
+        if (!stagesOf(p).some((x) => x.id === stage.id)) { new Notice('「' + p.title + '」的流程里没有「' + stage.id + '」这一步；可右键 →「编辑这个项目的流程」或「类型 →」修改'); return; }
         await this.plugin.setProjectStage(p, stage.id);
       });
     }
@@ -1330,10 +1464,10 @@ class WorkbenchView extends ItemView {
     }
 
     const meta = h(card, 'div', { cls: 'rw-card-meta' });
-    for (const k of ['literature', 'experiment', 'data', 'meeting']) {
-      const c = p.counts[k] || 0;
+    for (const k of ['literature', 'experiment', 'meeting']) {
+      const c = (p.counts[k] || 0) + (k === 'experiment' ? p.counts.data || 0 : 0);
       if (!c && !large) continue;
-      const m = h(meta, 'span', { cls: 'rw-meta', title: NOTE_TYPES[k].label });
+      const m = h(meta, 'span', { cls: 'rw-meta', title: k === 'experiment' ? '实验与数据' : NOTE_TYPES[k].label });
       ic(m, NOTE_TYPES[k].icon);
       h(m, 'span', { text: c });
       m.addEventListener('click', (e) => { e.stopPropagation(); this.switchTab(k, { project: p.name }); });
@@ -1381,8 +1515,8 @@ class WorkbenchView extends ItemView {
   }
 
   /* 矩阵：行 = 项目，列 = 阶段 */
-  renderMatrix(parent, projects, kind) {
-    const stages = stagesOfKind(kind || 'paper');
+  renderMatrix(parent, projects, kind, stagesList) {
+    const stages = stagesList || stagesOfKind(kind || 'paper');
     const wrap = h(parent, 'div', { cls: 'rw-matrix-wrap' });
     const t = h(wrap, 'table', { cls: 'rw-matrix' });
     const tr = h(h(t, 'thead'), 'tr');
@@ -1406,7 +1540,7 @@ class WorkbenchView extends ItemView {
       nameTd.addEventListener('contextmenu', (e) => this.projectMenu(e, p));
       const cur = stageIdxOf(p);
       stages.forEach((s, i) => {
-        const cnt = p.counts[s.noteType] || 0;
+        const cnt = s.noteType === 'experiment' ? (p.counts.experiment || 0) + (p.counts.data || 0) : p.counts[s.noteType] || 0;
         const td = h(row, 'td', { cls: 'rw-m-cell' + (i < cur ? ' is-done' : '') + (i === cur ? ' is-current' : '') });
         td.style.setProperty('--sc', s.color);
         const inner = h(td, 'div', { cls: 'rw-m-inner' });
@@ -1414,7 +1548,7 @@ class WorkbenchView extends ItemView {
         if (i === cur) h(inner, 'span', { cls: 'rw-m-now', text: '进行中' });
         if (cnt) h(inner, 'span', { cls: 'rw-m-count', text: cnt + ' 篇' });
         td.title = p.title + ' · ' + s.id + '：' + cnt + ' 条笔记（点击查看）';
-        td.addEventListener('click', () => this.switchTab(s.noteType, { project: p.name }));
+        td.addEventListener('click', () => { if (s.noteType) this.switchTab(s.noteType === 'data' ? 'experiment' : s.noteType, { project: p.name }); else this.openProject(p.name); });
       });
       h(row, 'td', { cls: 'rw-m-next', text: p.next || '—' });
     }
@@ -1434,6 +1568,7 @@ class WorkbenchView extends ItemView {
     for (const s of stagesOf(p)) {
       m.addItem((i) => i.setTitle('阶段 → ' + s.id).setIcon(s.icon).setChecked(p.stage === s.id).onClick(async () => { await this.plugin.setProjectStage(p, s.id); this.render(); }));
     }
+    m.addItem((i) => i.setTitle('编辑这个项目的流程…').setIcon('route').onClick(() => new ProjectFlowModal(this.app, this.plugin, p).open()));
     m.addSeparator();
     for (const k of KIND_ORDER) {
       m.addItem((i) => i.setTitle('类型 → ' + KINDS[k].label).setIcon(KINDS[k].icon).setChecked(p.pkind === k).onClick(async () => { await this.plugin.setProjectKind(p, k); this.render(); }));
@@ -1470,6 +1605,8 @@ class WorkbenchView extends ItemView {
       m.addItem((i) => i.setTitle('从 PDF 识别标题').setIcon('scan-text').onClick(async () => { await this.plugin.fillLitMeta(null, n.file); this.render(); }));
       if (n.explain) m.addItem((i) => i.setTitle('打开讲解稿').setIcon('file-text').onClick(() => this.plugin.openFile(n.explain)));
       m.addItem((i) => i.setTitle('用 Obsidian 自带的 PDF 阅读器打开').setIcon('external-link').onClick(() => this.plugin.openFile(n.file)));
+      m.addItem((i) => i.setTitle('加入 / 移出分类…').setIcon('folder-tree').onClick(() => { const m2 = new Menu(); this.plugin.collMenu(m2, [n], () => this.render()); m2.showAtPosition({ x: e.clientX, y: e.clientY }); }));
+      m.addItem((i) => i.setTitle('添加附件（会先建文献笔记）…').setIcon('paperclip').onClick(async () => { const nf = await this.plugin.createLitNoteForPdf(n.file); if (nf) setTimeout(() => new AttachModal(this.app, this.plugin, nf, () => this.render()).open(), 300); }));
       m.addSeparator();
       this.plugin.ftMenuItems(m, n.file);
       m.showAtMouseEvent(e);
@@ -1480,6 +1617,7 @@ class WorkbenchView extends ItemView {
     m.addItem((i) => i.setTitle('打开').setIcon('file-text').onClick(() => this.plugin.openFile(n.file)));
     if (n.type === 'literature') { const c = this.plugin.paperOf(n.file); if (c && c.pdf) { m.addItem((i) => i.setTitle('从 PDF 识别标题 / 作者 / 年份').setIcon('scan-text').onClick(async () => { await this.plugin.fillLitMeta(n.file, c.pdf, { force: !!str(n.fm.title) && looksLikeFileName(str(n.fm.title)) }); this.render(); })); m.addSeparator(); this.plugin.ftMenuItems(m, c.pdf); m.addSeparator(); } }
     m.addItem((i) => i.setTitle('预览').setIcon('eye').onClick(() => this.plugin.previewNotes([n], n)));
+    m.addItem((i) => i.setTitle('附件（' + this.plugin.attachmentsOf(n).length + '）…').setIcon('paperclip').onClick(() => new AttachModal(this.app, this.plugin, n.file, () => this.render()).open()));
     if (n.type === 'idea') {
       m.addItem((i) => i.setTitle('转为科研项目').setIcon('rocket').onClick(() => this.plugin.ideaToProject(n)));
     }
@@ -1488,6 +1626,7 @@ class WorkbenchView extends ItemView {
     const PLBL = { vault: '打开 PDF（工作台库内）', zotero: '在 Zotero 中打开 PDF', path: '打开 PDF（电脑上的文件）', url: '打开在线 PDF' };
     for (const x of this.plugin.pdfsOf(n)) m.addItem((i) => i.setTitle(PLBL[x.kind]).setIcon('file-text').onClick(() => this.plugin.openPdf(x)));
     if (n.type === 'literature') {
+      m.addItem((i) => i.setTitle('加入 / 移出分类…').setIcon('folder-tree').onClick(() => { const m2 = new Menu(); this.plugin.collMenu(m2, [n], () => this.render()); m2.showAtPosition({ x: e.clientX, y: e.clientY }); }));
       m.addItem((i) => i.setTitle(pdf ? '更换关联的 PDF…' : '关联 PDF…').setIcon('link').onClick(() => this.plugin.pickPdfFor(n)));
       if (pdf && pdf.kind === 'vault' && this.plugin.pdfsOf(n).some((x) => x.kind === 'zotero')) { /* 两种都有 */ }
       if (pdf && n.fm.pdf) m.addItem((i) => i.setTitle('取消关联 PDF').setIcon('unlink').onClick(() => this.plugin.setField(n.file, 'pdf', '')));
@@ -1542,7 +1681,8 @@ class WorkbenchView extends ItemView {
 
   /* ---------- 笔记类标签页（灵感/文献/实验/数据/写作/投稿/会议） ---------- */
   renderNotesTab(el, type) {
-    const def = NOTE_TYPES[type];
+    const def = type === 'experiment' ? EXP_TAB_DEF : NOTE_TYPES[type];
+    const ofType = (n) => n.type === type || (type === 'experiment' && n.type === 'data');
     const f = (this.filters[type] = this.filters[type] || {});
     const st = this.plugin.settings;
     const view = st.noteViews[type] || (type === 'meeting' ? 'list' : 'board');
@@ -1571,16 +1711,19 @@ class WorkbenchView extends ItemView {
       if (mode === 'notes') { this.renderLitNotes(el, f); return; }
       this.renderOrphanPdfs(el, f);
     }
-    const inferredList = this.index.notes.filter((n) => n.type === type && n.inferred);
+    const inferredList = this.index.notes.filter((n) => ofType(n) && n.inferred);
     if (inferredList.length) this.btn(right, '补全属性（' + inferredList.length + '）', 'wand', () => this.plugin.fillProps(inferredList), 'rw-btn-warn');
-    this.btn(right, '新建' + def.label, 'plus', () => this.plugin.newNoteModal({ type, project: curProject }), 'mod-cta');
+    if (type === 'experiment') {
+      this.btn(right, '新建数据分析', 'bar-chart-3', () => this.plugin.newNoteModal({ type: 'data', project: curProject }));
+      this.btn(right, '新建实验记录', 'plus', () => this.plugin.newNoteModal({ type, project: curProject }), 'mod-cta');
+    } else this.btn(right, (type === 'meeting' ? '新建会议纪要' : '新建' + def.label), 'plus', () => (type === 'meeting' ? this.plugin.newMeetingModal({ project: curProject }) : this.plugin.newNoteModal({ type, project: curProject })), 'mod-cta');
 
     // 当前处于本阶段的项目
     {
       // 当前阶段正需要这类笔记的项目（各类型项目的阶段都会映射到某类笔记）
-      const inStage = this.index.projects.filter((p) => p.status !== '已完成' && stageDefOf(p) && stageDefOf(p).noteType === type);
+      const inStage = this.index.projects.filter((p) => p.status !== '已完成' && stageDefOf(p) && (stageDefOf(p).noteType === type || (type === 'experiment' && stageDefOf(p).noteType === 'data')));
       const strip = h(el, 'div', { cls: 'rw-strip' });
-      const sc = def.stage ? STAGES[stageIndex(def.stage)] : { color: '#8b5cf6', icon: def.icon };
+      const sc = (def.stage && STAGES[stageIndex(def.stage)]) || { color: '#8b5cf6', icon: def.icon };
       strip.style.setProperty('--sc', sc.color);
       const lab = h(strip, 'span', { cls: 'rw-strip-label' });
       ic(lab, def.icon);
@@ -1620,8 +1763,9 @@ class WorkbenchView extends ItemView {
     const content = h(el, 'div', { cls: 'rw-notes-content' });
     const drawContent = () => {
       clear(content);
-      let list = this.index.notes.filter((n) => n.type === type);
+      let list = this.index.notes.filter(ofType);
       if (type === 'literature' && f.cat && f.cat !== 'all') list = list.filter((n) => this.litTags(n).has(f.cat));
+      if (type === 'literature' && f.coll) list = list.filter((n) => (f.coll === '__none' ? !this.plugin.collOf(n).length : this.plugin.inColl(n, f.coll)));
       if (f.project === '__none') list = list.filter((n) => !n.projectName);
       else if (f.project) list = list.filter((n) => n.projectName === f.project);
       if (f.text) { const s = f.text.toLowerCase(); list = list.filter((n) => n.title.toLowerCase().includes(s) || n.file.path.toLowerCase().includes(s)); }
@@ -1645,9 +1789,10 @@ class WorkbenchView extends ItemView {
 
   renderNoteBoard(parent, list, def) {
     const statuses = def.statuses.slice();
-    const other = list.filter((n) => !statuses.includes(n.status));
+    const colOf = (n) => (def === EXP_TAB_DEF && EXP_STATUS_ALIAS[n.status]) || n.status;
+    const other = list.filter((n) => !statuses.includes(colOf(n)));
     const board = h(parent, 'div', { cls: 'rw-board rw-nboard' });
-    const cols = statuses.map((s) => [s, list.filter((n) => n.status === s)]);
+    const cols = statuses.map((s) => [s, list.filter((n) => colOf(n) === s)]);
     if (other.length) cols.unshift(['未设置状态', other]);
     for (const [s, items] of cols) {
       const col = h(board, 'div', { cls: 'rw-col' });
@@ -1680,7 +1825,7 @@ class WorkbenchView extends ItemView {
     let extra = '';
     if (n.type === 'literature') extra = [str(fm.authors), str(fm.year), str(fm.journal)].filter(Boolean).join(' · ');
     else if (n.type === 'submission') extra = [str(fm.journal), str(fm.decision)].filter(Boolean).join(' · ');
-    else if (n.type === 'meeting') extra = str(fm.attendees);
+    else if (n.type === 'meeting') extra = [str(fm.summary), str(fm.attendees)].filter(Boolean).join(' · ');
     else if (n.type === 'experiment') extra = str(fm.conditions);
     else if (n.type === 'draft') extra = [str(fm.section), str(fm.target)].filter(Boolean).join(' · ');
     if (extra) h(card, 'div', { cls: 'rw-card-desc', text: extra });
@@ -1730,8 +1875,14 @@ class WorkbenchView extends ItemView {
     if (fm.audio) acts.push(['录音', 'mic', fm.audio]);
     if (fm.file) acts.push(['文件', 'paperclip', fm.file]);
     if (fm.slides) acts.push(['PPT', 'presentation', fm.slides]);
-    if (!acts.length) return;
+    const atts = this.plugin.attachmentsOf(n);
+    if (!acts.length && !atts.length) return;
     const row = h(parent, 'div', { cls: 'rw-attach' });
+    if (atts.length) {
+      const b = h(row, 'button', { cls: 'rw-attach-btn', title: atts.map((a) => a.file.name).join('\n') });
+      ic(b, 'paperclip'); h(b, 'span', { text: '附件 ' + atts.length });
+      b.addEventListener('click', (e) => { e.stopPropagation(); const m = new Menu(); this.plugin.attachMenu(m, n, () => this.render()); m.showAtMouseEvent(e); });
+    }
     for (const [label, iconName, val] of acts) {
       const b = h(row, 'button', { cls: 'rw-attach-btn', title: '打开' + label });
       ic(b, iconName);
@@ -1751,6 +1902,15 @@ class WorkbenchView extends ItemView {
       const t1 = h(r, 'td', { cls: 'rw-t-title', text: n.title });
       this.pdfChip(t1, n);
       if (n.inferred) this.inferredBadge(t1, n);
+      {
+        const sum = str(n.fm.summary || n.fm.description);
+        const na = this.plugin.attachmentsOf(n).length;
+        if (sum || na) {
+          const sub = h(t1, 'div', { cls: 'rw-t-sub' });
+          if (na) { const a = h(sub, 'span', { cls: 'rw-att-chip', title: '附件 / 材料' }); ic(a, 'paperclip'); h(a, 'span', { text: String(na) }); a.addEventListener('click', (e) => { e.stopPropagation(); const m = new Menu(); this.plugin.attachMenu(m, n, () => this.render()); m.showAtMouseEvent(e); }); }
+          if (sum) h(sub, 'span', { text: trunc(sum, 90) });
+        }
+      }
       t1.addEventListener('click', () => this.openNoteTitle(n));
       const t2 = h(r, 'td');
       if (n.projectName) this.projectChip(t2, n.projectName);
@@ -2096,6 +2256,7 @@ class WorkbenchView extends ItemView {
     if (f.text) { const s = f.text.toLowerCase(); list = list.filter((n) => (n.title + ' ' + str(n.fm.authors) + ' ' + str(n.fm.journal) + ' ' + str(n.fm.title_zh)).toLowerCase().includes(s)); }
     this._litAll = list;
     if (f.cat && f.cat !== 'all') list = list.filter((n) => this.litTags(n).has(f.cat));
+    if (f.coll) list = list.filter((n) => (f.coll === '__none' ? !this.plugin.collOf(n).length : this.plugin.inColl(n, f.coll)));
     return list;
   }
   /* 文献分类：有没有笔记 / PDF / 转换后的 Markdown、译文、HTML / 讲解稿 */
@@ -2129,12 +2290,52 @@ class WorkbenchView extends ItemView {
       h(c, 'span', { cls: 'rw-litcats-n', text: String(n) });
       c.addEventListener('click', () => { f.cat = k; this.render(); });
     }
+    this.litCollChips(el, f);
+  }
+  /* 「我的分类」一排：点了筛选；右键改名 / 删除 / 建子分类；把文献卡片拖到分类上就加入 */
+  litCollChips(el, f) {
+    const pl = this.plugin;
+    const all = this._litAll || [];
+    const cs = pl.litCollections();
+    const row = h(el, 'div', { cls: 'rw-litcats rw-mycolls' });
+    ic(h(row, 'span', { cls: 'rw-litcats-ic', title: '我的分类：自己建的分类，一篇文献可以在多个分类里' }), 'folder-tree');
+    const chip = (key, label, n, depth, title) => {
+      const c = h(row, 'button', { cls: 'rw-catchip rw-collchip' + ((f.coll || '') === key ? ' is-active' : '') + (depth ? ' is-sub' : ''), title: title || '' });
+      if (depth) h(c, 'span', { cls: 'rw-coll-sub', text: '↳' });
+      h(c, 'span', { text: label });
+      if (n != null) h(c, 'span', { cls: 'rw-litcats-n', text: String(n) });
+      c.addEventListener('click', () => { f.coll = key; this.render(); });
+      return c;
+    };
+    chip('', '全部', all.length, 0);
+    const act = f.coll && f.coll !== '__none' ? f.coll : '';
+    for (const c of cs) {
+      const depth = c.split('/').length - 1;
+      // 子分类：只在它的上一级（或它自己 / 兄弟）被选中时显示
+      if (depth && !(act && (act === c.split('/').slice(0, -1).join('/') || act.startsWith(c.split('/').slice(0, -1).join('/') + '/')))) continue;
+      const n = all.filter((x) => pl.inColl(x, c)).length;
+      const el2 = chip(c, c.split('/').pop(), n, depth, c + '（右键：改名 / 删除 / 建子分类；把文献拖到这里加入）');
+      el2.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        const m = new Menu();
+        m.addItem((i) => i.setTitle('新建子分类…').setIcon('folder-plus').onClick(() => pl.promptText('「' + c + '」下的子分类名称', '', async (v) => { const nc = await pl.addCollection(c + '/' + v); if (nc) { f.coll = nc; this.render(); } })));
+        m.addItem((i) => i.setTitle('重命名…').setIcon('pencil').onClick(() => pl.promptText('分类名称（可以写成「父/子」来移动）', c, async (v) => { await pl.renameCollection(c, v); if (f.coll === c) f.coll = ''; })));
+        m.addItem((i) => i.setTitle('删除分类').setIcon('trash-2').onClick(async () => { const ok = await pl.confirmDelete({ title: '删除分类', lines: ['删除分类「' + c + '」' + (cs.some((x) => x.startsWith(c + '/')) ? '和它的子分类' : '') + '？', '只是把文献移出这个分类，文献和 PDF 都不会删。'], noTrashNote: true, confirmText: '删除分类' }); if (ok) { if ((f.coll || '').startsWith(c)) f.coll = ''; await pl.deleteCollection(c); } }));
+        m.showAtMouseEvent(e);
+      });
+      this.makeDropZone(el2, async (path) => { const x = all.find((y) => y.file.path === path); if (x) await pl.setColl([x], c, true); });
+    }
+    if (cs.length) chip('__none', '未分类', all.filter((x) => !pl.collOf(x).length).length, 0);
+    const add = h(row, 'button', { cls: 'rw-catchip rw-collchip-add', title: '新建一个分类' });
+    ic(add, 'plus'); h(add, 'span', { text: cs.length ? '' : '新建分类' });
+    add.addEventListener('click', () => pl.promptText('新分类名称（用「父分类/子分类」可以建子分类）', act ? act + '/' : '', async (v) => { const c = await pl.addCollection(v); if (c) { f.coll = c; this.render(); } }));
   }
   /* 文献资料库：还没有文献笔记的 PDF（项目里的「原文PDF」等） */
   renderOrphanPdfs(el, f) {
     const pl = this.plugin;
     let list = pl.orphanPdfEntries(this.index);
     if (f.cat && f.cat !== 'all') list = list.filter((n) => this.litTags(n).has(f.cat));
+    if (f.coll) list = list.filter((n) => (f.coll === '__none' ? !pl.collOf(n).length : pl.inColl(n, f.coll)));
     if (f.project === '__none') list = list.filter((n) => !n.projectName);
     else if (f.project) list = list.filter((n) => n.projectName === f.project);
     if (!list.length) return;
@@ -2175,6 +2376,28 @@ class WorkbenchView extends ItemView {
     if (meta) h(td, 'div', { cls: 'rw-pgt-meta', text: meta });
     const row = h(td, 'div', { cls: 'rw-pgt-chips' });
     if (n.projectName) this.projectChip(row, n.projectName);
+    if (!n.pdfOnly) {
+      const atts = this.plugin.attachmentsOf(n);
+      this._attOpen = this._attOpen || new Set();
+      const open = this._attOpen.has(n.file.path);
+      const ac = h(row, 'span', { cls: 'rw-att-chip' + (atts.length ? '' : ' is-empty') + (open ? ' is-open' : ''), title: atts.length ? '附件：' + atts.map((a) => a.file.name).join('、') + '（点击展开）' : '添加附件：PPT、讲稿、笔记、录音…' });
+      ic(ac, 'paperclip'); h(ac, 'span', { text: atts.length ? String(atts.length) : '附件' });
+      ac.addEventListener('click', (e) => { e.stopPropagation(); if (!atts.length) { new AttachModal(this.app, this.plugin, n.file, () => this.render()).open(); return; } if (open) this._attOpen.delete(n.file.path); else this._attOpen.add(n.file.path); this.render(); });
+      if (open && atts.length) {
+        {
+          const box = h(td, 'div', { cls: 'rw-att-inline' });
+          for (const a of atts) {
+            const r2 = h(box, 'div', { cls: 'rw-att-irow', title: a.file.path });
+            ic(r2, FILE_CATS[EXT_CAT[(a.file.extension || '').toLowerCase()] || 'other'].icon);
+            h(r2, 'span', { text: a.file.name });
+            r2.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.openFile(a.file); });
+          }
+          const mg = h(box, 'div', { cls: 'rw-att-irow is-manage' }); ic(mg, 'settings-2'); h(mg, 'span', { text: '管理附件…' });
+          mg.addEventListener('click', (e) => { e.stopPropagation(); new AttachModal(this.app, this.plugin, n.file, () => this.render()).open(); });
+        }
+      }
+    }
+    for (const c of this.plugin.collOf(n)) { const cc = h(row, 'span', { cls: 'rw-collmini', text: c.split('/').pop(), title: '分类：' + c + '（点击只看这个分类）' }); cc.addEventListener('click', (e) => { e.stopPropagation(); const ff = (this.filters.literature = this.filters.literature || {}); ff.coll = c; this.render(); }); }
     if (n.pdfOnly) {
       const nb = h(row, 'span', { cls: 'rw-status rw-nonote is-clickable', text: '还没有笔记 · 建一个', title: '这个 PDF 还没有文献笔记，点一下就建（属性、摘录、AI 分析结果都会挂到笔记上）' });
       nb.addEventListener('click', async (e) => { e.stopPropagation(); await this.plugin.createLitNoteForPdf(n.file); this.render(); });
@@ -2245,6 +2468,15 @@ class WorkbenchView extends ItemView {
       m.addItem((i) => i.setTitle('选中的 ' + target.length + ' 篇：一键全文翻译（机器翻译）').setIcon('languages').onClick(() => run((pdf) => pl.ftTranslate(pdf, 'machine'))));
       m.showAtMouseEvent(e);
     }, 'rw-btn-sm').title = '勾选文献后：批量转 Markdown / 全文翻译';
+    {
+      const cb = this.btn(bar, selN.length ? '分类（' + selN.length + '）' : '分类', 'folder-tree', (e) => {
+        if (!selN.length) return new Notice('先勾选要分类的文献；也可以把文献拖到上面的分类按钮上');
+        const m = new Menu();
+        pl.collMenu(m, selN, () => this.render());
+        m.showAtMouseEvent(e);
+      }, 'rw-btn-sm');
+      cb.title = '把勾选的文献加入 / 移出「我的分类」';
+    }
     if (selN.length) {
       const db = this.btn(bar, '删除（' + selN.length + '）', 'trash-2', async () => {
         const done = await pl.deleteLiterature(selN);
@@ -2457,8 +2689,12 @@ class WorkbenchView extends ItemView {
     kc.addEventListener('click', (e) => {
       const m = new Menu();
       for (const k of KIND_ORDER) m.addItem((i) => i.setTitle(KINDS[k].label).setIcon(KINDS[k].icon).setChecked(p.pkind === k).onClick(async () => { await this.plugin.setProjectKind(p, k); this.render(); }));
+      m.addSeparator();
+      m.addItem((i) => i.setTitle('管理项目类型和流程…').setIcon('settings-2').onClick(() => new KindsEditorModal(this.app, this.plugin, p.pkind).open()));
       m.showAtMouseEvent(e);
     });
+    const fb = h(chips, 'span', { cls: 'rw-kind-chip is-clickable rw-flow-chip', text: Array.isArray(p.customStages) ? (p.customStages.length ? '自定义流程' : '无流程') : '编辑流程', title: '只改这个项目的流程（阶段）' });
+    fb.addEventListener('click', () => new ProjectFlowModal(this.app, this.plugin, p).open());
     h(chips, 'span', { cls: 'rw-status st-' + p.status, text: p.status });
     if (p.priority) h(chips, 'span', { cls: 'rw-prio prio-' + p.priority, text: '优先级 ' + p.priority });
     if (p.parentName) {
@@ -2594,12 +2830,12 @@ class WorkbenchView extends ItemView {
     h(r, 'span', { cls: 'rw-task-text', text: t.text });
     if (t.due) h(r, 'span', { cls: 'rw-deadline ' + deadlineCls(t.due), text: t.due.slice(5) + (t.time ? ' ' + t.time : '') + ' · ' + deadlineText(t.due) });
     h(r, 'span', { cls: 'rw-task-src', text: t.file.basename });
-    r.addEventListener('click', () => this.plugin.openFile(t.file, t.line));
+    r.addEventListener('click', () => new TaskModal(this.app, this.plugin, t, () => this.render()).open());
   }
 
   /* ---------- 计划页 ---------- */
   renderPlan(el) {
-    const right = this.header(el, '计划与待办', '汇总所有项目和科研笔记中的 - [ ] 待办；勾选会直接修改原笔记。待办写「📅 日期 ⏰ 时间」就会出现在日历上', 'calendar-check');
+    const right = this.header(el, '计划与待办', '汇总所有项目和科研笔记中的 - [ ] 待办；点一条待办就在窗口里修改（内容、日期、时间、备注、完成），会自动写回原笔记。待办写「📅 日期 ⏰ 时间」就会出现在日历上', 'calendar-check');
     const clock = h(right, 'div', { cls: 'rw-clock' });
     const tickClock = () => { const n = new Date(); clock.textContent = pad(n.getHours()) + ':' + pad(n.getMinutes()) + ' · ' + (n.getMonth() + 1) + '月' + n.getDate() + '日 星期' + '日一二三四五六'[n.getDay()]; };
     tickClock();
@@ -3001,7 +3237,7 @@ class WorkbenchView extends ItemView {
   }
 
   openEvent(ev) {
-    if (ev.task) return this.plugin.openFile(ev.file, ev.task.line);
+    if (ev.task) return new TaskModal(this.app, this.plugin, ev.task, () => this.render()).open();
     if (ev.kind === 'deadline' && ev.isProject) return this.openProject(ev.projectKey);
     if (ev.file) return this.plugin.openFile(ev.file);
   }
@@ -3433,6 +3669,427 @@ class WorkbenchView extends ItemView {
 
 /* ───────────────────────── 弹窗 ───────────────────────── */
 
+/* 待办窗口：在计划页 / 日历里点待办，直接在这里改内容、日期、时间、备注、完成，不用跳到原笔记 */
+class TaskModal extends Modal {
+  constructor(app, plugin, t, onDone) { super(app); this.plugin = plugin; this.t = t; this.onDone = onDone; }
+  async onOpen() {
+    this.modalEl.classList.add('rw-task-modal');
+    this.titleEl.setText(this.t.done ? '待办（已完成）' : '待办');
+    this.contentEl.classList.add('rw-modal');
+    const data = await this.app.vault.read(this.t.file);
+    const lines = data.split('\n');
+    let ln = this.t.line;
+    if (lines[ln] !== this.t.raw) { const j = lines.indexOf(this.t.raw); if (j >= 0) ln = j; }
+    const raw = lines[ln] || '';
+    const m = raw.match(/^(\s*)([-*+])\s*\[(.)\]\s*(.*)$/);
+    if (!m) { h(this.contentEl, 'div', { cls: 'rw-empty', text: '原笔记里找不到这条待办了（可能已经被改过）。' }); return; }
+    this.ln = ln; this.indent = m[1]; this.bullet = m[2];
+    const body = m[4];
+    const dm = body.match(/(?:📅|due:)\s*(\d{4}-\d{2}-\d{2})/);
+    const tm = body.match(/⏰\s*(\d{1,2}):(\d{2})/) || body.match(/(?:📅|due:)\s*\d{4}-\d{2}-\d{2}\s+(\d{1,2}):(\d{2})/);
+    const doneAt = body.match(/✅\s*(\d{4}-\d{2}-\d{2})/);
+    this.v = {
+      text: body.replace(/(?:📅|due:)\s*\d{4}-\d{2}-\d{2}(\s+\d{1,2}:\d{2})?/, '').replace(/⏰\s*\d{1,2}:\d{2}/, '').replace(/✅\s*\d{4}-\d{2}-\d{2}/, '').replace(/\s+/g, ' ').trim(),
+      date: dm ? dm[1] : '', time: tm ? pad(Number(tm[1])) + ':' + tm[2] : '', done: m[3] !== ' ', doneAt: doneAt ? doneAt[1] : '',
+    };
+    // 下面缩进更深的行 = 这条待办的备注
+    const notes = [];
+    let k = ln + 1;
+    while (k < lines.length && lines[k].trim() && (lines[k].match(/^\s*/)[0].length > this.indent.length) && !/^\s*[-*+]\s*\[.\]/.test(lines[k])) { notes.push(lines[k]); k++; }
+    this.noteEnd = k;
+    this.notePrefix = notes.length ? notes[0].match(/^\s*(?:[-*+]\s+)?/)[0] : this.indent + '    - ';
+    this.v.notes = notes.map((l) => l.replace(/^\s*(?:[-*+]\s+)?/, '')).join('\n');
+    this.draw();
+  }
+  draw() {
+    const c = this.contentEl; clear(c);
+    const v = this.v;
+    const top = h(c, 'div', { cls: 'rw-task-top' });
+    const cb = h(top, 'input', { attr: { type: 'checkbox', title: '完成' } }); cb.checked = v.done;
+    cb.addEventListener('change', () => { v.done = cb.checked; ta.classList.toggle('is-done', v.done); });
+    const ta = h(top, 'textarea', { cls: 'rw-task-text-in' + (v.done ? ' is-done' : ''), attr: { rows: '2', placeholder: '要做什么' } });
+    ta.value = v.text;
+    ta.addEventListener('input', () => { v.text = ta.value.replace(/\n/g, ' '); });
+    setTimeout(() => ta.focus(), 30);
+    const dt = new Setting(c).setName('日期 / 时间').setDesc('填了日期就会出现在日历上');
+    dt.addText((t) => { t.inputEl.type = 'date'; t.setValue(v.date).onChange((x) => (v.date = x)); });
+    dt.addText((t) => { t.inputEl.type = 'time'; t.setValue(v.time).onChange((x) => (v.time = x)); });
+    dt.addExtraButton && dt.addExtraButton((b) => b.setIcon('x').setTooltip('清除日期和时间').onClick(() => { v.date = ''; v.time = ''; this.draw(); }));
+    h(c, 'div', { cls: 'rw-field-label', text: '备注' });
+    const nt = h(c, 'textarea', { cls: 'rw-task-notes', attr: { rows: '4', placeholder: '补充说明、链接、进度…（每行一条，会写在待办下面）' } });
+    nt.value = v.notes;
+    nt.addEventListener('input', () => { v.notes = nt.value; });
+    const src = h(c, 'div', { cls: 'rw-task-src-line' });
+    ic(src, 'file-text');
+    h(src, 'span', { cls: 'rw-muted', text: '来自：' });
+    const sl = h(src, 'a', { text: this.t.file.basename, attr: { href: '#' } });
+    sl.addEventListener('click', (e) => { e.preventDefault(); this.close(); this.plugin.openFile(this.t.file, this.ln); });
+    if (this.t.projectName) { h(src, 'span', { cls: 'rw-muted', text: ' · 项目 ' + this.t.projectName }); }
+    const bar = h(c, 'div', { cls: 'rw-kind-ed-bar' });
+    const del = h(bar, 'button', { cls: 'rw-btn rw-btn-danger' }); ic(del, 'trash-2'); h(del, 'span', { text: '删除待办' });
+    del.addEventListener('click', () => this.remove());
+    h(bar, 'span', { cls: 'rw-spacer' });
+    const cancel = h(bar, 'button', { cls: 'rw-btn', text: '取消' }); cancel.addEventListener('click', () => this.close());
+    const ok = h(bar, 'button', { cls: 'rw-btn mod-cta', text: '保存' }); ok.addEventListener('click', () => this.save());
+    c.addEventListener('keydown', (e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); this.save(); } });
+  }
+  buildLines() {
+    const v = this.v;
+    const text = String(v.text || '').replace(/\s+/g, ' ').trim();
+    let line = this.indent + this.bullet + ' [' + (v.done ? 'x' : ' ') + '] ' + text + (v.date ? ' 📅 ' + v.date : '') + (v.time ? ' ⏰ ' + v.time : '');
+    if (v.done) line += ' ✅ ' + (v.doneAt || today());
+    const notes = String(v.notes || '').split('\n').map((x) => x.trim()).filter(Boolean).map((x) => this.notePrefix + x);
+    return [line].concat(notes);
+  }
+  async edit(fn) {
+    let ok = false;
+    await this.app.vault.process(this.t.file, (data) => {
+      const lines = data.split('\n');
+      let ln = this.ln;
+      if (!/^\s*[-*+]\s*\[.\]/.test(lines[ln] || '')) return data;
+      const end = this.noteEnd + (ln - this.ln);
+      const out = fn(lines, ln, end);
+      ok = true;
+      return out.join('\n');
+    });
+    return ok;
+  }
+  async save() {
+    if (!String(this.v.text || '').trim()) return new Notice('待办内容不能为空');
+    const ok = await this.edit((lines, ln, end) => lines.slice(0, ln).concat(this.buildLines(), lines.slice(end)));
+    new Notice(ok ? (this.v.done ? '✅ 已完成：' : '已保存：') + trunc(this.v.text, 30) : '原笔记已经变了，没保存；点「来自」去原笔记看看');
+    this.close();
+    if (this.onDone) setTimeout(() => this.onDone(), 150);
+  }
+  async remove() {
+    const ok0 = await this.plugin.confirmDelete({ title: '删除待办', lines: ['从「' + this.t.file.basename + '」里删掉这条待办' + (this.v.notes ? '和它的备注' : '') + '？', trunc(this.v.text, 80)], noTrashNote: true, confirmText: '删除' });
+    if (!ok0) return;
+    await this.edit((lines, ln, end) => lines.slice(0, ln).concat(lines.slice(end)));
+    new Notice('已删除待办');
+    this.close();
+    if (this.onDone) setTimeout(() => this.onDone(), 150);
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+/* 新建会议纪要：标题、日期、简介、参会人和材料在同一个窗口里填 */
+class NewMeetingModal extends Modal {
+  constructor(app, plugin, preset) {
+    super(app); this.plugin = plugin;
+    this.v = Object.assign({ title: '', date: today(), time: '', project: '', attendees: '', summary: '', items: [], move: false, open: true }, preset || {});
+    this.q = '';
+  }
+  onOpen() {
+    this.modalEl.classList.add('rw-meeting-modal');
+    this.titleEl.setText('新建会议纪要');
+    this.contentEl.classList.add('rw-modal');
+    const c = this.contentEl;
+    new Setting(c).setName('标题').addText((t) => { t.setPlaceholder('例如：组会 · 汇报 DOA 对抗攻击进展').setValue(this.v.title).onChange((x) => (this.v.title = x)); setTimeout(() => t.inputEl.focus(), 30); });
+    const dt = new Setting(c).setName('日期和时间');
+    dt.addText((t) => { t.inputEl.type = 'date'; t.setValue(this.v.date).onChange((x) => (this.v.date = x)); });
+    dt.addText((t) => { t.inputEl.type = 'time'; t.setValue(this.v.time).onChange((x) => (this.v.time = x)); });
+    const projects = this.plugin.buildIndex().projects.filter((p) => p.status !== '已完成' || p.name === this.v.project);
+    new Setting(c).setName('所属项目').addDropdown((d) => { d.addOption('', '（不属于项目）'); projects.forEach((p) => d.addOption(p.name, p.title)); d.setValue(this.v.project || '').onChange((x) => (this.v.project = x)); });
+    new Setting(c).setName('参会人').addText((t) => t.setPlaceholder('可选，比如：导师、张三、李四').setValue(this.v.attendees).onChange((x) => (this.v.attendees = x)));
+    h(c, 'div', { cls: 'rw-field-label', text: '简介' });
+    const ta = h(c, 'textarea', { cls: 'rw-meet-summary', attr: { rows: '3', placeholder: '这次会议讲了什么、要解决什么问题（会显示在会议列表里，回看时一眼知道是哪次会）' } });
+    ta.value = this.v.summary;
+    ta.addEventListener('input', () => { this.v.summary = ta.value; });
+    h(c, 'div', { cls: 'rw-field-label', text: '材料（录音、视频、PPT、PDF、图片…）' });
+    this.matEl = h(c, 'div', { cls: 'rw-meet-mats' });
+    this.drawMats();
+    const bar = h(c, 'div', { cls: 'rw-kind-ed-bar' });
+    const ol = h(bar, 'label', { cls: 'rw-check' });
+    const oc = h(ol, 'input', { attr: { type: 'checkbox' } }); oc.checked = this.v.open !== false;
+    h(ol, 'span', { text: '创建后打开' });
+    oc.addEventListener('change', () => { this.v.open = oc.checked; });
+    h(bar, 'span', { cls: 'rw-spacer' });
+    const cancel = h(bar, 'button', { cls: 'rw-btn', text: '取消' }); cancel.addEventListener('click', () => this.close());
+    const ok = h(bar, 'button', { cls: 'rw-btn mod-cta', text: '创建会议纪要' }); ok.addEventListener('click', () => this.submit());
+  }
+  drawMats() {
+    const c = this.matEl; clear(c);
+    const pl = this.plugin;
+    for (const [i, it] of this.v.items.entries()) {
+      const name = it.name || (it.path || '');
+      const ext = extOf(name).toLowerCase();
+      const row = h(c, 'div', { cls: 'rw-att-row' });
+      ic(row, FILE_CATS[EXT_CAT[ext] || 'other'].icon);
+      h(row, 'div', { cls: 'rw-att-name', text: name, title: it instanceof TFile ? it.path : '来自电脑' });
+      h(row, 'span', { cls: 'rw-muted rw-att-where', text: it instanceof TFile ? '库里的文件' : (it.size ? fmtSize(it.size) + ' · ' : '') + '来自电脑' });
+      const x = h(row, 'button', { cls: 'rw-iconbtn', title: '去掉' }); ic(x, 'x');
+      x.addEventListener('click', () => { this.v.items.splice(i, 1); this.drawMats(); });
+    }
+    const drop = h(c, 'div', { cls: 'rw-att-drop' });
+    ic(drop, 'upload');
+    h(drop, 'span', { text: '把录音、PPT 等拖到这里，或' });
+    const pick = h(drop, 'button', { cls: 'rw-btn rw-btn-sm', text: '从电脑选择…' });
+    const fin = h(drop, 'input', { attr: { type: 'file', multiple: '' } }); fin.style.display = 'none';
+    pick.addEventListener('click', () => fin.click());
+    fin.addEventListener('change', () => { if (fin.files) { this.v.items.push(...fin.files); this.drawMats(); } });
+    drop.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); drop.classList.add('is-over'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('is-over'));
+    drop.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); drop.classList.remove('is-over'); const fs = e.dataTransfer && e.dataTransfer.files; if (fs && fs.length) { this.v.items.push(...fs); this.drawMats(); } });
+    if (IS_MOBILE || TOUCH) { const rec = h(drop, 'button', { cls: 'rw-btn rw-btn-sm', text: '录音…' }); const rin = h(drop, 'input', { attr: { type: 'file', accept: 'audio/*', capture: '' } }); rin.style.display = 'none'; rec.addEventListener('click', () => rin.click()); rin.addEventListener('change', () => { if (rin.files) { this.v.items.push(...rin.files); this.drawMats(); } }); }
+    // 从库里选（比如已经导入过的录音）
+    const sb = h(c, 'div', { cls: 'rw-att-bar' });
+    const qi = h(sb, 'input', { cls: 'rw-att-q', attr: { type: 'search', placeholder: '或者从库里找已有的文件…' } });
+    qi.value = this.q;
+    const res = h(c, 'div', { cls: 'rw-att-res rw-meet-res' });
+    const drawRes = () => {
+      clear(res);
+      const q = this.q.trim().toLowerCase();
+      if (!q) return;
+      const have = new Set(this.v.items.filter((x) => x instanceof TFile).map((x) => x.path));
+      const files = this.app.vault.getFiles().filter((f) => f.extension !== 'md' && !have.has(f.path) && !f.path.startsWith(pl.dataDir() + '/') && f.path.toLowerCase().includes(q)).sort((a, b) => b.stat.mtime - a.stat.mtime).slice(0, 12);
+      if (!files.length) h(res, 'div', { cls: 'rw-muted rw-att-empty', text: '没找到' });
+      for (const f of files) {
+        const row = h(res, 'div', { cls: 'rw-att-row is-cand' });
+        ic(row, FILE_CATS[EXT_CAT[(f.extension || '').toLowerCase()] || 'other'].icon);
+        h(row, 'div', { cls: 'rw-att-name', text: f.name, title: f.path });
+        h(row, 'span', { cls: 'rw-muted rw-att-where', text: f.parent ? f.parent.path : '' });
+        const add = h(row, 'button', { cls: 'rw-btn rw-btn-sm', text: '加入' });
+        add.addEventListener('click', () => { this.v.items.push(f); this.q = ''; this.drawMats(); });
+      }
+    };
+    qi.addEventListener('input', () => { this.q = qi.value; drawRes(); });
+    drawRes();
+    if (this.v.items.some((x) => x instanceof TFile)) {
+      const ml = h(c, 'label', { cls: 'rw-check rw-meet-move' });
+      const mc = h(ml, 'input', { attr: { type: 'checkbox' } }); mc.checked = !!this.v.move;
+      h(ml, 'span', { text: '库里的文件移进这次纪要的附件文件夹（不勾 = 只关联，文件留在原处）' });
+      mc.addEventListener('change', () => { this.v.move = mc.checked; });
+    }
+  }
+  async submit() {
+    if (this.busy) return;
+    if (!String(this.v.title || '').trim()) return new Notice('请填写会议标题');
+    this.busy = true;
+    try { await this.plugin.createMeeting(this.v); this.close(); }
+    catch (e) { new Notice('创建失败：' + (e.message || e)); }
+    finally { this.busy = false; }
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+/* 管理一条笔记（文献 / 实验记录…）的附件 */
+class AttachModal extends Modal {
+  constructor(app, plugin, noteFile, onDone) { super(app); this.plugin = plugin; this.noteFile = noteFile; this.onDone = onDone; this.q = ''; }
+  get note() { return this.plugin.buildIndex().notes.find((x) => x.file.path === this.noteFile.path) || { file: this.noteFile, fm: (this.app.metadataCache.getFileCache(this.noteFile) || {}).frontmatter || {} }; }
+  onOpen() {
+    this.modalEl.classList.add('rw-attach-modal');
+    this.titleEl.setText('附件 · ' + (this.note.title || this.noteFile.basename));
+    this.contentEl.classList.add('rw-modal');
+    this.draw();
+  }
+  async refresh() { await new Promise((r) => setTimeout(r, 120)); this.draw(); if (this.onDone) this.onDone(); }
+  draw() {
+    const c = this.contentEl; clear(c);
+    const pl = this.plugin;
+    const atts = pl.attachmentsOf(this.note);
+    const dir = pl.attachDir(this.noteFile);
+    // 现有附件
+    const list = h(c, 'div', { cls: 'rw-att-list' });
+    if (!atts.length) h(list, 'div', { cls: 'rw-muted rw-att-empty', text: '还没有附件。可以把这篇的 PPT、讲稿、录音、自己的理解笔记、数据等挂在这里，以后打开文献就能一起找到。' });
+    for (const a of atts) {
+      const row = h(list, 'div', { cls: 'rw-att-row' });
+      ic(row, FILE_CATS[EXT_CAT[(a.file.extension || '').toLowerCase()] || 'other'].icon);
+      const nm = h(row, 'div', { cls: 'rw-att-name', text: a.file.name, title: a.file.path });
+      nm.addEventListener('click', () => pl.openFile(a.file));
+      h(row, 'span', { cls: 'rw-muted rw-att-where', text: a.inDir ? '附件文件夹' : a.file.parent ? a.file.parent.path : '' });
+      if (!a.inDir) { const mv = h(row, 'button', { cls: 'rw-iconbtn', title: '移到这篇的附件文件夹（' + dir + '）' }); ic(mv, 'folder-input'); mv.addEventListener('click', async () => { await pl.addAttachments(this.noteFile, [a.file], { move: true }); this.refresh(); }); }
+      if (a.listed && !a.inDir) { const un = h(row, 'button', { cls: 'rw-iconbtn', title: '取消关联（文件本身保留）' }); ic(un, 'unlink'); un.addEventListener('click', async () => { await pl.unlinkAttachment(this.noteFile, a.file); this.refresh(); }); }
+      const del = h(row, 'button', { cls: 'rw-iconbtn rw-del', title: '删除这个文件（进回收站）' }); ic(del, 'trash-2');
+      del.addEventListener('click', async () => { const ok = await pl.confirmDelete({ title: '删除附件', lines: ['删除文件「' + a.file.name + '」？', '位置：' + a.file.path] }); if (ok) { if (a.listed) await pl.unlinkAttachment(this.noteFile, a.file); await pl.trash(a.file); this.refresh(); } });
+    }
+    // 从电脑添加 / 拖进来
+    const drop = h(c, 'div', { cls: 'rw-att-drop' });
+    ic(drop, 'upload');
+    h(drop, 'span', { text: '把电脑上的文件拖到这里，或' });
+    const pick = h(drop, 'button', { cls: 'rw-btn rw-btn-sm mod-cta', text: '从电脑选择文件…' });
+    const fin = h(drop, 'input', { attr: { type: 'file', multiple: '' } }); fin.style.display = 'none';
+    pick.addEventListener('click', () => fin.click());
+    fin.addEventListener('change', async () => { if (fin.files && fin.files.length) { await pl.addAttachments(this.noteFile, [...fin.files]); this.refresh(); } });
+    drop.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); drop.classList.add('is-over'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('is-over'));
+    drop.addEventListener('drop', async (e) => { e.preventDefault(); e.stopPropagation(); drop.classList.remove('is-over'); const fs = e.dataTransfer && e.dataTransfer.files; if (fs && fs.length) { await pl.addAttachments(this.noteFile, [...fs]); this.refresh(); } });
+    h(c, 'div', { cls: 'rw-muted rw-att-hint', text: '电脑上的文件会复制到「' + dir + '」。' });
+    // 从库里选
+    const bar = h(c, 'div', { cls: 'rw-att-bar' });
+    const qi = h(bar, 'input', { cls: 'rw-att-q', attr: { type: 'search', placeholder: '从库里找文件：输入文件名…' } });
+    qi.value = this.q;
+    const mvl = h(bar, 'label', { cls: 'rw-check', title: '添加库里的文件时，顺便移进这篇的附件文件夹' });
+    const mvc = h(mvl, 'input', { attr: { type: 'checkbox' } }); mvc.checked = !!pl.settings.attachMove;
+    h(mvl, 'span', { text: '移进附件文件夹' });
+    mvc.addEventListener('change', () => { pl.settings.attachMove = mvc.checked; pl.saveSettingsSoon(); });
+    const res = h(c, 'div', { cls: 'rw-att-res' });
+    const have = new Set(atts.map((a) => a.file.path));
+    const drawRes = () => {
+      clear(res);
+      const q = this.q.trim().toLowerCase();
+      const projDir = this.noteFile.path.split('/').slice(0, 3).join('/');
+      let files = this.app.vault.getFiles().filter((f) => f.path !== this.noteFile.path && !have.has(f.path) && !f.path.startsWith(pl.dataDir() + '/') && !f.path.startsWith('.'));
+      if (q) files = files.filter((f) => f.path.toLowerCase().includes(q));
+      else files = files.filter((f) => f.path.startsWith(projDir + '/') && f.extension !== 'md' || f.path.startsWith(this.noteFile.parent ? this.noteFile.parent.path + '/' : '\u0000'));
+      files.sort((a, b) => b.stat.mtime - a.stat.mtime);
+      if (!files.length) h(res, 'div', { cls: 'rw-muted rw-att-empty', text: q ? '没找到' : '输入文件名搜索库里的文件' });
+      for (const f of files.slice(0, 30)) {
+        const row = h(res, 'div', { cls: 'rw-att-row is-cand' });
+        ic(row, FILE_CATS[EXT_CAT[(f.extension || '').toLowerCase()] || 'other'].icon);
+        h(row, 'div', { cls: 'rw-att-name', text: f.name, title: f.path });
+        h(row, 'span', { cls: 'rw-muted rw-att-where', text: f.parent ? f.parent.path : '' });
+        const add = h(row, 'button', { cls: 'rw-btn rw-btn-sm', text: '添加' });
+        add.addEventListener('click', async () => { await pl.addAttachments(this.noteFile, [f], { move: !!pl.settings.attachMove }); this.refresh(); });
+      }
+    };
+    qi.addEventListener('input', () => { this.q = qi.value; drawRes(); });
+    drawRes();
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+/* 阶段列表编辑器：每行一个阶段（名称 + 对应哪类笔记），可上下移、删除、添加 */
+const STAGE_NOTE_OPTS = [['', '（不对应）'], ['idea', '灵感'], ['literature', '文献'], ['experiment', '实验与数据'], ['draft', '写作'], ['submission', '投稿'], ['meeting', '会议']];
+function stageListEditor(parent, stages, onChange) {
+  const box = h(parent, 'div', { cls: 'rw-stage-ed' });
+  const draw = () => {
+    clear(box);
+    if (!stages.length) h(box, 'div', { cls: 'rw-muted rw-stage-ed-empty', text: '没有阶段 = 没有进度（像资料库一样只存文件）' });
+    stages.forEach((st, i) => {
+      const row = h(box, 'div', { cls: 'rw-stage-ed-row' });
+      h(row, 'span', { cls: 'rw-stage-ed-num', text: String(i + 1) });
+      const name = h(row, 'input', { cls: 'rw-stage-ed-name', attr: { type: 'text', placeholder: '阶段名称' } });
+      name.value = st.id || '';
+      name.addEventListener('input', () => { st.id = name.value; if (st.autoNt !== false && !st.ntTouched) { st.noteType = guessStageNoteType(name.value); sel.value = st.noteType || ''; } onChange && onChange(); });
+      const sel = h(row, 'select', { cls: 'dropdown rw-select rw-select-sm', title: '这个阶段主要产出哪类笔记（矩阵里统计、点了跳到哪一页）' });
+      for (const [v, t] of STAGE_NOTE_OPTS) { const o = h(sel, 'option', { text: t }); o.value = v; }
+      sel.value = st.noteType === 'data' ? 'experiment' : st.noteType || '';
+      sel.addEventListener('change', () => { st.noteType = sel.value; st.ntTouched = true; onChange && onChange(); });
+      const btn = (icon, title, fn, dis) => { const b = h(row, 'button', { cls: 'rw-iconbtn', title }); ic(b, icon); if (dis) b.disabled = true; b.addEventListener('click', (e) => { e.preventDefault(); fn(); draw(); onChange && onChange(); }); };
+      btn('arrow-up', '上移', () => { stages.splice(i - 1, 0, stages.splice(i, 1)[0]); }, i === 0);
+      btn('arrow-down', '下移', () => { stages.splice(i + 1, 0, stages.splice(i, 1)[0]); }, i === stages.length - 1);
+      btn('x', '删除这个阶段', () => { stages.splice(i, 1); });
+    });
+    const add = h(box, 'button', { cls: 'rw-btn rw-btn-sm rw-stage-ed-add' });
+    ic(add, 'plus'); h(add, 'span', { text: '添加阶段' });
+    add.addEventListener('click', (e) => { e.preventDefault(); stages.push({ id: '', noteType: '' }); draw(); onChange && onChange(); const ins = box.querySelectorAll('.rw-stage-ed-name'); if (ins.length) ins[ins.length - 1].focus(); });
+  };
+  draw();
+  return { redraw: draw };
+}
+
+/* 管理项目类型：新建 / 改名 / 改颜色 / 编辑每种类型的流程 / 删除 */
+class KindsEditorModal extends Modal {
+  constructor(app, plugin, focusKey) {
+    super(app); this.plugin = plugin; this.focusKey = focusKey;
+    this.list = kindsToSettings().map((k) => Object.assign(k, { origLabel: k.label, stages: k.stages.map((x) => Object.assign(x, { orig: x.id, ntTouched: true })) }));
+  }
+  onOpen() {
+    this.modalEl.classList.add('rw-kinds-modal');
+    this.titleEl.setText('项目类型与流程');
+    this.contentEl.classList.add('rw-modal');
+    this.draw();
+  }
+  draw() {
+    const c = this.contentEl; clear(c);
+    h(c, 'div', { cls: 'rw-muted', text: '每种项目类型有自己的流程（阶段）。阶段全部删掉 = 没有进度，比如资料库。某个项目想要不一样的流程，可以在项目右键菜单 →「编辑这个项目的流程」单独改。' });
+    const idx = this.plugin.buildIndex();
+    this.list.forEach((k, i) => {
+      const card = h(c, 'div', { cls: 'rw-kind-ed' + (k.key === this.focusKey ? ' is-focus' : '') });
+      card.style.setProperty('--kc', k.color);
+      const top = h(card, 'div', { cls: 'rw-kind-ed-top' });
+      const col = h(top, 'input', { attr: { type: 'color', title: '颜色' } }); col.value = /^#[0-9a-f]{6}$/i.test(k.color) ? k.color : '#888888';
+      col.addEventListener('input', () => { k.color = col.value; card.style.setProperty('--kc', k.color); });
+      const name = h(top, 'input', { cls: 'rw-kind-ed-name', attr: { type: 'text', placeholder: '类型名称' } }); name.value = k.label;
+      name.addEventListener('input', () => { k.label = name.value; });
+      const used = idx.projects.filter((p) => p.pkind === k.key).length;
+      h(top, 'span', { cls: 'rw-muted', text: used ? used + ' 个项目' : '' });
+      const btn = (icon, title, fn, dis) => { const b = h(top, 'button', { cls: 'rw-iconbtn', title }); ic(b, icon); if (dis) b.disabled = true; b.addEventListener('click', (e) => { e.preventDefault(); fn(); }); };
+      btn('arrow-up', '上移', () => { this.list.splice(i - 1, 0, this.list.splice(i, 1)[0]); this.draw(); }, i === 0);
+      btn('arrow-down', '下移', () => { this.list.splice(i + 1, 0, this.list.splice(i, 1)[0]); this.draw(); }, i === this.list.length - 1);
+      btn('trash-2', k.key === 'paper' ? '「论文」是默认类型，不能删除' : '删除这个类型', async () => {
+        const ok = await this.plugin.confirmDelete({ title: '删除类型', lines: ['删除类型「' + k.label + '」？', used ? '有 ' + used + ' 个项目是这个类型，删除后它们会变成「' + (this.list.find((x) => x.key === 'paper') || {}).label + '」类型（保存时自动改）。' : '没有项目在用这个类型。'], noTrashNote: true, confirmText: '删除' });
+        if (ok) { this.list.splice(i, 1); this.draw(); }
+      }, k.key === 'paper');
+      const desc = h(card, 'input', { cls: 'rw-kind-ed-desc', attr: { type: 'text', placeholder: '一句话说明（新建项目时显示）' } }); desc.value = k.desc || '';
+      desc.addEventListener('input', () => { k.desc = desc.value; });
+      stageListEditor(card, k.stages);
+    });
+    const bar = h(c, 'div', { cls: 'rw-kind-ed-bar' });
+    const add = h(bar, 'button', { cls: 'rw-btn' }); ic(add, 'plus'); h(add, 'span', { text: '新建类型' });
+    add.addEventListener('click', () => { this.list.push({ key: 'k' + Date.now().toString(36), label: '新类型', icon: 'folder', color: STAGE_PALETTE[this.list.length % STAGE_PALETTE.length], desc: '', stages: [{ id: '准备', noteType: '' }, { id: '进行', noteType: '' }, { id: '完成', noteType: '' }] }); this.draw(); const ns = this.contentEl.querySelectorAll('.rw-kind-ed-name'); if (ns.length) { ns[ns.length - 1].focus(); ns[ns.length - 1].select(); } });
+    const reset = h(bar, 'button', { cls: 'rw-btn' }); ic(reset, 'rotate-ccw'); h(reset, 'span', { text: '恢复默认类型' });
+    reset.addEventListener('click', async () => {
+      const ok = await this.plugin.confirmDelete({ title: '恢复默认', lines: ['把类型和流程恢复成默认的那几种？你新建的类型会去掉（用它的项目会变成「论文」）。'], noTrashNote: true, confirmText: '恢复' });
+      if (ok) { this.list = DEFAULT_KIND_ORDER.map((key) => Object.assign({ key, origLabel: (this.list.find((x) => x.key === key) || {}).origLabel }, JSON.parse(JSON.stringify(DEFAULT_KINDS[key])), { stages: DEFAULT_KINDS[key].stages.map((x) => ({ id: x.id, noteType: x.noteType, desc: x.desc, ntTouched: true })) })); this.draw(); }
+    });
+    h(bar, 'span', { cls: 'rw-spacer' });
+    const cancel = h(bar, 'button', { cls: 'rw-btn', text: '取消' }); cancel.addEventListener('click', () => this.close());
+    const save = h(bar, 'button', { cls: 'rw-btn mod-cta', text: '保存' }); save.addEventListener('click', () => this.save());
+  }
+  async save() {
+    for (const k of this.list) {
+      k.label = String(k.label || '').trim();
+      if (!k.label) return new Notice('有类型没有名称');
+      k.stages = k.stages.filter((x) => String(x.id || '').trim());
+      const ids = k.stages.map((x) => x.id.trim());
+      if (new Set(ids).size !== ids.length) return new Notice('「' + k.label + '」里有重名的阶段');
+    }
+    const labels = this.list.map((k) => k.label);
+    if (new Set(labels).size !== labels.length) return new Notice('有两个类型同名');
+    await this.plugin.saveKinds(this.list);
+    this.close();
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+/* 单个项目的流程：用类型的流程 / 自定义 / 没有流程 */
+class ProjectFlowModal extends Modal {
+  constructor(app, plugin, p) {
+    super(app); this.plugin = plugin; this.p = p;
+    this.mode = Array.isArray(p.customStages) ? (p.customStages.length ? 'custom' : 'none') : 'kind';
+    const base = Array.isArray(p.customStages) && p.customStages.length ? stagesOf(p) : stagesOfKind(p.pkind);
+    this.stages = base.map((x) => ({ id: x.id, noteType: x.noteType || '', ntTouched: true }));
+  }
+  onOpen() {
+    this.modalEl.classList.add('rw-flow-modal');
+    this.titleEl.setText('「' + this.p.title + '」的流程');
+    this.contentEl.classList.add('rw-modal');
+    this.draw();
+  }
+  draw() {
+    const c = this.contentEl; clear(c);
+    const k = KINDS[this.p.pkind];
+    const opts = [['kind', '用类型「' + k.label + '」的流程', k.stages.length ? k.stages.map((x) => x.id).join(' → ') : '无流程'], ['custom', '这个项目单独设流程', '只改这个项目，不影响同类型的其他项目'], ['none', '没有流程', '不显示进度，只存文件']];
+    const g = h(c, 'div', { cls: 'rw-confirm-choices' });
+    for (const [v, t, d] of opts) {
+      const lab = h(g, 'label', { cls: 'rw-confirm-choice' });
+      const r = h(lab, 'input', { attr: { type: 'radio', name: 'rw-flow' } });
+      r.checked = this.mode === v;
+      r.addEventListener('change', () => { if (r.checked) { this.mode = v; this.draw(); } });
+      const tx = h(lab, 'span'); h(tx, 'div', { text: t }); h(tx, 'div', { cls: 'rw-muted', text: d });
+    }
+    if (this.mode === 'custom') stageListEditor(c, this.stages);
+    const bar = h(c, 'div', { cls: 'rw-kind-ed-bar' });
+    const mk = h(bar, 'button', { cls: 'rw-btn', text: '管理所有项目类型…' }); mk.addEventListener('click', () => { this.close(); new KindsEditorModal(this.app, this.plugin, this.p.pkind).open(); });
+    h(bar, 'span', { cls: 'rw-spacer' });
+    const cancel = h(bar, 'button', { cls: 'rw-btn', text: '取消' }); cancel.addEventListener('click', () => this.close());
+    const save = h(bar, 'button', { cls: 'rw-btn mod-cta', text: '保存' }); save.addEventListener('click', () => this.save());
+  }
+  async save() {
+    let list = null;
+    if (this.mode === 'none') list = [];
+    else if (this.mode === 'custom') {
+      list = this.stages.map((x) => String(x.id || '').trim()).filter(Boolean);
+      if (!list.length) return new Notice('至少填一个阶段，或者选「没有流程」');
+      if (new Set(list).size !== list.length) return new Notice('有重名的阶段');
+    }
+    await this.plugin.setProjectFlow(this.p, list);
+    this.close();
+  }
+  onClose() { clear(this.contentEl); }
+}
+
 class NewProjectModal extends Modal {
   constructor(app, plugin, preset) {
     super(app);
@@ -3464,6 +4121,11 @@ class NewProjectModal extends Modal {
     // 2) 基本信息
     new Setting(contentEl).setName('项目名称').addText((t) => { t.setPlaceholder('例如：DOA 对抗攻击论文 / 某团队 SIM 工作研读').setValue(this.v.name).onChange((x) => (this.v.name = x)); setTimeout(() => t.inputEl.focus(), 30); });
     new Setting(contentEl).setName('一句话描述').addText((t) => t.setValue(this.v.description).onChange((x) => (this.v.description = x)));
+    const mg = h(contentEl, 'div', { cls: 'rw-kind-manage' });
+    const mgb = h(mg, 'button', { cls: 'rw-linkbtn', text: '⚙ 管理项目类型和流程…' });
+    mgb.addEventListener('click', () => { this.close(); new KindsEditorModal(this.app, this.plugin).open(); });
+    this.flowSet = new Setting(contentEl).setName('自定义流程').setDesc('可选：只给这个项目用的流程，用 → 或逗号分隔，比如「问题建模 → 推导 → 仿真 → 写作」；填「无」= 没有进度。留空 = 用上面类型的流程');
+    this.flowSet.addText((t) => { t.setPlaceholder('留空 = 用类型的流程').setValue(this.v.flow || '').onChange((x) => { this.v.flow = x; this.refreshStages(); }); });
     this.stageSet = new Setting(contentEl).setName('当前阶段');
     this.stageSet.addDropdown((d) => { this.stageDd = d; d.onChange((x) => (this.v.stage = x)); });
     this.parentSet = new Setting(contentEl).setName('所属研究方向').setDesc('可选：把这个项目挂到某个「研究方向」下面');
@@ -3479,15 +4141,20 @@ class NewProjectModal extends Modal {
   setKind(k, initial) {
     this.v.kind = k;
     for (const key of Object.keys(this.kindEls)) this.kindEls[key].classList.toggle('is-active', key === k);
-    const stages = stagesOfKind(k);
+    this.refreshStages(initial);
+    this.parentSet.settingEl.style.display = this.hasDirs && k !== 'direction' ? '' : 'none';
+    if (k === 'direction') this.v.parent = '';
+  }
+  refreshStages(initial) {
+    const k = this.v.kind;
+    const cs = String(this.v.flow || '').trim() ? parseCustomStages(this.v.flow) : null;
+    const stages = cs ? cs.map((n, i) => stageDefFromName(n, i)) : stagesOfKind(k);
     const sel = this.stageDd.selectEl;
     clear(sel);
     for (const st of stages) this.stageDd.addOption(st.id, st.id);
     if (!(initial && stages.some((x) => x.id === this.v.stage))) this.v.stage = stages[0] ? stages[0].id : '';
     if (stages.length) this.stageDd.setValue(this.v.stage);
     this.stageSet.settingEl.style.display = stages.length ? '' : 'none';
-    this.parentSet.settingEl.style.display = this.hasDirs && k !== 'direction' ? '' : 'none';
-    if (k === 'direction') this.v.parent = '';
   }
   async submit() {
     if (this.busy) return;
@@ -3495,7 +4162,8 @@ class NewProjectModal extends Modal {
     if (!name) { new Notice('请输入项目名称'); return; }
     this.busy = true;
     try {
-      const file = await this.plugin.createProject(Object.assign({}, this.v, { name }));
+      const cs = String(this.v.flow || '').trim() ? parseCustomStages(this.v.flow) : null;
+      const file = await this.plugin.createProject(Object.assign({}, this.v, { name }, cs ? { customStages: cs } : {}));
       if (file) { this.close(); if (this.v.onDone) this.v.onDone(file); }
     } finally { this.busy = false; }
   }
@@ -6295,7 +6963,13 @@ class PaperReaderView extends ItemView {
       if (this.ctx.noteObj && this.ctx.noteObj.projectName) t.style.setProperty('--pc', projectColor(this.ctx.noteObj.projectName));
       h(bar, 'span', { cls: 'rw-tp-sp' });
       const mk = (icon, title, fn) => { const x = h(bar, 'button', { cls: 'rw-tp-btn', title }); ic(x, icon); x.addEventListener('click', fn); return x; };
-      if (this.ctx.note) mk('file-text', '打开文献笔记', () => pl.openFile(this.ctx.note));
+      if (this.ctx.note) {
+        mk('file-text', '打开文献笔记', () => pl.openFile(this.ctx.note));
+        const nObj = this.ctx.noteObj || { file: this.ctx.note, fm: (this.app.metadataCache.getFileCache(this.ctx.note) || {}).frontmatter || {} };
+        const na = pl.attachmentsOf(nObj).length;
+        const atB = mk('paperclip', na ? '附件（' + na + '）：PPT、讲稿、笔记…' : '添加附件：PPT、讲稿、笔记…', (e) => { const m = new Menu(); pl.attachMenu(m, nObj, () => {}); m.showAtMouseEvent(e); });
+        if (na) { atB.classList.add('has-count'); h(atB, 'span', { cls: 'rw-tp-n', text: String(na) }); }
+      }
       else mk('file-plus', '为这个 PDF 建文献笔记', async () => { await pl.createLitNoteForPdf(this.ctx.pdf); this.load(this.pane && this.pane.cur); });
       if (this.ctx.pdf) {
         const ftB = mk('file-down', '全文：转 Markdown / 一键全文翻译 / HTML 阅读页', (e) => { const m = new Menu(); pl.ftMenuItems(m, this.ctx.pdf); m.showAtMouseEvent(e); });
@@ -6583,6 +7257,8 @@ class WorkbenchSettingTab extends PluginSettingTab {
       .addText((t) => t.setPlaceholder((s.rootFolder || '科研') + '/工作台数据').setValue(s.dataFolder || '').onChange(async (v) => { s.dataFolder = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('AI 协作约定').setDesc('在仓库根目录生成 CLAUDE.md 和 AGENTS.md，让 Claude Code / Codex 按工作台的格式生成笔记。')
       .addButton((b) => b.setButtonText('生成 / 更新').onClick(() => this.plugin.writeAgentGuide()));
+    new Setting(containerEl).setName('项目类型与流程').setDesc('新建 / 改名 / 删除项目类型，编辑每种类型的阶段（阶段留空 = 没有进度）')
+      .addButton((b) => b.setButtonText('管理…').onClick(() => new KindsEditorModal(this.app, this.plugin).open()));
     const info = h(containerEl, 'div', { cls: 'setting-item-description' });
     info.style.marginTop = '16px';
     info.textContent = '项目类型与流程：' + KIND_ORDER.map((k) => KINDS[k].label + '（' + (KINDS[k].stages.length ? KINDS[k].stages.map((x) => x.id).join(' → ') : '无流程') + '）').join('；') + '。类型和阶段分别写在项目主页的 kind、stage 属性里，可在工作台里直接修改。';
@@ -13057,6 +13733,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     if (!Array.isArray(this.settings.inspireLinks)) this.settings.inspireLinks = DEFAULT_INSPIRE_LINKS.map((x) => Object.assign({}, x));
     if (!this.settings.collapsed) this.settings.collapsed = {};
     if (!Array.isArray(this.settings.logTags)) this.settings.logTags = ['邮件', '学习', '阅读', '实验', '写作', '会议', '汇报', '杂事'];
+    applyKinds(this.settings.projectKinds);
   }
   async saveSettings() { await this.saveData(this.settings); }
   saveSettingsSoon() { clearTimeout(this._saveT); this._saveT = setTimeout(() => this.saveSettings(), 500); }
@@ -13119,9 +13796,11 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
           description: str(fm.description || fm.summary),
           counts: {}, openTasks, lastActivity: file.stat.mtime,
         };
+        if (Object.prototype.hasOwnProperty.call(fm, 'stages')) { const cs = parseCustomStages(fm.stages); if (cs) p.customStages = cs; }
         const stages = stagesOf(p);
         const raw = str(fm.stage).trim();
-        p.stage = stages.some((x) => x.id === raw) ? raw : (p.pkind === 'paper' && normStage(raw)) || (stages[0] ? stages[0].id : '');
+        const alias = normStage(raw);
+        p.stage = stages.some((x) => x.id === raw) ? raw : alias && stages.some((x) => x.id === alias) ? alias : stages[0] ? stages[0].id : '';
         projects.push(p);
         byName.set(p.name, p);
       } else if (type === 'resource') {
@@ -14122,8 +14801,44 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     await this.app.fileManager.processFrontMatter(file, (fm) => { fm[key] = value; });
   }
 
+  /* 保存项目类型（改名、改阶段名时，把已有项目的 kind / stage 属性一起改过来） */
+  async saveKinds(list) {
+    const idx = this.buildIndex();
+    const keys = new Set(list.map((k) => k.key));
+    const paperLabel = (list.find((k) => k.key === 'paper') || {}).label || '论文';
+    const jobs = [];
+    for (const p of idx.projects) {
+      const k = list.find((x) => x.key === p.pkind);
+      const fm = p.fm || {};
+      if (!k || !keys.has(p.pkind)) { jobs.push([p, { kind: paperLabel }]); continue; }
+      const ch = {};
+      if (k.origLabel && k.label.trim() !== k.origLabel && (str(fm.kind) === k.origLabel || (!fm.kind && p.pkind !== 'paper'))) ch.kind = k.label.trim();
+      if (!Array.isArray(p.customStages)) {
+        const ren = k.stages.find((x) => x.orig && x.orig === p.stage && x.orig !== x.id.trim());
+        if (ren) ch.stage = ren.id.trim();
+        else if (!k.stages.some((x) => x.id.trim() === p.stage) && !k.stages.some((x) => x.orig === p.stage)) ch.stage = k.stages[0] ? k.stages[0].id.trim() : '';
+      }
+      if (Object.keys(ch).length) jobs.push([p, ch]);
+    }
+    this.settings.projectKinds = list.map((k) => ({ key: k.key, label: k.label.trim(), icon: k.icon, color: k.color, desc: k.desc || '', stages: k.stages.map((x) => ({ id: x.id.trim(), noteType: x.noteType || '', desc: x.desc || '' })) }));
+    applyKinds(this.settings.projectKinds);
+    await this.saveSettings();
+    for (const [p, ch] of jobs) { try { await this.app.fileManager.processFrontMatter(p.file, (fm) => Object.assign(fm, ch)); } catch (e) { console.error(e); } }
+    new Notice('已保存项目类型' + (jobs.length ? '，同步改了 ' + jobs.length + ' 个项目的类型 / 阶段' : ''));
+    this.refreshViews();
+  }
+  /* 单个项目的流程：null = 用类型的流程；[] = 没有流程；[...] = 自定义 */
+  async setProjectFlow(p, list) {
+    await this.app.fileManager.processFrontMatter(p.file, (fm) => {
+      if (list == null) delete fm.stages; else fm.stages = list.length ? list : ['无'];
+      const stages = list == null ? stagesOfKind(p.pkind) : list.map((n, i) => stageDefFromName(n, i));
+      if (!stages.some((x) => x.id === fm.stage)) { const al = normStage(fm.stage); fm.stage = al && stages.some((x) => x.id === al) ? al : stages[0] ? stages[0].id : ''; }
+    });
+    new Notice('「' + p.title + '」的流程已更新');
+    this.refreshViews();
+  }
   async setProjectKind(p, k) {
-    const stages = stagesOfKind(k);
+    const stages = Array.isArray(p.customStages) ? stagesOf(p) : stagesOfKind(k);
     await this.app.fileManager.processFrontMatter(p.file, (fm) => {
       fm.kind = KINDS[k].label;
       if (!stages.some((x) => x.id === fm.stage)) fm.stage = stages[0] ? stages[0].id : '';
@@ -14172,7 +14887,43 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
   }
 
   newProjectModal(preset) { new NewProjectModal(this.app, this, preset).open(); }
-  newNoteModal(preset) { new NewNoteModal(this.app, this, preset).open(); }
+  newNoteModal(preset) { if (preset && preset.type === 'meeting') return this.newMeetingModal(preset); new NewNoteModal(this.app, this, preset).open(); }
+  newMeetingModal(preset) { new NewMeetingModal(this.app, this, preset || {}).open(); }
+  /* 新建会议纪要：标题 + 简介 + 材料（录音 / 视频 / PPT / PDF…）一步完成，材料放进纪要自己的附件文件夹 */
+  async createMeeting(v) {
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(v.date || '') ? v.date : today();
+    const title = date + ' ' + sanitize(v.title || '会议');
+    const summary = String(v.summary || '').trim();
+    const fm = { date, attendees: v.attendees || '' };
+    if (v.time) fm.time = v.time;
+    if (summary) fm.summary = summary.replace(/\s+/g, ' ').slice(0, 300);
+    const prepend = summary ? '> [!abstract] 简介\n' + summary.split('\n').map((l) => '> ' + l).join('\n') : '';
+    const file = await this.createNote({ type: 'meeting', title, project: v.project || '', fm, prepend, silent: true, status: v.items && v.items.length ? '待整理' : undefined });
+    if (v.items && v.items.length) {
+      await this.addAttachments(file, v.items, { move: !!v.move });
+      await new Promise((r) => setTimeout(r, 80));
+      const n = { file, fm: (this.app.metadataCache.getFileCache(file) || {}).frontmatter || {} };
+      const atts = this.attachmentsOf(n);
+      const MEDIA = FILE_CATS.meeting.exts;
+      const audio = atts.find((a) => MEDIA.includes((a.file.extension || '').toLowerCase()));
+      if (audio) await this.app.fileManager.processFrontMatter(file, (f) => { f.audio = '[[' + audio.file.path + ']]'; });
+      const lines = ['## 📎 材料'];
+      for (const a of atts) {
+        const ext = (a.file.extension || '').toLowerCase();
+        if (MEDIA.includes(ext) || ['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext)) lines.push('- ' + a.file.name, '', '![[' + a.file.path + ']]', '');
+        else lines.push('- [[' + a.file.path + '|' + a.file.name + ']]');
+      }
+      await this.app.vault.process(file, (data) => {
+        const i = data.indexOf('\n## 议题');
+        const block = lines.join('\n').replace(/\n+$/, '') + '\n';
+        return i >= 0 ? data.slice(0, i + 1) + block + '\n' + data.slice(i + 1) : data.replace(/\s*$/, '') + '\n\n' + block;
+      });
+    }
+    new Notice('已创建会议纪要：' + title + (v.items && v.items.length ? '（含 ' + v.items.length + ' 个材料）' : ''));
+    this.refreshViews();
+    if (v.open !== false) await this.openFile(file);
+    return file;
+  }
   promptText(title, value, cb) { new TextPromptModal(this.app, title, value, async (v) => { await cb(v); this.refreshViews(); }).open(); }
   refreshViews() {
     for (const l of this.app.workspace.getLeavesOfType(VIEW_TYPE)) if (l.view && l.view.render) l.view.render();
@@ -14455,6 +15206,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     const dd = this.dataDir() + '/';
     const linked = new Set();
     for (const n of idx.notes) if (n.type === 'literature') for (const p of this.pdfsOf(n)) if (p.kind === 'vault' && p.file) linked.add(p.file.path);
+    for (const n of idx.notes) if (n.fm && n.fm.attachments) for (const a of this.attachmentsOf(n)) linked.add(a.file.path);
     const LIT = /文献|原文|论文|参考|阅读|讲解|paper|literature|reading|reference/i;
     const NOT = /overleaf|对比|目标稿|投稿|草稿|draft|submission|审稿|rebuttal/i;
     const out = [];
@@ -14462,7 +15214,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     for (const f of this.app.vault.getFiles()) {
       if ((f.extension || '').toLowerCase() !== 'pdf' || linked.has(f.path) || !f.path.startsWith(root + '/') || f.path.startsWith(dd)) continue;
       const dirs = f.path.slice(root.length + 1).split('/').slice(0, -1);
-      if (!dirs.some((d) => LIT.test(d)) || dirs.some((d) => NOT.test(d))) continue;
+      if (!dirs.some((d) => LIT.test(d)) || dirs.some((d) => NOT.test(d) || d === '附件')) continue;
       const projectName = dirs[0] === '项目' && dirs[1] ? dirs[1] : '';
       // 同目录 / 上一级里编号相同的 md（比如「02 xxx.md」对「02_xxx.pdf」）当作讲解稿，标题也用它的
       let explain = null;
@@ -14501,6 +15253,175 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     if (!this._info.has(k)) this._info.set(k, {});
     return this._info.get(k);
   }
+  /* ───── 附件：像 Zotero 一样，一篇文献 / 一条实验记录下面挂 PPT、讲稿、笔记、数据… ─────
+     记在 frontmatter 的 attachments 列表（[[链接]]，改名 / 移动会自动更新）；
+     「<笔记所在文件夹>/附件/<笔记名>/」里的文件也算它的附件 */
+  attachDir(noteFile) { return normalizePath(((noteFile.parent && noteFile.parent.path !== '/') ? noteFile.parent.path + '/' : '') + '附件/' + (sanitize(noteFile.basename).slice(0, 60) || '附件')); }
+  linkTarget(v, from) {
+    let t = String(v || '').trim();
+    const m = t.match(/^!?\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]$/) || t.match(/^\[[^\]]*\]\(([^)]+)\)$/);
+    if (m) t = m[1];
+    try { t = decodeURIComponent(t); } catch (e) { /* ignore */ }
+    if (!t) return null;
+    return this.app.metadataCache.getFirstLinkpathDest(t, from || '') || this.app.vault.getAbstractFileByPath(normalizePath(t)) || null;
+  }
+  attachmentsOf(n) {
+    if (!n || !n.file || n.pdfOnly) return [];
+    const out = [], seen = new Set();
+    const raw = n.fm && n.fm.attachments;
+    const arr = Array.isArray(raw) ? raw : raw ? [raw] : [];
+    for (const v of arr) { const f = this.linkTarget(v, n.file.path); if (f instanceof TFile && !seen.has(f.path)) { seen.add(f.path); out.push({ file: f, listed: true }); } }
+    const dir = this.app.vault.getAbstractFileByPath(this.attachDir(n.file));
+    if (dir && dir.children) {
+      const walk = (d) => { for (const c of d.children) { if (c instanceof TFile) { if (!seen.has(c.path)) { seen.add(c.path); out.push({ file: c, listed: false, inDir: true }); } } else if (c.children) walk(c); } };
+      walk(dir);
+    }
+    for (const x of out) if (x.file.path.startsWith(this.attachDir(n.file) + '/')) x.inDir = true;
+    return out;
+  }
+  /* items：库里的 TFile，或从电脑选 / 拖进来的 File。电脑上的文件总是复制进附件文件夹；库里的文件按 move 决定移不移 */
+  async addAttachments(noteFile, items, o) {
+    o = o || {};
+    const dir = this.attachDir(noteFile);
+    const links = [];
+    let n = 0;
+    for (const it of items) {
+      try {
+        let f = it;
+        if (!(it instanceof TFile)) {
+          await this.ensureFolder(dir);
+          f = await this.app.vault.createBinary(this.uniqueFilePath(dir, it.name || '附件'), await it.arrayBuffer());
+        } else if (o.move && !it.path.startsWith(dir + '/')) {
+          await this.ensureFolder(dir);
+          const dest = this.uniqueFilePath(dir, it.name);
+          await this.app.fileManager.renameFile(it, dest);
+          f = this.app.vault.getAbstractFileByPath(dest) || it;
+        }
+        if (f.path === noteFile.path) continue;
+        links.push('[[' + f.path + ']]');
+        n++;
+      } catch (e) { new Notice('添加附件失败：' + (it.name || '') + ' ' + (e.message || e)); }
+    }
+    if (links.length) {
+      await this.app.fileManager.processFrontMatter(noteFile, (fm) => {
+        const cur = Array.isArray(fm.attachments) ? fm.attachments.slice() : fm.attachments ? [fm.attachments] : [];
+        const have = new Set(cur.map((v) => { const t = this.linkTarget(v, noteFile.path); return t ? t.path : String(v); }));
+        for (const l of links) { const pth = l.slice(2, -2); if (!have.has(pth)) { cur.push(l); have.add(pth); } }
+        fm.attachments = cur;
+      });
+      new Notice('📎 已添加 ' + n + ' 个附件');
+    }
+    this.refreshViews();
+    return n;
+  }
+  async unlinkAttachment(noteFile, file) {
+    await this.app.fileManager.processFrontMatter(noteFile, (fm) => {
+      const cur = Array.isArray(fm.attachments) ? fm.attachments : fm.attachments ? [fm.attachments] : [];
+      const next = cur.filter((v) => { const t = this.linkTarget(v, noteFile.path); return !(t && t.path === file.path); });
+      if (next.length) fm.attachments = next; else delete fm.attachments;
+    });
+    this.refreshViews();
+  }
+  attachMenu(m, n, refresh) {
+    const atts = this.attachmentsOf(n);
+    for (const a of atts) m.addItem((i) => i.setTitle(a.file.name).setIcon(FILE_CATS[EXT_CAT[(a.file.extension || '').toLowerCase()] || 'other'].icon).onClick(() => this.openFile(a.file)));
+    if (atts.length) m.addSeparator();
+    m.addItem((i) => i.setTitle(atts.length ? '管理附件…' : '添加附件…').setIcon('paperclip').onClick(() => new AttachModal(this.app, this, n.file, refresh).open()));
+  }
+  /* ───── 文献「我的分类」：自己建的分类，一篇可以在多个分类里，支持「父/子」子分类 ─────
+     笔记：写在 frontmatter 的 collections 列表；还没有笔记的 PDF：记在设置 pdfColl 里，建笔记时搬过去 */
+  litCollections() {
+    const list = Array.isArray(this.settings.litCollections) ? this.settings.litCollections : [];
+    const all = new Set();
+    for (const c of list) { const parts = String(c).split('/').map((x) => x.trim()).filter(Boolean); for (let i = 1; i <= parts.length; i++) all.add(parts.slice(0, i).join('/')); }
+    return [...all].sort((a, b) => a.localeCompare(b, 'zh'));
+  }
+  collOf(n) {
+    if (!n) return [];
+    if (n.pdfOnly && n.file) return ((this.settings.pdfColl || {})[n.file.path] || []).slice();
+    const v = n.fm && n.fm.collections;
+    if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
+    if (typeof v === 'string' && v.trim()) return v.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
+    return [];
+  }
+  inColl(n, c) { return this.collOf(n).some((x) => x === c || x.startsWith(c + '/')); }
+  async addCollection(path) {
+    path = String(path || '').split('/').map((x) => sanitize(x.trim()).replace(/[,，]/g, ' ')).filter(Boolean).join('/');
+    if (!path) return '';
+    const list = Array.isArray(this.settings.litCollections) ? this.settings.litCollections : (this.settings.litCollections = []);
+    if (!list.includes(path)) list.push(path);
+    await this.saveSettings();
+    return path;
+  }
+  /* 把一批文献加入 / 移出某个分类 */
+  async setColl(entries, c, on) {
+    let changed = 0;
+    for (const n of entries) {
+      if (n.pdfOnly) {
+        const cur = this.collOf(n);
+        if (on === cur.includes(c)) continue;
+        const next = on ? cur.concat([c]) : cur.filter((x) => x !== c);
+        this.settings.pdfColl = this.settings.pdfColl || {};
+        if (next.length) this.settings.pdfColl[n.file.path] = next; else delete this.settings.pdfColl[n.file.path];
+        changed++;
+        continue;
+      }
+      let did = false;
+      await this.app.fileManager.processFrontMatter(n.file, (fm) => {
+        const cur = this.collOf({ fm });
+        if (on === cur.includes(c)) return;
+        const next = on ? cur.concat([c]) : cur.filter((x) => x !== c);
+        if (next.length) fm.collections = next; else delete fm.collections;
+        did = true;
+      });
+      if (did) changed++;
+    }
+    if (entries.some((n) => n.pdfOnly)) await this.saveSettings();
+    if (changed) new Notice((on ? '已加入「' : '已移出「') + c + '」：' + changed + ' 篇');
+    this.refreshViews();
+  }
+  /* 改名 / 删除分类（连同子分类），已分好的文献一起改 */
+  async renameCollection(from, to) {
+    to = String(to || '').split('/').map((x) => sanitize(x.trim()).replace(/[,，]/g, ' ')).filter(Boolean).join('/');
+    if (!to || to === from) return;
+    const map = (x) => (x === from ? to : x.startsWith(from + '/') ? to + x.slice(from.length) : x);
+    await this.rewriteCollections(map);
+    this.settings.litCollections = [...new Set((this.settings.litCollections || []).map(map))];
+    await this.saveSettings();
+    new Notice('分类已改名为「' + to + '」');
+    this.refreshViews();
+  }
+  async deleteCollection(c) {
+    const map = (x) => (x === c || x.startsWith(c + '/') ? null : x);
+    await this.rewriteCollections(map);
+    this.settings.litCollections = (this.settings.litCollections || []).filter((x) => map(x) != null);
+    await this.saveSettings();
+    new Notice('已删除分类「' + c + '」（文献本身不受影响）');
+    this.refreshViews();
+  }
+  async rewriteCollections(map) {
+    const idx = this.buildIndex();
+    for (const n of idx.notes.filter((x) => x.type === 'literature')) {
+      const cur = this.collOf(n);
+      if (!cur.length) continue;
+      const next = [...new Set(cur.map(map).filter(Boolean))];
+      if (next.join('|') !== cur.join('|')) await this.app.fileManager.processFrontMatter(n.file, (fm) => { if (next.length) fm.collections = next; else delete fm.collections; });
+    }
+    const pc = this.settings.pdfColl || {};
+    for (const k of Object.keys(pc)) { const next = [...new Set(pc[k].map(map).filter(Boolean))]; if (next.length) pc[k] = next; else delete pc[k]; }
+  }
+  /* 「加入分类」菜单：勾选状态 = 选中的文献是否都在这个分类里 */
+  collMenu(m, entries, onDone) {
+    const cs = this.litCollections();
+    if (!cs.length) m.addItem((i) => i.setTitle('还没有分类').setDisabled ? i.setTitle('还没有分类').setDisabled(true) : i.setTitle('还没有分类'));
+    for (const c of cs) {
+      const all = entries.length && entries.every((n) => this.collOf(n).includes(c));
+      const depth = c.split('/').length - 1;
+      m.addItem((i) => i.setTitle('\u2003'.repeat(depth) + c.split('/').pop()).setIcon(all ? 'check-square' : 'square').onClick(async () => { await this.setColl(entries, c, !all); if (onDone) onDone(); }));
+    }
+    m.addSeparator();
+    m.addItem((i) => i.setTitle('新建分类并加入…').setIcon('folder-plus').onClick(() => this.promptText('新分类名称（用「父分类/子分类」可以建子分类）', '', async (v) => { const c = await this.addCollection(v); if (c) { await this.setColl(entries, c, true); if (onDone) onDone(); } })));
+  }
   async createLitNoteForPdf(pdf) {
     const idx = this.buildIndex();
     let x = idx.files.find((e) => e.file && e.file.path === pdf.path) || { kind: 'file', file: pdf, name: pdf.name, ext: 'pdf', cat: 'literature', projectName: '' };
@@ -14513,6 +15434,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     if (nf && nf.path) {
       try { if (this._pg && this._pg[pdf.path]) { this._pg[nf.path] = Object.assign({}, this._pg[pdf.path], this._pg[nf.path] || {}); delete this._pg[pdf.path]; this.pgSaveSoon(); } } catch (e) { /* ignore */ }
       try { if (this.mfStore && this.mfStore.rename) await this.mfStore.rename(pdf.path, nf.path); } catch (e) { /* ignore */ }
+      try { const pc = (this.settings.pdfColl || {})[pdf.path]; if (pc && pc.length) { await this.app.fileManager.processFrontMatter(nf, (fm) => { fm.collections = pc.slice(); }); delete this.settings.pdfColl[pdf.path]; this.saveSettingsSoon(); } } catch (e) { /* ignore */ }
       // 新笔记顺手识别标题、作者、年份（填空，不覆盖）
       if (this.settings.litAutoMeta !== false) setTimeout(() => { this.fillLitMeta(nf, pdf, { quiet: true }).catch(() => {}); }, 300);
     }
