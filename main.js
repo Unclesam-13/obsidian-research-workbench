@@ -2732,9 +2732,9 @@ class WorkbenchView extends ItemView {
     // 笔记（按流程）
     const notes = this.index.notes.filter((n) => n.projectName === p.name);
     const empties = [];
-    for (const type of Object.keys(NOTE_TYPES)) {
-      const def = NOTE_TYPES[type];
-      const list = notes.filter((n) => n.type === type).sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.file.stat.mtime - a.file.stat.mtime);
+    for (const type of Object.keys(NOTE_TYPES).filter((t) => t !== 'data')) {
+      const def = type === 'experiment' ? EXP_TAB_DEF : NOTE_TYPES[type];
+      const list = notes.filter((n) => n.type === type || (type === 'experiment' && n.type === 'data')).sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.file.stat.mtime - a.file.stat.mtime);
       if (!list.length) { empties.push(type); continue; }
       const sec = this.section(left, def.label + ' · ' + list.length, def.icon);
       sec.el.classList.add('rw-dsec');
@@ -2747,7 +2747,7 @@ class WorkbenchView extends ItemView {
       }
       for (const n of list.slice(0, 6)) {
         const r = h(sec.body, 'div', { cls: 'rw-row' });
-        ic(r, def.icon, 'rw-row-icon');
+        ic(r, NOTE_TYPES[n.type].icon, 'rw-row-icon');
         const mid = h(r, 'div', { cls: 'rw-row-mid' });
         const rt = h(mid, 'div', { cls: 'rw-row-title rw-row-title-pdf' });
         h(rt, 'span', { cls: 'rw-row-title-text', text: n.title });
@@ -2760,13 +2760,53 @@ class WorkbenchView extends ItemView {
         r.addEventListener('contextmenu', (e) => this.noteMenu(e, n));
       }
     }
+    // 其他内容：没写 type 的 md 笔记，以及 PPT、PDF、文稿、图片、代码、HTML 等文件（按类型分组）
+    {
+      const pfiles = this.index.files.filter((x) => x.projectName === p.name);
+      this._detailMore = this._detailMore || new Set();
+      const groups = [['__md', '其他笔记', 'file-text', pfiles.filter((x) => x.looseMd)]];
+      for (const k of Object.keys(FILE_CATS)) groups.push([k, k === 'literature' ? '文献原文（PDF 等）' : k === 'other' ? '其他文件' : FILE_CATS[k].label, FILE_CATS[k].icon, pfiles.filter((x) => !x.looseMd && x.cat === k)]);
+      for (const [key, label, icon, list0] of groups) {
+        if (!list0.length) continue;
+        const list = list0.slice().sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+        const sec = this.section(left, label + ' · ' + list.length, icon);
+        sec.el.classList.add('rw-dsec');
+        const moreKey = p.name + '|' + key;
+        const showAll = this._detailMore.has(moreKey);
+        if (list.length > 6) {
+          const more = h(sec.right, 'button', { cls: 'rw-linkbtn', text: showAll ? '收起' : '全部 ' + list.length + ' →' });
+          more.addEventListener('click', () => { if (showAll) this._detailMore.delete(moreKey); else this._detailMore.add(moreKey); this.render(); });
+        }
+        const shown = showAll ? list : list.slice(0, 6);
+        shown.forEach((x) => {
+          const r = h(sec.body, 'div', { cls: 'rw-row' });
+          ic(r, x.looseMd ? 'file-text' : FILE_CATS[x.cat] ? FILE_CATS[x.cat].icon : 'paperclip', 'rw-row-icon');
+          const mid = h(r, 'div', { cls: 'rw-row-mid' });
+          h(mid, 'div', { cls: 'rw-row-title', text: x.looseMd ? x.file.basename : x.name, title: x.kind === 'link' ? x.extPath : x.file.path });
+          const dir = x.file && x.file.parent ? x.file.parent.path : '';
+          const rel = dir.startsWith(this.plugin.projectDir(p.name)) ? dir.slice(this.plugin.projectDir(p.name).length + 1) : dir;
+          h(mid, 'div', { cls: 'rw-row-sub', text: [rel, x.looseMd ? '' : fmtSize(x.size), relTime(x.mtime)].filter(Boolean).join(' · ') });
+          if (x.looseMd) {
+            const tag = h(r, 'button', { cls: 'rw-iconbtn', title: '设成工作台笔记（补上类型等属性，之后会出现在对应的分类里）' });
+            ic(tag, 'tag');
+            tag.addEventListener('click', (e) => { e.stopPropagation(); const m = new Menu(); for (const t of Object.keys(NOTE_TYPES)) m.addItem((i) => i.setTitle('设为 ' + NOTE_TYPES[t].label).setIcon(NOTE_TYPES[t].icon).onClick(async () => { await this.app.fileManager.processFrontMatter(x.file, (fm) => { fm.type = t; if (!fm.project) fm.project = '[[' + p.name + ']]'; if (!fm.status) fm.status = this.plugin.defaultStatusFor(t); if (!fm.date) fm.date = fmtDate(new Date(x.file.stat.ctime || x.file.stat.mtime || Date.now())); }); this.plugin.refreshViews(); })); m.showAtMouseEvent(e); });
+            r.addEventListener('click', () => this.plugin.openFile(x.file));
+          } else {
+            r.addEventListener('click', () => this.plugin.previewEntries(shown, shown.indexOf(x)));
+            r.addEventListener('dblclick', () => this.plugin.openEntry(x));
+          }
+          this.trashBtn(r, x.kind === 'link' ? '删除链接记录' : '删除文件', () => this.plugin.deleteEntry(x));
+          r.addEventListener('contextmenu', (e) => this.fileMenu(e, x));
+        });
+      }
+    }
     if (empties.length) {
       const q2 = h(left, 'div', { cls: 'rw-quickadd' });
       h(q2, 'span', { cls: 'rw-muted', text: '新建：' });
       for (const type of empties) {
         const b = h(q2, 'button', { cls: 'rw-catchip' });
         ic(b, NOTE_TYPES[type].icon);
-        h(b, 'span', { text: NOTE_TYPES[type].label });
+        h(b, 'span', { text: type === 'experiment' ? '实验与数据' : type === 'meeting' ? '会议纪要' : NOTE_TYPES[type].label });
         b.addEventListener('click', () => this.plugin.newNoteModal({ type, project: p.name }));
       }
     }
