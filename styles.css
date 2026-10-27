@@ -2347,3 +2347,8 @@ tr:hover .rw-att-chip.is-empty, .rw-pgc .rw-att-chip.is-empty { opacity: .7; }
 .rw-task-src-line { display: flex; align-items: center; gap: 4px; margin-top: 10px; font-size: 12px; }
 .rw-task-src-line svg { width: 13px; height: 13px; color: var(--text-muted); }
 .rw-task { cursor: pointer; }
+
+/* v0.22.2 跨项目移动 */
+.rw-fp-top { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+.rw-fp-top select { flex: 1; min-width: 160px; }
+.rw-fp-cross { font-size: 11.5px; padding: 1px 8px; border-radius: 10px; color: var(--text-on-accent); background: var(--interactive-accent); }

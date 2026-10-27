@@ -412,6 +412,12 @@ function normStage(v) {
   return STAGE_ALIASES[s] || STAGE_ALIASES[s.toLowerCase()] || null;
 }
 function stageIndex(id) { return STAGES.findIndex((s) => s.id === id); }
+/* 路径属于哪个项目：<根>/项目/<项目名>/… */
+function projectOfPathIn(path, root) {
+  const pre = normalizePath((root || '科研') + '/项目') + '/';
+  if (!String(path).startsWith(pre)) return '';
+  return String(path).slice(pre.length).split('/')[0] || '';
+}
 function sanitize(name) { return String(name).replace(/[\\/:*?"<>|#^[\]]/g, '-').trim(); }
 function q(v) { return JSON.stringify(v == null ? '' : String(v)); }
 function hue(name) {
@@ -1617,6 +1623,7 @@ class WorkbenchView extends ItemView {
     m.addItem((i) => i.setTitle('打开').setIcon('file-text').onClick(() => this.plugin.openFile(n.file)));
     if (n.type === 'literature') { const c = this.plugin.paperOf(n.file); if (c && c.pdf) { m.addItem((i) => i.setTitle('从 PDF 识别标题 / 作者 / 年份').setIcon('scan-text').onClick(async () => { await this.plugin.fillLitMeta(n.file, c.pdf, { force: !!str(n.fm.title) && looksLikeFileName(str(n.fm.title)) }); this.render(); })); m.addSeparator(); this.plugin.ftMenuItems(m, c.pdf); m.addSeparator(); } }
     m.addItem((i) => i.setTitle('预览').setIcon('eye').onClick(() => this.plugin.previewNotes([n], n)));
+    m.addItem((i) => i.setTitle('移动到文件夹…（可跨项目）').setIcon('folder-input').onClick(() => this.plugin.pickFolder(n.projectName || '', { title: '把「' + n.title + '」移动到…' }, (dest) => this.plugin.moveFileTo(n.file, dest))));
     m.addItem((i) => i.setTitle('附件（' + this.plugin.attachmentsOf(n).length + '）…').setIcon('paperclip').onClick(() => new AttachModal(this.app, this.plugin, n.file, () => this.render()).open()));
     if (n.type === 'idea') {
       m.addItem((i) => i.setTitle('转为科研项目').setIcon('rocket').onClick(() => this.plugin.ideaToProject(n)));
@@ -2062,7 +2069,7 @@ class WorkbenchView extends ItemView {
     m.addSeparator();
     const noteType = x.cat === 'literature' ? 'literature' : x.cat === 'meeting' ? 'meeting' : x.cat === 'data' ? 'data' : x.cat === 'writing' ? 'draft' : null;
     if (noteType) m.addItem((i) => i.setTitle('为它创建' + NOTE_TYPES[noteType].label + '笔记').setIcon(NOTE_TYPES[noteType].icon).onClick(() => pl.createNoteForEntry(x, noteType, true)));
-    if (x.kind === 'file' && x.projectName) m.addItem((i) => i.setTitle('移动到项目里的文件夹…').setIcon('folder-input').onClick(() => pl.pickFolder(x.projectName, { title: '把「' + x.name + '」移动到…' }, (dest) => pl.moveFileTo(x.file, dest))));
+    if (x.kind === 'file') m.addItem((i) => i.setTitle('移动到文件夹…（可跨项目）').setIcon('folder-input').onClick(() => pl.pickFolder(x.projectName || '', { title: '把「' + x.name + '」移动到…' }, (dest) => pl.moveFileTo(x.file, dest))));
     m.addSeparator();
     m.addItem((i) => i.setTitle('移到 → 未归属项目').setChecked(!x.projectName).onClick(() => pl.moveEntry(x, '', x.cat)));
     for (const p of this.index.projects.filter((pp) => pp.status !== '已完成' || pp.name === x.projectName)) {
@@ -2212,6 +2219,7 @@ class WorkbenchView extends ItemView {
     m.addItem((i) => i.setTitle('导入文件到这里…').setIcon('upload').onClick(() => pl.pickFiles({ project: p.name, folder: f.path })));
     m.addItem((i) => i.setTitle('在里面新建子文件夹…').setIcon('folder-plus').onClick(() => pl.promptText('子文件夹名称', '', (v) => pl.createFolderIn(f.path, v))));
     m.addItem((i) => i.setTitle('重命名…').setIcon('pencil').onClick(() => pl.promptText('重命名文件夹', f.name, (v) => pl.renameFolder(f, v))));
+    m.addItem((i) => i.setTitle('移动文件夹到…（可跨项目）').setIcon('folder-input').onClick(() => pl.pickFolder(p.name, { title: '把文件夹「' + f.name + '」移动到…', exclude: f.path }, (dest) => pl.moveFolderTo(f, dest))));
     if (!IS_MOBILE) m.addItem((i) => i.setTitle('在系统文件夹中显示').setIcon('folder-open').onClick(() => (this.app.showInFolder ? this.app.showInFolder(f.path) : showFsPath(pl.fullPath(f)))));
     addDeleteItem(m, '删除文件夹…', () => pl.deleteFolder(f));
     m.showAtMouseEvent(e);
@@ -2225,7 +2233,7 @@ class WorkbenchView extends ItemView {
     if (entry) m.addItem((i) => i.setTitle('预览').setIcon('eye').onClick(() => pl.previewEntries([entry], 0)));
     const note = isMd && this.index.notes.find((n) => n.file.path === f.path);
     if (note) m.addItem((i) => i.setTitle('预览').setIcon('eye').onClick(() => pl.previewNotes([note], note)));
-    m.addItem((i) => i.setTitle('移动到文件夹…').setIcon('folder-input').onClick(() => pl.pickFolder(p.name, { title: '把「' + f.name + '」移动到…' }, (dest) => pl.moveFileTo(f, dest))));
+    m.addItem((i) => i.setTitle('移动到文件夹…（可跨项目）').setIcon('folder-input').onClick(() => pl.pickFolder(p.name, { title: '把「' + f.name + '」移动到…' }, (dest) => pl.moveFileTo(f, dest))));
     m.addItem((i) => i.setTitle('重命名…').setIcon('pencil').onClick(() => pl.promptText('新文件名', isMd ? f.basename : f.name, (v) => pl.renameFileTo(f, v))));
     m.addItem((i) => i.setTitle('复制 [[链接]]').setIcon('link').onClick(() => pl.copyText('[[' + f.path + ']]')));
     if (!IS_MOBILE) m.addItem((i) => i.setTitle('在系统文件夹中显示').setIcon('folder-open').onClick(() => (this.app.showInFolder ? this.app.showInFolder(f.path) : showFsPath(pl.fullPath(f)))));
@@ -5369,6 +5377,16 @@ class FolderPickModal extends Modal {
     const c = this.contentEl;
     clear(c);
     const pl = this.plugin;
+    // 目标项目：可以换成别的项目（跨项目移动）
+    const projects = pl.buildIndex().projects.filter((p) => p.status !== '已完成' || p.name === this.project || p.name === this.o.from);
+    if (!this.project && projects.length) this.project = this.o.from || projects[0].name;
+    const top = h(c, 'div', { cls: 'rw-fp-top' });
+    h(top, 'span', { cls: 'rw-muted', text: '移到项目：' });
+    const sel = h(top, 'select', { cls: 'dropdown rw-select' });
+    for (const p of projects) { const o = h(sel, 'option', { text: p.title + (p.name === this.o.from ? '（当前项目）' : '') }); o.value = p.name; }
+    sel.value = this.project;
+    sel.addEventListener('change', () => { this.project = sel.value; this.draw(); });
+    if (this.o.from && this.project !== this.o.from) h(top, 'span', { cls: 'rw-fp-cross', text: '跨项目移动' });
     const base = pl.projectDir(this.project);
     const list = h(c, 'div', { cls: 'rw-fp-list' });
     const row = (label, path, depth, icon, sub) => {
@@ -5381,7 +5399,7 @@ class FolderPickModal extends Modal {
       r.addEventListener('click', async () => { this.close(); await this.cb(path); });
     };
     row('项目自由空间（' + this.project + ' 根目录）', base, 0, 'folder-open');
-    for (const f of pl.projectFolderList(this.project)) row(f.name, f.path, f.depth + 1, 'folder', f.auto ? '工作台自动归档' : '');
+    for (const f of pl.projectFolderList(this.project)) { if (this.o.exclude && (f.path === this.o.exclude || f.path.startsWith(this.o.exclude + '/'))) continue; row(f.name, f.path, f.depth + 1, 'folder', f.auto ? '工作台自动归档' : ''); }
     const nb = h(c, 'button', { cls: 'rw-btn rw-btn-sm rw-fp-new' });
     ic(nb, 'folder-plus'); h(nb, 'span', { text: '新建文件夹…' });
     nb.addEventListener('click', () => new TextPromptModal(this.app, '新文件夹名称（建在项目根目录，可用 / 建多级）', '', async (v) => {
@@ -16748,8 +16766,37 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     if (file.parent && file.parent.path === folder) return;
     await this.ensureFolder(folder);
     const np = file.extension === 'md' ? this.uniquePath(folder, file.basename) : this.uniqueFilePath(folder, file.name);
+    const fromP = projectOfPathIn(file.path, this.settings.rootFolder), toP = projectOfPathIn(np, this.settings.rootFolder);
     await this.app.fileManager.renameFile(file, np);
-    new Notice('已移动：' + file.name + ' → ' + folder.split('/').slice(-2).join('/'));
+    // 跨项目移动笔记：所属项目（project 属性）也跟着改
+    if (file.extension === 'md' && fromP !== toP) {
+      const nf = this.app.vault.getAbstractFileByPath(np);
+      const fm = nf && (this.app.metadataCache.getFileCache(nf) || {}).frontmatter;
+      if (nf && fm && fm.type && normType(fm.type) !== 'project' && 'project' in fm) await this.app.fileManager.processFrontMatter(nf, (f) => { f.project = toP ? '[[' + toP + ']]' : ''; });
+    }
+    new Notice('已移动：' + file.name + ' → ' + (fromP !== toP ? (toP || '未归属') + ' / ' : '') + folder.split('/').slice(-2).join('/'));
+    this.refreshViews();
+  }
+  /* 移动整个文件夹（可以到别的项目）；里面笔记的 project 属性跟着改到新项目 */
+  async moveFolderTo(folder, dest) {
+    dest = normalizePath(dest);
+    if (dest === folder.path || dest.startsWith(folder.path + '/') || (folder.parent && folder.parent.path === dest)) return;
+    await this.ensureFolder(dest);
+    let np = normalizePath(dest + '/' + folder.name), i = 2;
+    while (this.app.vault.getAbstractFileByPath(np)) np = normalizePath(dest + '/' + folder.name + ' ' + i++);
+    const fromP = projectOfPathIn(folder.path, this.settings.rootFolder), toP = projectOfPathIn(np, this.settings.rootFolder);
+    await this.app.fileManager.renameFile(folder, np);
+    let fixed = 0;
+    if (fromP !== toP) {
+      const nf = this.app.vault.getAbstractFileByPath(np);
+      const walk = (d) => (d && d.children ? d.children.flatMap((c) => (c.children ? walk(c) : [c])) : []);
+      for (const f of walk(nf)) {
+        if ((f.extension || '') !== 'md') continue;
+        const fm = (this.app.metadataCache.getFileCache(f) || {}).frontmatter;
+        if (fm && fm.type && normType(fm.type) !== 'project' && 'project' in fm && parseLinkName(fm.project) === fromP) { await this.app.fileManager.processFrontMatter(f, (x) => { x.project = toP ? '[[' + toP + ']]' : ''; }); fixed++; }
+      }
+    }
+    new Notice('已移动文件夹：' + folder.name + ' → ' + (fromP !== toP ? (toP || '未归属') + ' / ' : '') + dest.split('/').slice(-2).join('/') + (fixed ? '（' + fixed + ' 条笔记改到新项目）' : ''));
     this.refreshViews();
   }
   async renameFileTo(file, name) {
@@ -16770,7 +16817,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     new Notice('🗑 已删除：' + f.name);
     this.refreshViews();
   }
-  pickFolder(project, o, cb) { new FolderPickModal(this.app, this, project, o || {}, cb).open(); }
+  pickFolder(project, o, cb) { new FolderPickModal(this.app, this, project, Object.assign({ from: project }, o || {}), cb).open(); }
 
   pickFiles(ctx) {
     const input = document.createElement('input');
