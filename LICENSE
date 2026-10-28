@@ -24,3 +24,4 @@ SOFTWARE.
 Third-party: vendor-katex.js / vendor-katex.css bundle KaTeX
 (https://github.com/KaTeX/KaTeX), MIT License, Copyright (c) 2013-2020 Khan Academy and other contributors.
 The Mindflow module is ported from https://github.com/Unclesam-13/canvas-mindflow.
+The 生活 (life) panel is ported from https://github.com/Unclesam-13/obsidian-daily-hub.

@@ -243,14 +243,24 @@ const TABS = [
   { id: 'submission', label: '投稿', icon: 'send' },
   { id: 'meeting', label: '会议', icon: 'users' },
   { id: 'files', label: '文件', icon: 'paperclip' },
+  { id: 'kb', label: '知识库', icon: 'library-big' },
   { id: 'plan', label: '计划', icon: 'calendar-check' },
   { id: 'activity', label: '全局记录', icon: 'activity' },
   { id: 'assistant', label: 'AI 助手', icon: 'bot' },
   { id: 'mindflow', label: 'Mindflow', icon: 'git-fork' },
 ];
 
+/* 生活面板的标签（科研 / 生活两个面板，顶部切换） */
+const LIFE_TABS = [
+  { id: 'life', label: '生活主页', icon: 'sun' },
+  { id: 'kb', label: '知识库', icon: 'library-big' },
+  { id: 'activity', label: '生活记录', icon: 'activity' },
+  { id: 'mindflow', label: 'Mindflow', icon: 'git-fork' },
+];
 const DEFAULT_SETTINGS = {
   rootFolder: '科研',
+  kbFolder: '知识库',
+  lifeFolder: '生活',
   openOnStartup: true,
   defaultTab: 'home',
   lastTab: 'home',
@@ -907,7 +917,47 @@ class WorkbenchView extends ItemView {
     })();
     try { return await this._mfOpening; } finally { this._mfOpening = null; }
   }
-  async onClose() { if (this.mfView) { try { await this.mfView.onClose(); this.mfView.unload(); } catch (e) { /* ignore */ } this.mfView = null; } if (this._ro) this._ro.disconnect(); clearTimeout(this._t); clearInterval(this._clockT); clearInterval(this._logT); if (this.tipEl) this.tipEl.remove(); }
+  /* 生活面板：把 Daily Hub 的主页嵌进来（常驻，切走只隐藏） */
+  async showLife() {
+    const pl = this.plugin;
+    if (!this.lifeHost) this.lifeHost = h(this.contentEl, 'div', { cls: 'rw-lifehost' });
+    this.lifeHost.style.display = '';
+    if (this.lifeView) { try { this.lifeView.refresh(); } catch (e) { /* ignore */ } return this.lifeView; }
+    if (this._lifeOpening) return this._lifeOpening;
+    this._lifeOpening = (async () => {
+      try { await pl._lifeReady; } catch (e) { /* ignore */ }
+      const C = pl.dhClasses;
+      if (!C || !pl.dailyHub || !pl.dailyHub.settings) { clear(this.lifeHost); h(this.lifeHost, 'div', { cls: 'rw-empty', text: '生活面板没有加载成功，打开开发者工具（Ctrl+Shift+I）看看报错' }); return null; }
+      const v = new C.DailyHubView(this.leaf, pl.dailyHub);
+      try { if (v.containerEl && v.containerEl !== this.lifeHost) v.containerEl.remove(); } catch (e) { /* ignore */ }
+      clear(this.lifeHost);
+      v.containerEl = this.lifeHost;
+      v.contentEl = h(this.lifeHost, 'div', { cls: 'view-content rw-dh-embed' });
+      v.load();
+      await v.onOpen();
+      this.lifeView = v;
+      return v;
+    })();
+    try { return await this._lifeOpening; } finally { this._lifeOpening = null; }
+  }
+  /* 知识库：按文件夹浏览（技术笔记、基础学科、读书笔记…） */
+  renderKb(el) {
+    const pl = this.plugin;
+    const base = pl.projectDir('__kb');
+    this.header(el, '知识库', '技术笔记、基础学科、读书笔记等长期积累的知识（文件夹：' + base + '），科研和生活都能用', 'library-big');
+    if (!this.app.vault.getAbstractFileByPath(base)) {
+      const e = h(el, 'div', { cls: 'rw-empty' });
+      h(e, 'div', { text: '还没有「' + base + '」文件夹。' });
+      this.btn(e, '新建知识库文件夹', 'folder-plus', async () => { await pl.ensureFolder(base); this.render(); }, 'mod-cta');
+      this.btn(e, '从另一个库导入…', 'import', () => pl.importVaultModal());
+      return;
+    }
+    const n = pl.countFiles(base);
+    const p = { name: '__kb', title: '知识库', base, file: null };
+    const sec = this.section(el, '知识库 · ' + n + ' 个文件', 'folder-tree');
+    this.renderFolderBrowser(sec.body, p);
+  }
+  async onClose() { if (this.lifeView) { try { await this.lifeView.onClose(); this.lifeView.unload(); } catch (e) { /* ignore */ } this.lifeView = null; } if (this.mfView) { try { await this.mfView.onClose(); this.mfView.unload(); } catch (e) { /* ignore */ } this.mfView = null; } if (this._ro) this._ro.disconnect(); clearTimeout(this._t); clearInterval(this._clockT); clearInterval(this._logT); if (this.tipEl) this.tipEl.remove(); }
 
   requestRefresh() {
     clearTimeout(this._t);
@@ -924,6 +974,7 @@ class WorkbenchView extends ItemView {
     root.classList.add('rw-root');
 
     const top = h(root, 'div', { cls: 'rw-topbar' });
+    this.modeEl = h(top, 'div', { cls: 'rw-mode', title: '切换科研 / 生活面板' });
     this.searchWrap = h(top, 'div', { cls: 'rw-search' });
     ic(this.searchWrap, 'search', 'rw-search-icon');
     this.searchInput = h(this.searchWrap, 'input', { cls: 'rw-search-input', attr: { type: 'text', placeholder: '搜索项目、文献、实验和笔记…（Enter 搜全文）' } });
@@ -1004,11 +1055,31 @@ class WorkbenchView extends ItemView {
     this.switchTab('detail');
   }
 
+  get mode() { return this.plugin.settings.appMode === 'life' ? 'life' : 'research'; }
+  /* 科研 / 生活 两个面板切换；各自记住上次停在哪个标签 */
+  setMode(m, tab) {
+    const st = this.plugin.settings;
+    if (m !== 'life') m = 'research';
+    st.appMode = m;
+    this.tab = tab || (m === 'life' ? st.lastLifeTab || 'life' : st.lastTab && !LIFE_TABS.some((t) => t.id === st.lastTab && t.id !== 'kb' && t.id !== 'mindflow') ? st.lastTab : 'home');
+    this.plugin.saveSettingsSoon();
+    this.render();
+  }
+  renderMode() {
+    if (!this.modeEl) return;
+    clear(this.modeEl);
+    for (const [id, label, icon] of [['research', '科研', 'flask-conical'], ['life', '生活', 'sun']]) {
+      const b = h(this.modeEl, 'button', { cls: 'rw-mode-btn' + (this.mode === id ? ' is-active' : '') });
+      ic(b, icon); h(b, 'span', { text: label });
+      b.addEventListener('click', () => { if (this.mode !== id) this.setMode(id); });
+    }
+  }
   renderTabs() {
     clear(this.tabsEl);
+    this.renderMode();
     const counts = {};
     for (const n of this.index.notes) counts[n.type] = (counts[n.type] || 0) + 1;
-    for (const t of TABS) {
+    for (const t of this.mode === 'life' ? LIFE_TABS : TABS) {
       const b = h(this.tabsEl, 'button', { cls: 'rw-tab' + (this.tab === t.id ? ' is-active' : '') });
       ic(b, t.icon);
       h(b, 'span', { text: t.label });
@@ -1037,9 +1108,13 @@ class WorkbenchView extends ItemView {
 
   switchTab(id, filter) {
     if (id === 'data') id = 'experiment';
+    // 从生活面板跳到科研的页面（或反过来）时，顺便切换面板
+    if (this.mode === 'life' && !LIFE_TABS.some((t) => t.id === id)) this.plugin.settings.appMode = 'research';
+    else if (this.mode === 'research' && id === 'life') this.plugin.settings.appMode = 'life';
     this.tab = id;
     if (filter) this.filters[id] = Object.assign({}, this.filters[id] || {}, filter);
-    if (id !== 'detail') this.plugin.settings.lastTab = id;
+    if (this.mode === 'life') this.plugin.settings.lastLifeTab = id;
+    else if (id !== 'detail') this.plugin.settings.lastTab = id;
     this.plugin.saveSettingsSoon();
     this.contentEl.scrollTop = 0;
     this.render();
@@ -1081,10 +1156,14 @@ class WorkbenchView extends ItemView {
     this.renderTabs();
     // Mindflow：常驻挂载，切走只隐藏（生成中的回答不会被打断）
     const mfMode = this.tab === 'mindflow';
-    this.contentEl.classList.toggle('rw-mfmode', mfMode);
-    this.bodyEl.style.display = mfMode ? 'none' : '';
+    const lifeMode = this.tab === 'life';
+    this.contentEl.classList.toggle('rw-mfmode', mfMode || lifeMode);
+    this.contentEl.classList.toggle('rw-lifemode', this.mode === 'life');
+    this.bodyEl.style.display = mfMode || lifeMode ? 'none' : '';
     if (this.mfHost) this.mfHost.style.display = mfMode ? '' : 'none';
+    if (this.lifeHost) this.lifeHost.style.display = lifeMode ? '' : 'none';
     if (mfMode) { this.bodyEl.style.minHeight = ''; this.showMindflow(); return; }
+    if (lifeMode) { this.bodyEl.style.minHeight = ''; this.showLife(); return; }
     clear(this.bodyEl);
     const el = this.bodyEl;
     try {
@@ -1092,6 +1171,7 @@ class WorkbenchView extends ItemView {
       else if (this.tab === 'projects') this.renderProjects(el);
       else if (NOTE_TYPES[this.tab]) this.renderNotesTab(el, this.tab === 'data' ? 'experiment' : this.tab);
       else if (this.tab === 'files') this.renderFiles(el);
+      else if (this.tab === 'kb') this.renderKb(el);
       else if (this.tab === 'detail' && this.detailProject && this.index.byName.has(this.detailProject)) this.renderDetail(el, this.index.byName.get(this.detailProject));
       else if (this.tab === 'plan') this.renderPlan(el);
       else if (this.tab === 'assistant') this.renderAssistant(el);
@@ -2161,7 +2241,7 @@ class WorkbenchView extends ItemView {
       r.addEventListener('contextmenu', (e) => this.folderMenu(e, p, f, r2));
       this.folderDropTarget(r, p, f.path);
     }
-    const shown = files.filter((f) => !(f.path === p.file.path));
+    const shown = files.filter((f) => !(p.file && f.path === p.file.path));
     if (!rel && shown.length && folders.length) h(list, 'div', { cls: 'rw-fb-label', text: '自由空间 · 直接放在项目里的文件' });
     const LIM = 40;
     const showAll = st['__all_' + cur];
@@ -3403,7 +3483,7 @@ class WorkbenchView extends ItemView {
     if (this.tab === 'activity' || (this.tab === 'home' && this.plugin.settings.homeLogMode === 'act')) this.requestRefresh();
   }
   renderActivityPage(el) {
-    const right = this.header(el, '全局记录', '工作台自动记下的每一次操作：新建、导入、加入灵感、移动、改名、删除、编辑、改状态。和手写的「科研日志」分开', 'activity');
+    const right = this.mode === 'life' ? this.header(el, '生活记录', '生活文件夹里自动记下的操作：新建、导入、移动、改名、删除、编辑。科研那边的操作在科研面板的「全局记录」里', 'activity') : this.header(el, '全局记录', '工作台自动记下的每一次操作：新建、导入、加入灵感、移动、改名、删除、编辑、改状态。和手写的「科研日志」分开；生活文件夹里的操作在生活面板的「生活记录」里', 'activity');
     this.btn(right, '打开记录文件', 'file-text', () => { const f = this.app.vault.getAbstractFileByPath(this.plugin.actPath(new Date())); if (f) this.plugin.openFile(f); else new Notice('这个月还没有记录'); }, 'rw-btn-sm');
     this.renderActivity(el, {});
   }
@@ -3442,6 +3522,8 @@ class WorkbenchView extends ItemView {
     h(list, 'div', { cls: 'rw-empty-sm', text: '加载中…' });
     (async () => {
       let all = await pl.readActivity(o.compact ? 7 : F.days);
+      // 科研面板只看科研 / 知识库的动作，生活面板只看生活的
+      { const lifeSide = this.mode === 'life'; all = all.filter((e) => (pl.scopeOfPath(e.p || '') === 'life') === lifeSide); }
       clear(list);
       if (o.compact) all = all.filter((e) => e.a !== 'edit');
       else {
@@ -3716,6 +3798,264 @@ class WorkbenchView extends ItemView {
 }
 
 /* ───────────────────────── 弹窗 ───────────────────────── */
+
+
+/* ═════════ 从另一个库导入（合并「自学集」等） ═════════
+   在电脑上直接读那个库的文件夹（Node fs），按规则复制进来：原库一个字都不改。
+   md 里指向原路径的 [[链接]] 会改成新路径；会议记录补上会议纪要属性；Daily Hub 的设置搬进生活面板。 */
+const IMPORT_SKIP_DIRS = new Set(['.obsidian', '.trash', '.git', '.smart-env', '.claude', '.agents', '.copilot', '.opencode', '.specstory', '.spider', '.vscode', 'node_modules']);
+const LIFE_CATS = ['健身', '饮食', '记账', '调养身颜', '练车', '想法', '想买做的事', '梦想中的场景', '刷视频内容监测', '阅读', '英语听力', '小说', '职业发展', '未知', '知识库转md进度', '待办规划'];
+/* 自学集 → 工作台 的默认规则（从上到下，先匹配到的生效；目标可以在导入窗口里改） */
+function zxjPresetRules(projects) {
+  const has = (n) => projects.includes(n);
+  const pick = (cands, fallback) => cands.find(has) || fallback;
+  const atk = pick(['doa对抗攻击', 'DOA物理对抗攻击'], 'doa对抗攻击');
+  const rev = pick(['DOA深度学习综述'], 'DOA深度学习综述');
+  const ca = pick(['CA1'], 'CA1');
+  const R = (src, dst, group, why, o) => Object.assign({ src, dst, group, why, on: true }, o || {});
+  const out = [
+    R('日期记录', '生活/日记', '生活', '每天的日记（上午 / 下午 / 晚上）'),
+    R('项目/主页设置.md', '生活/主页设置.md', '生活', 'Daily Hub 主页设置（写给自己、常用链接、项目说明）'),
+  ];
+  for (const c of LIFE_CATS) out.push(R('项目/' + c, '生活/记录/' + c, '生活', 'Daily Hub 生活类别'));
+  out.push(
+    R('项目/科研日志', '科研/日志/日记整理', '科研', 'Daily Hub 从日记里拆出来的科研日志'),
+    R('项目/会议记录', '科研/会议', '科研', '会议记录 → 工作台会议纪要（补上 type: meeting）', { meeting: true }),
+    R('项目/论文/攻击论文', '科研/项目/' + atk + '/进展记录', '科研', '攻击论文的每日进展 → 项目「' + atk + '」'),
+    R('项目/论文/综述论文', '科研/项目/' + rev + '/进展记录', '科研', '综述论文的每日进展 → 项目「' + rev + '」'),
+    R('项目/论文/每日一篇', '科研/文献/每日一篇', '科研', '每天读一篇的记录'),
+    R('项目/CA1计划', '科研/项目/' + ca + '/进展记录', '科研', 'CA1 计划进展 → 项目「' + ca + '」'),
+    R('项目/旁听', '科研/旁听', '科研', '旁听的课 / 讲座'),
+    R('项目/英语论文敲打', '科研/写作/英语论文敲打', '科研', '英文论文写作练习'),
+    R('项目', '生活/记录', '生活', '其他 Daily Hub 类别'),
+    R('科研/日志', '科研/日志/历史', '科研', '以前的科研日志（2025 起）'),
+    R('科研/计划/CA计划', '科研/项目/' + ca + '/计划', '科研', 'CA 计划和 UTS 表格 → 项目「' + ca + '」'),
+    R('科研/计划', '科研/计划', '科研', '年 / 季 / 月 / 周计划、实验布置、演讲词'),
+    R('科研/项目/线下实验', '科研/项目/' + atk + '/线下实验', '科研', '线下实验记录和结果 → 项目「' + atk + '」'),
+    R('科研/项目/综述', '科研/项目/' + rev + '/汇报材料', '科研', '综述范围调整的会议材料 → 项目「' + rev + '」'),
+    R('科研/项目/DOA物理对抗攻击.md', '科研/项目/' + atk + '/自学集-DOA物理对抗攻击.md', '科研', '旧库里的项目页'),
+    R('科研/项目/CA1综述.md', '科研/项目/' + ca + '/自学集-CA1综述.md', '科研', '旧库里的项目页'),
+    R('科研/模板', '科研/模板', '科研', '科研日记 / 周计划模板'),
+    R('科研', '科研/自学集导入', '科研', '科研文件夹里的其他文件'),
+    R('02_记录与成果', '知识库', '知识库', '技术笔记、基础学科、通信技术、应用、阅读、拓展学习、草稿、小说'),
+    R('03_工具与模板', '知识库/工具与模板', '知识库', '工具、模板、提示词、软件安装流程'),
+    R('01_任务与目标', '归档/自学集/01_任务与目标', '归档', ''),
+    R('99_归档', '归档/自学集/99_归档', '归档', ''),
+    R('attachments', '归档/自学集/attachments', '归档', '根目录的图片附件（笔记里按文件名引用，放哪都能显示）'),
+    R('Excalidraw', '归档/自学集/Excalidraw', '归档', 'Excalidraw 画图（需要 Excalidraw 插件才能编辑）'),
+    R('templates', '归档/自学集/templates', '归档', ''),
+    R('markitdown-output', '归档/自学集/markitdown-output', '归档', '转换出来的文档'),
+    R('文件', '归档/自学集/文件', '归档', ''),
+    R('_QClaw', '归档/自学集/_QClaw', '不导入', 'QClaw 助手的记忆文件', { on: false }),
+    R('copilot', '归档/自学集/copilot', '不导入', 'Copilot 插件数据', { on: false }),
+    R('copilot-custom-prompts', '归档/自学集/copilot-custom-prompts', '不导入', 'Copilot 插件数据', { on: false }),
+    R('obsidian-ruby-translator', '归档/自学集/obsidian-ruby-translator', '不导入', '插件数据', { on: false }),
+    R('Weave EPUB Reader', '归档/自学集/Weave EPUB Reader', '不导入', '插件数据', { on: false }),
+    R('Spider Maps', '归档/自学集/Spider Maps', '不导入', '插件数据', { on: false }),
+    R('', '归档/自学集', '归档', '根目录其他文件（主页.md、canvas、base…）'),
+  );
+  return out;
+}
+function genericRules(name) { return [{ src: '', dst: '导入/' + (sanitize(name) || '其他库'), group: '归档', why: '整个库原样放进一个文件夹', on: true }]; }
+function ruleFor(rules, rel) {
+  for (const r of rules) {
+    if (r.src === '') return r;
+    if (rel === r.src || rel.startsWith(r.src + '/')) return r;
+  }
+  return null;
+}
+function mapPath(r, rel) {
+  if (r.src === '') return normalizePath(r.dst + '/' + rel);
+  if (rel === r.src) return normalizePath(r.dst);
+  return normalizePath(r.dst + rel.slice(r.src.length));
+}
+
+class ImportVaultModal extends Modal {
+  constructor(app, plugin) { super(app); this.plugin = plugin; this.src = plugin.settings.importSrc || ''; this.files = null; this.rules = null; this.busy = false; }
+  fs() { try { return require('fs'); } catch (e) { return null; } }
+  pathMod() { try { return require('path'); } catch (e) { return null; } }
+  onOpen() {
+    this.modalEl.classList.add('rw-import-modal');
+    this.titleEl.setText('从另一个库导入');
+    this.contentEl.classList.add('rw-modal');
+    const fs = this.fs();
+    if (!this.src && fs) { for (const c of ['D:\\Documents\\自学集', 'D:/Documents/自学集']) { try { if (fs.existsSync(c)) { this.src = c; break; } } catch (e) { /* ignore */ } } }
+    this.draw();
+  }
+  draw() {
+    const c = this.contentEl; clear(c);
+    const fs = this.fs();
+    if (!fs || IS_MOBILE) { h(c, 'div', { cls: 'rw-empty', text: '导入需要在电脑上的 Obsidian 里做（要直接读另一个库的文件夹）。' }); return; }
+    h(c, 'div', { cls: 'rw-muted', text: '把另一个 Obsidian 库的文件按下面的规则复制进当前库。原来的库不会被改动；同名文件不会覆盖。' });
+    const row = h(c, 'div', { cls: 'rw-att-bar' });
+    const inp = h(row, 'input', { cls: 'rw-att-q', attr: { type: 'text', placeholder: '另一个库的文件夹路径，比如 D:\\Documents\\自学集' } });
+    inp.value = this.src;
+    inp.addEventListener('input', () => { this.src = inp.value.trim(); });
+    const scan = h(row, 'button', { cls: 'rw-btn mod-cta', text: this.files ? '重新扫描' : '扫描' });
+    scan.addEventListener('click', () => this.scan());
+    if (this.err) h(c, 'div', { cls: 'rw-imp-err', text: this.err });
+    if (!this.files) return;
+    const total = this.files.length;
+    const plan = this.plan();
+    const on = plan.filter((x) => x.rule && x.rule.on);
+    h(c, 'div', { cls: 'rw-imp-sum', text: '共 ' + total + ' 个文件，按下面的规则会复制 ' + on.length + ' 个（' + fmtSize(on.reduce((a, x) => a + x.size, 0)) + '）' + (this.isZxj ? ' · 已识别为「自学集」，用了对应的规则' : '') });
+    // 规则表
+    const tbl = h(c, 'div', { cls: 'rw-imp-rules' });
+    const groups = ['生活', '科研', '知识库', '归档', '不导入'];
+    for (const g of groups) {
+      const rs = this.rules.filter((r) => r.group === g);
+      if (!rs.length) continue;
+      h(tbl, 'div', { cls: 'rw-imp-group', text: { 生活: '🌿 生活', 科研: '🧪 科研', 知识库: '📚 知识库', 归档: '🗄 归档', 不导入: '⏸ 默认不导入（插件数据等）' }[g] });
+      for (const r of rs) {
+        const items = plan.filter((x) => x.rule === r);
+        if (!items.length) continue;
+        const rr = h(tbl, 'div', { cls: 'rw-imp-rule' + (r.on ? '' : ' is-off') });
+        const cb = h(rr, 'input', { attr: { type: 'checkbox' } }); cb.checked = r.on;
+        cb.addEventListener('change', () => { r.on = cb.checked; this.draw(); });
+        const src = h(rr, 'div', { cls: 'rw-imp-src' });
+        h(src, 'div', { cls: 'rw-imp-path', text: (r.src || '（根目录其他）') + (r.src && !/\.\w+$/.test(r.src) ? '/' : '') });
+        h(src, 'div', { cls: 'rw-muted', text: items.length + ' 个文件 · ' + fmtSize(items.reduce((a, x) => a + x.size, 0)) + (r.why ? ' · ' + r.why : '') });
+        h(rr, 'span', { cls: 'rw-imp-arrow', text: '→' });
+        const dst = h(rr, 'input', { cls: 'rw-imp-dst', attr: { type: 'text' } }); dst.value = r.dst;
+        dst.addEventListener('change', () => { r.dst = normalizePath(dst.value.trim() || r.dst); });
+      }
+    }
+    const opts = h(c, 'div', { cls: 'rw-imp-opts' });
+    const opt = (key, label, def) => { const l = h(opts, 'label', { cls: 'rw-check' }); const x = h(l, 'input', { attr: { type: 'checkbox' } }); x.checked = this[key] = this[key] === undefined ? def : this[key]; x.addEventListener('change', () => { this[key] = x.checked; }); h(l, 'span', { text: label }); };
+    opt('optLinks', '把 md 里指向原位置的 [[链接]] 改成新位置', true);
+    opt('optMeeting', '会议记录补上会议纪要属性（type: meeting、日期）', true);
+    if (this.hasDh) opt('optDh', '把 Daily Hub 的设置（写给自己、常用链接、项目说明、类别顺序）搬进生活面板', true);
+    const bar = h(c, 'div', { cls: 'rw-kind-ed-bar' });
+    this.progEl = h(bar, 'span', { cls: 'rw-muted' });
+    h(bar, 'span', { cls: 'rw-spacer' });
+    const cancel = h(bar, 'button', { cls: 'rw-btn', text: '关闭' }); cancel.addEventListener('click', () => this.close());
+    const go = h(bar, 'button', { cls: 'rw-btn mod-cta', text: '开始导入 ' + on.length + ' 个文件' }); go.addEventListener('click', () => this.run());
+    this.goBtn = go;
+  }
+  async scan() {
+    const fs = this.fs(), pm = this.pathMod();
+    this.err = '';
+    const root = String(this.src || '').trim().replace(/[\\/]+$/, '');
+    try { if (!root || !fs.statSync(root).isDirectory()) throw new Error('not dir'); } catch (e) { this.err = '找不到这个文件夹：' + root; this.files = null; this.draw(); return; }
+    const vaultBase = this.app.vault.adapter && this.app.vault.adapter.getBasePath ? this.app.vault.adapter.getBasePath() : '';
+    if (vaultBase && pm && pm.resolve(vaultBase) === pm.resolve(root)) { this.err = '这就是当前库，不用导入'; this.draw(); return; }
+    const out = [];
+    const walk = (dir, rel) => {
+      let list = [];
+      try { list = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+      for (const d of list) {
+        if (d.name.startsWith('.')) continue;
+        const full = pm.join(dir, d.name);
+        const r = rel ? rel + '/' + d.name : d.name;
+        if (d.isDirectory()) { if (!IMPORT_SKIP_DIRS.has(d.name)) walk(full, r); }
+        else if (d.isFile()) { let size = 0; try { size = fs.statSync(full).size; } catch (e) { /* ignore */ } out.push({ rel: r, full, size }); }
+      }
+    };
+    walk(root, '');
+    this.files = out;
+    this.root = root;
+    this.isZxj = out.some((f) => f.rel.startsWith('日期记录/')) && out.some((f) => f.rel.startsWith('项目/'));
+    this.hasDh = fs.existsSync(pm.join(root, '.obsidian', 'plugins', 'daily-hub', 'data.json'));
+    const projects = this.plugin.buildIndex().projects.map((p) => p.name);
+    this.rules = this.isZxj ? zxjPresetRules(projects) : genericRules(pm.basename(root));
+    this.plugin.settings.importSrc = root; this.plugin.saveSettingsSoon();
+    this.draw();
+  }
+  plan() { return this.files.map((f) => { const rule = ruleFor(this.rules, f.rel); return Object.assign({}, f, { rule, dst: rule ? mapPath(rule, f.rel) : '' }); }); }
+  async run() {
+    if (this.busy) return;
+    const fs = this.fs();
+    const plan = this.plan().filter((x) => x.rule && x.rule.on);
+    if (!plan.length) return new Notice('没有要导入的文件');
+    this.busy = true; this.goBtn.disabled = true;
+    const pl = this.plugin, vault = this.app.vault;
+    // 原路径（不带 .md）→ 新路径，用来改链接
+    const linkMap = new Map();
+    for (const x of plan) { linkMap.set(x.rel, x.dst); if (/\.md$/i.test(x.rel)) linkMap.set(x.rel.replace(/\.md$/i, ''), x.dst.replace(/\.md$/i, '')); }
+    const fixLinks = (text) => text.replace(/(!?\[\[)([^\]|#\n]+)([^\]\n]*\]\])/g, (m, a, t, b) => { const k = t.trim(); const v = linkMap.get(k) || linkMap.get(k + '.md'); return v ? a + (linkMap.has(k) ? v : v.replace(/\.md$/i, '')) + b : m; })
+      .replace(/(\]\(<?)([^)>\s]+)(>?\))/g, (m, a, t, b) => { let k = t; try { k = decodeURIComponent(t); } catch (e) { /* ignore */ } const v = linkMap.get(k); return v ? a + encodeURI(v) + b : m; });
+    let ok = 0, skip = 0, renamed = 0, fail = 0;
+    const fails = [];
+    pl._actMute = true;
+    try {
+      for (let i = 0; i < plan.length; i++) {
+        const x = plan[i];
+        if (i % 20 === 0) { this.progEl.setText('正在复制 ' + (i + 1) + ' / ' + plan.length + '…'); await new Promise((r) => setTimeout(r, 0)); }
+        try {
+          let dst = x.dst;
+          const isText = /\.(md|canvas|base)$/i.test(dst);
+          let text = null;
+          if (isText) {
+            text = fs.readFileSync(x.full, 'utf8');
+            if (this.optLinks !== false) text = fixLinks(text);
+            if (/\.md$/i.test(dst) && x.rule.meeting && this.optMeeting !== false) text = addMeetingFm(text, x.rel);
+          }
+          const exists = vault.getAbstractFileByPath(dst);
+          if (exists) {
+            // 已经有了（比如以前导入过）：内容一样就跳过，不一样才另存一份
+            if (exists instanceof TFile && !isText && exists.stat && exists.stat.size === x.size) { skip++; continue; }
+            if (exists instanceof TFile && isText) {
+              const body = (t) => String(t || '').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '').replace(/\s+/g, ' ').trim();
+              const cur = body(await vault.cachedRead(exists));
+              const raw = body(fs.readFileSync(x.full, 'utf8'));
+              if (cur === body(text) || cur === raw || (raw.length > 40 && cur.includes(raw))) { skip++; continue; }
+            }
+            const ext = extOf(dst); const base = ext ? dst.slice(0, -(ext.length + 1)) : dst;
+            let k = 1; dst = base + '（自学集）' + (ext ? '.' + ext : '');
+            while (vault.getAbstractFileByPath(dst)) dst = base + '（自学集 ' + ++k + '）' + (ext ? '.' + ext : '');
+            renamed++;
+          }
+          await pl.ensureFolder(dst.split('/').slice(0, -1).join('/'));
+          if (isText) {
+            await vault.create(dst, text);
+          } else {
+            const buf = fs.readFileSync(x.full);
+            await vault.createBinary(dst, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+          }
+          ok++;
+        } catch (e) { fail++; if (fails.length < 8) fails.push(x.rel + '：' + (e.message || e)); }
+      }
+      if (this.hasDh && this.optDh !== false) await this.importDh();
+    } finally { pl._actMute = false; this.busy = false; }
+    pl.act({ a: 'import', p: (this.rules.find((r) => r.on) || {}).dst || '', n: '从「' + this.root.split(/[\\/]/).pop() + '」导入 ' + ok + ' 个文件', s: '工作台' });
+    this.progEl.setText('');
+    const msg = '✅ 导入完成：复制 ' + ok + ' 个' + (skip ? '，跳过已存在的 ' + skip + ' 个' : '') + (renamed ? '，' + renamed + ' 个同名文件加了「（自学集）」后缀' : '') + (fail ? '，失败 ' + fail + ' 个' : '');
+    new Notice(msg, 10000);
+    clear(this.contentEl);
+    h(this.contentEl, 'div', { cls: 'rw-imp-done', text: msg });
+    if (fails.length) { const ul = h(this.contentEl, 'ul', { cls: 'rw-muted' }); for (const f of fails) h(ul, 'li', { text: f }); }
+    h(this.contentEl, 'div', { cls: 'rw-muted', text: '原来的库没有改动。确认没问题后，原库要不要删由你决定。' });
+    const bar = h(this.contentEl, 'div', { cls: 'rw-kind-ed-bar' });
+    const life = h(bar, 'button', { cls: 'rw-btn mod-cta', text: '打开生活面板' }); life.addEventListener('click', () => { this.close(); pl.openLife(); });
+    const close = h(bar, 'button', { cls: 'rw-btn', text: '关闭' }); close.addEventListener('click', () => this.close());
+    pl.refreshViews();
+  }
+  /* Daily Hub 的设置搬进生活面板（不搬 AI 密钥：生活面板默认用工作台的 AI） */
+  async importDh() {
+    const fs = this.fs(), pm = this.pathMod();
+    let d = null;
+    try { d = JSON.parse(fs.readFileSync(pm.join(this.root, '.obsidian', 'plugins', 'daily-hub', 'data.json'), 'utf8')); } catch (e) { return; }
+    const dh = this.plugin.dailyHub;
+    if (!dh || !dh.settings || !d) return;
+    const mapDir = (p) => { const r = ruleFor(this.rules, p); return r && r.on ? mapPath(r, p) : null; };
+    for (const k of ['memo', 'showMemo', 'clampLongNotes', 'phoneWeekView', 'launcherLimit', 'sideTab', 'showDoneTodos', 'aiExtraPrompt', 'projectHints']) if (d[k] !== undefined) dh.settings[k] = d[k];
+    if (Array.isArray(d.links)) dh.settings.links = d.links.filter((l) => l && l.url);
+    if (Array.isArray(d.projectOrder)) dh.settings.projectOrder = d.projectOrder.map(mapDir).filter((x) => x && x.startsWith(normalizePath(dh.settings.projectRoot) + '/'));
+    if (Array.isArray(d.archivedProjects)) dh.settings.archivedProjects = d.archivedProjects.map(mapDir).filter(Boolean);
+    await dh.saveSettings();
+  }
+  onClose() { clear(this.contentEl); }
+}
+/* 会议记录：没有 type 的补上 type: meeting / 日期 / 状态 */
+function addMeetingFm(text, rel) {
+  const name = rel.split('/').pop().replace(/\.md$/i, '');
+  const dm = name.match(/(\d{4}-\d{2}-\d{2})/);
+  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  if (m && /^type\s*:/m.test(m[1])) return text;
+  const add = ['type: meeting', 'status: 已整理'].concat(dm && !(m && /^date\s*:/m.test(m[1])) ? ['date: ' + dm[1]] : []);
+  if (m) return '---\n' + m[1] + '\n' + add.join('\n') + '\n---\n' + text.slice(m[0].length);
+  return '---\n' + add.join('\n') + '\n---\n' + text;
+}
 
 /* 待办窗口：在计划页 / 日历里点待办，直接在这里改内容、日期、时间、备注、完成，不用跳到原笔记 */
 class TaskModal extends Modal {
@@ -5378,7 +5718,8 @@ class FolderPickModal extends Modal {
     clear(c);
     const pl = this.plugin;
     // 目标项目：可以换成别的项目（跨项目移动）
-    const projects = pl.buildIndex().projects.filter((p) => p.status !== '已完成' || p.name === this.project || p.name === this.o.from);
+    const projects = pl.buildIndex().projects.filter((p) => p.status !== '已完成' || p.name === this.project || p.name === this.o.from).map((p) => ({ name: p.name, title: p.title }));
+    projects.push({ name: '__kb', title: '📚 知识库' }, { name: '__life', title: '🌿 生活' });
     if (!this.project && projects.length) this.project = this.o.from || projects[0].name;
     const top = h(c, 'div', { cls: 'rw-fp-top' });
     h(top, 'span', { cls: 'rw-muted', text: '移到项目：' });
@@ -5398,7 +5739,7 @@ class FolderPickModal extends Modal {
       if (sub) h(mid, 'div', { cls: 'rw-row-sub', text: sub });
       r.addEventListener('click', async () => { this.close(); await this.cb(path); });
     };
-    row('项目自由空间（' + this.project + ' 根目录）', base, 0, 'folder-open');
+    row(this.project === '__kb' ? '知识库根目录' : this.project === '__life' ? '生活根目录' : '项目自由空间（' + this.project + ' 根目录）', base, 0, 'folder-open');
     for (const f of pl.projectFolderList(this.project)) { if (this.o.exclude && (f.path === this.o.exclude || f.path.startsWith(this.o.exclude + '/'))) continue; row(f.name, f.path, f.depth + 1, 'folder', f.auto ? '工作台自动归档' : ''); }
     const nb = h(c, 'button', { cls: 'rw-btn rw-btn-sm rw-fp-new' });
     ic(nb, 'folder-plus'); h(nb, 'span', { text: '新建文件夹…' });
@@ -7304,6 +7645,30 @@ class WorkbenchSettingTab extends PluginSettingTab {
       tab.containerEl = box;
       try { tab.display(); } catch (e) { h(box, 'div', { cls: 'rw-muted', text: 'Mindflow 设置加载失败：' + e.message }); }
     }
+    // ── 生活面板（合并进来的 Daily Hub） ──
+    const dhp = this.plugin.dailyHub;
+    if (dhp && dhp.settings && this.plugin.lifeSettingTab) {
+      new Setting(containerEl).setName('生活面板（Daily Hub）').setHeading();
+      new Setting(containerEl).setName('生活面板使用工作台的 AI 接口').setDesc('打开 = 「AI 整理日记」和上面「AI」一节共用接口、密钥和模型。关掉后可以在下面单独配')
+        .addToggle((t) => t.setValue(dhp.settings.useHostAi !== false).onChange(async (v) => { dhp.settings.useHostAi = v; await dhp.saveSettings(); this.display(); }));
+      new Setting(containerEl).setName('日记里的科研内容写进科研日志').setDesc('AI 整理日记时，读文献、做实验、写论文、组会这类内容不放进生活类别，而是写进科研工作台的「科研日志」（带 #日记整理 标签），生活和科研分开')
+        .addToggle((t) => t.setValue(dhp.settings.researchTarget !== false).onChange(async (v) => { dhp.settings.researchTarget = v; await dhp.saveSettings(); }));
+      const box = h(containerEl, 'div', { cls: 'rw-mf-settings rw-life-settings' });
+      const tab = this.plugin.lifeSettingTab;
+      tab.containerEl = box;
+      try {
+        tab.display();
+        if (dhp.settings.useHostAi !== false) {
+          const heads = [...box.querySelectorAll('.setting-item-heading')];
+          const a = heads.find((x) => /AI 识别/.test(x.textContent));
+          if (a) { const b = heads[heads.indexOf(a) + 1]; let n = a.nextSibling; while (n && n !== b) { const nx = n.nextSibling; if (!(n.textContent || '').includes('额外要求') && !(n.textContent || '').includes('项目说明')) n.remove(); n = nx; } const tip = document.createElement('div'); tip.className = 'setting-item-description rw-mf-ai-tip'; tip.textContent = '正在使用科研工作台的 AI 接口（' + (this.plugin.settings.llmModel || '未设置模型') + '）。'; a.after(tip); }
+        }
+      } catch (e) { h(box, 'div', { cls: 'rw-muted', text: '生活面板设置加载失败：' + e.message }); }
+    }
+    new Setting(containerEl).setName('知识库文件夹').setDesc('「知识库」标签浏览的文件夹（技术笔记、基础学科、读书笔记…），科研和生活两个面板都能看')
+      .addText((t) => t.setPlaceholder('知识库').setValue(s.kbFolder || '').onChange(async (v) => { s.kbFolder = v.trim() || '知识库'; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('从另一个库导入').setDesc('把另一个 Obsidian 库（比如「自学集」）的日记、生活记录、科研记录、知识笔记按规则复制进来，原来的库不动')
+      .addButton((b) => b.setButtonText('打开导入…').onClick(() => this.plugin.importVaultModal()));
     new Setting(containerEl).setName('其他').setHeading();
     new Setting(containerEl).setName('全局记录（自动）').setDesc('自动记下新建、导入、加入灵感、移动、改名、删除、编辑、改状态，存在「工作台数据/全局记录/年-月.md」，和手写的科研日志分开')
       .addToggle((t) => t.setValue(s.activityOn !== false).onChange(async (v) => { s.activityOn = v; await this.plugin.saveSettings(); }));
@@ -13542,6 +13907,2742 @@ module.exports._classes = { CanvasMindflowPlugin, MindflowChat, MindflowChatView
 }
 /* ======== MINDFLOW-END ======== */
 
+/* ======== DAILY-HUB-START（生活面板：移植自自己写的 Daily Hub 插件） ======== */
+const __dh = { exports: {}, __host: null, loaded: false };
+function __loadDailyHub(host) {
+  if (__dh.loaded) return __dh.exports;
+  __dh.__host = host;
+  (function (module, exports, require) {
+'use strict';
+
+const {
+  Component,
+  ItemView,
+  Keymap,
+  MarkdownRenderer,
+  Modal,
+  Notice,
+  Platform,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+  normalizePath,
+  requestUrl,
+  setIcon,
+} = require("obsidian");
+
+const VIEW_TYPE = "rw-daily-hub-view";
+const DATE_NAME_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"];
+const WEEKDAY_FULL = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
+const AI_START = "<!-- daily-hub:ai-start -->";
+const AI_END = "<!-- daily-hub:ai-end -->";
+
+const DEFAULT_MEMO = [
+  "写给自己的一段话：最近想做的事、提醒自己的原则……",
+  "- 待办是必须要做的事",
+  "- 想做的事是想，不是必要",
+].join("\n");
+
+const DEFAULT_SETTINGS = {
+  title: "生活",
+  lifeRoot: "生活",
+  dateRecordFolder: "生活/日记",
+  projectRoot: "生活/记录",
+  ignoredFolderNames: ["attachments", "assets", "附件"],
+  excludedFolderPrefixes: [],
+  projectOrder: [],
+  archivedProjects: [],
+  launcherLimit: 10,
+  memo: DEFAULT_MEMO,
+  showMemo: true,
+  clampLongNotes: true,
+  phoneWeekView: true,
+  openOnStartup: false,
+  replaceNewTabs: false,
+  aiProvider: "deepseek",
+  aiKeys: {},
+  aiBaseUrl: "https://api.deepseek.com",
+  aiApiKey: "",
+  aiModel: "deepseek-chat",
+  sideTab: "memo",
+  todoFolder: "生活/记录/待办规划",
+  showDoneTodos: false,
+  syncToFile: true,
+  syncFilePath: "生活/主页设置.md",
+  links: [],
+  useHostAi: true,
+  researchTarget: true,
+  aiExtraPrompt: "",
+  projectHints: "",
+};
+
+const AI_PROVIDERS = [
+  { id: "deepseek", name: "DeepSeek", baseUrl: "https://api.deepseek.com", model: "deepseek-chat", format: "openai" },
+  { id: "openai", name: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini", format: "openai" },
+  { id: "anthropic", name: "Claude（Anthropic）", baseUrl: "https://api.anthropic.com/v1", model: "claude-haiku-4-5-20251001", format: "anthropic" },
+  { id: "gemini", name: "Gemini（Google）", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-2.5-flash", format: "openai" },
+  { id: "moonshot", name: "Kimi（月之暗面）", baseUrl: "https://api.moonshot.cn/v1", model: "moonshot-v1-8k", format: "openai" },
+  { id: "qwen", name: "通义千问（阿里云百炼）", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-plus", format: "openai" },
+  { id: "zhipu", name: "智谱 GLM", baseUrl: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4-flash", format: "openai" },
+  { id: "siliconflow", name: "硅基流动 SiliconFlow", baseUrl: "https://api.siliconflow.cn/v1", model: "deepseek-ai/DeepSeek-V3", format: "openai" },
+  { id: "openrouter", name: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", model: "openai/gpt-4o-mini", format: "openai" },
+  { id: "ollama", name: "Ollama（本地，无需 Key）", baseUrl: "http://localhost:11434/v1", model: "qwen2.5:7b", format: "openai", noKey: true },
+  { id: "custom", name: "自定义（OpenAI 兼容）", baseUrl: "", model: "", format: "openai" },
+];
+const providerOf = (id) => AI_PROVIDERS.find((p) => p.id === id) || AI_PROVIDERS[AI_PROVIDERS.length - 1];
+
+/* ---------- 设置 <-> 笔记文件同步 ---------- */
+
+const SYNC_SECTIONS = [
+  ["memo", "写给自己"],
+  ["links", "常用链接"],
+  ["projectHints", "项目说明"],
+  ["excludedFolderPrefixes", "排除的目录"],
+  ["aiExtraPrompt", "额外要求"],
+];
+const SYNC_MARK = /^##\s.*<!--\s*dh:(\w+)\s*-->\s*$/;
+
+function buildSyncFile(s) {
+  const out = [
+    "---",
+    "daily-hub: settings",
+    "---",
+    "",
+    "> [!info] Daily Hub 主页设置",
+    "> 这个笔记和插件设置双向同步：在这里改，设置会跟着变；在设置里改，这里也会更新。",
+    "> 请保留每个二级标题末尾的 `<!-- dh:… -->` 标记，标题之间的内容可以随意修改。",
+    "",
+  ];
+  for (const [key, title] of SYNC_SECTIONS) {
+    out.push(`## ${title} <!-- dh:${key} -->`, "");
+    if (key === "links") {
+      for (const l of s.links || []) {
+        if (!l || !(l.url || l.name)) continue;
+        out.push(`- [${(l.name || "").replace(/[\[\]]/g, "")}](<${l.url || ""}>)`);
+      }
+    } else if (key === "projectHints") {
+      for (const line of (s.projectHints || "").split(/\r?\n/)) if (line.trim()) out.push(`- ${line.trim()}`);
+    } else if (key === "excludedFolderPrefixes") {
+      for (const x of s.excludedFolderPrefixes || []) out.push(`- ${x}`);
+    } else {
+      const v = (s[key] || "").trim();
+      if (v) out.push(v);
+    }
+    out.push("");
+  }
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
+}
+
+function parseSyncFile(text) {
+  const body = text.replace(/^---\n[\s\S]*?\n---\n?/, "");
+  const sections = {};
+  let cur = null;
+  for (const line of body.split(/\r?\n/)) {
+    const m = line.match(SYNC_MARK);
+    if (m) {
+      cur = m[1];
+      sections[cur] = [];
+    } else if (cur) {
+      sections[cur].push(line);
+    }
+  }
+  const out = {};
+  const bullet = (l) => l.replace(/^\s*[-*+]\s+/, "").trim();
+  if (sections.memo) out.memo = sections.memo.join("\n").trim();
+  if (sections.aiExtraPrompt) out.aiExtraPrompt = sections.aiExtraPrompt.join("\n").trim();
+  if (sections.projectHints) {
+    out.projectHints = sections.projectHints.filter((l) => l.trim()).map(bullet).filter(Boolean).join("\n");
+  }
+  if (sections.excludedFolderPrefixes) {
+    out.excludedFolderPrefixes = sections.excludedFolderPrefixes
+      .filter((l) => /^\s*[-*+]\s+\S/.test(l))
+      .map((l) => bullet(l).replace(/^`|`$/g, ""))
+      .filter(Boolean);
+  }
+  if (sections.links) {
+    out.links = [];
+    for (const l of sections.links) {
+      const m = l.match(/^\s*[-*+]\s+\[([^\]]*)\]\(\s*<?([^>)]*?)>?\s*\)/);
+      if (m) out.links.push({ name: m[1].trim(), url: m[2].trim() });
+      else if (/^\s*[-*+]\s+https?:\/\//.test(l)) {
+        const u = bullet(l);
+        out.links.push({ name: u, url: u });
+      }
+    }
+  }
+  return out;
+}
+
+/* ---------- helpers ---------- */
+
+const pad = (n) => String(n).padStart(2, "0");
+const keyOf = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const parseKey = (k) => {
+  const [y, m, d] = k.split("-").map(Number);
+  return new Date(y, m - 1, d, 12);
+};
+const monthStart = (d) => new Date(d.getFullYear(), d.getMonth(), 1, 12);
+const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n, 12);
+const addMonths = (d, n) => new Date(d.getFullYear(), d.getMonth() + n, 1, 12);
+const weekStart = (d) => addDays(d, -((d.getDay() + 6) % 7));
+const monthPrefix = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
+const shortDate = (k) => {
+  const d = parseKey(k);
+  return `${d.getMonth() + 1} 月 ${d.getDate()} 日`;
+};
+
+function greeting(hour) {
+  if (hour < 5) return "夜深了";
+  if (hour < 9) return "早上好";
+  if (hour < 12) return "上午好";
+  if (hour < 14) return "中午好";
+  if (hour < 18) return "下午好";
+  return "晚上好";
+}
+
+function isFolder(item) {
+  return Boolean(item) && Array.isArray(item.children);
+}
+
+function collectProjectTargets(folder, rootPath, ignored, out = []) {
+  const children = Array.isArray(folder?.children) ? folder.children : [];
+  const sub = children.filter((c) => isFolder(c) && !ignored.has(c.name));
+  const hasMd = children.some((c) => c?.extension === "md");
+  if (folder.path !== rootPath && (hasMd || sub.length === 0)) out.push(folder);
+  for (const f of sub) collectProjectTargets(f, rootPath, ignored, out);
+  return out;
+}
+
+function stripAiBlock(text) {
+  const s = text.indexOf(AI_START);
+  const e = text.indexOf(AI_END);
+  if (s === -1 || e === -1 || e < s) return text;
+  return (text.slice(0, s) + text.slice(e + AI_END.length)).trim();
+}
+
+/* ---------- 日常记录：按上午 / 下午 / 晚上整理的时间线 ---------- */
+
+const PERIODS = [
+  { key: "上午", from: 0, to: 12 * 60, icon: "sunrise" },
+  { key: "下午", from: 12 * 60, to: 18 * 60, icon: "sun" },
+  { key: "晚上", from: 18 * 60, to: 24 * 60, icon: "moon" },
+];
+const PERIOD_HEAD_RE = /^(#{1,6})\s*(上午|下午|晚上)\s*$/;
+const ENTRY_RE = /^[-*+]\s+(\d{1,2})[:：](\d{2})(?:\s+(.*))?$/;
+
+const periodOf = (min) => PERIODS.find((p) => min >= p.from && min < p.to) || PERIODS[2];
+const fmtTime = (min) => `${pad(Math.floor(min / 60))}:${pad(min % 60)}`;
+const parseTime = (str) => {
+  const m = String(str || "").match(/^(\d{1,2})[:：](\d{2})$/);
+  if (!m || +m[1] > 23 || +m[2] > 59) return null;
+  return +m[1] * 60 + +m[2];
+};
+
+function splitFrontmatter(text) {
+  const m = text.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/);
+  return m ? [m[0], text.slice(m[0].length)] : ["", text];
+}
+
+/** 取出所有「- HH:mm 内容」条目（含缩进的续行），返回剩余行与条目 */
+function extractEntries(lines) {
+  const rest = [];
+  const entries = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = lines[i].match(ENTRY_RE);
+    if (m && +m[1] < 24 && +m[2] < 60) {
+      const raw = [lines[i]];
+      while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1])) {
+        i += 1;
+        raw.push(lines[i]);
+      }
+      const min = +m[1] * 60 + +m[2];
+      const text = [m[3] || "", ...raw.slice(1).map((l) => l.replace(/^(\t| {1,4})/, ""))].join("\n").trim();
+      entries.push({ min, time: fmtTime(min), text, raw: raw.join("\n") });
+    } else {
+      rest.push(lines[i]);
+    }
+  }
+  return { rest, entries };
+}
+
+function entryToLines(min, text) {
+  const parts = String(text).replace(/\r/g, "").trim().split("\n");
+  return [`- ${fmtTime(min)} ${parts[0]}`, ...parts.slice(1).map((l) => (l.trim() ? `  ${l}` : "  "))];
+}
+
+/**
+ * 整理日常记录：把所有带时间的条目按时间归入「上午 / 下午 / 晚上」标题下并排序。
+ * 其他文字保持原位不动。add: 要新增的条目；removeRaw: 要删除的条目原文。
+ */
+function organizeDaily(text, { add = [], removeRaw = null, addText = null } = {}) {
+  const [fm, body] = splitFrontmatter(text || "");
+  const { rest, entries } = extractEntries(body.split(/\r?\n/));
+  if (removeRaw !== null) {
+    const i = entries.findIndex((e) => e.raw === removeRaw);
+    if (i >= 0) entries.splice(i, 1);
+  }
+  for (const a of add) entries.push({ min: a.min, lines: entryToLines(a.min, a.text) });
+  entries.sort((a, b) => a.min - b.min);
+
+  const lines = rest;
+  const headIndex = (key) => lines.findIndex((l) => (l.match(PERIOD_HEAD_RE) || [])[2] === key);
+  // 缺少的时段标题按 上午→下午→晚上 的顺序补上
+  for (const [pi, p] of PERIODS.entries()) {
+    const needed = entries.some((e) => periodOf(e.min) === p) || (addText && addText.key === p.key);
+    if (!needed || headIndex(p.key) !== -1) continue;
+    const later = PERIODS.slice(pi + 1).map((q) => headIndex(q.key)).filter((i) => i !== -1);
+    const heading = `## ${p.key}`;
+    if (later.length) lines.splice(Math.min(...later), 0, heading, "");
+    else lines.push("", heading, "");
+  }
+  // 从后往前插入，避免下标错位
+  const order = PERIODS.map((p) => ({ p, idx: headIndex(p.key) }))
+    .filter((x) => x.idx !== -1)
+    .sort((a, b) => b.idx - a.idx);
+  for (const { p, idx } of order) {
+    const block = entries
+      .filter((e) => periodOf(e.min) === p)
+      .flatMap((e) => e.lines || e.raw.split("\n"));
+    if (!block.length) continue;
+    // 放在该时段末尾（下一个同级或更高级标题之前），原有文字保持在前
+    const level = lines[idx].match(PERIOD_HEAD_RE)[1].length;
+    let end = idx + 1;
+    while (end < lines.length) {
+      const hm = lines[end].match(/^(#{1,6})\s/);
+      if (hm && (hm[1].length <= level || PERIOD_HEAD_RE.test(lines[end]))) break;
+      end += 1;
+    }
+    while (end > idx + 1 && !lines[end - 1].trim()) end -= 1;
+    lines.splice(end, 0, "", ...block, "");
+  }
+  // 不带时间的文字：指定时段就放到该时段末尾，否则放在所有时段之前
+  if (addText && String(addText.text).trim()) {
+    const block = String(addText.text).replace(/\r/g, "").replace(/\s+$/, "").split("\n");
+    if (addText.key) {
+      const idx = headIndex(addText.key);
+      const level = lines[idx].match(PERIOD_HEAD_RE)[1].length;
+      let end = idx + 1;
+      while (end < lines.length) {
+        const hm = lines[end].match(/^(#{1,6})\s/);
+        if (hm && (hm[1].length <= level || PERIOD_HEAD_RE.test(lines[end]))) break;
+        end += 1;
+      }
+      while (end > idx + 1 && !lines[end - 1].trim()) end -= 1;
+      lines.splice(end, 0, "", ...block, "");
+    } else {
+      const first = lines.findIndex((l) => PERIOD_HEAD_RE.test(l));
+      if (first === -1) lines.push("", ...block, "");
+      else lines.splice(first, 0, ...block, "");
+    }
+  }
+  // 合并多余空行
+  const out = [];
+  for (const l of lines) {
+    if (!l.trim() && out.length && !out[out.length - 1].trim()) continue;
+    out.push(l.trim() ? l : "");
+  }
+  while (out.length && !out[0].trim()) out.shift();
+  while (out.length && !out[out.length - 1].trim()) out.pop();
+  return `${fm}${out.join("\n")}\n`;
+}
+
+/** 解析日常记录用于展示时间线 */
+function parseDaily(text) {
+  const [, body] = splitFrontmatter(text || "");
+  const buckets = { other: [] };
+  for (const p of PERIODS) buckets[p.key] = [];
+  let cur = "other";
+  let curLevel = 0;
+  for (const line of body.split(/\r?\n/)) {
+    const pm = line.match(PERIOD_HEAD_RE);
+    if (pm) {
+      cur = pm[2];
+      curLevel = pm[1].length;
+      continue;
+    }
+    const hm = line.match(/^(#{1,6})\s/);
+    if (hm && cur !== "other" && hm[1].length <= curLevel) cur = "other";
+    buckets[cur].push(line);
+  }
+  const result = { other: "", periods: PERIODS.map((p) => ({ ...p, entries: [], extra: "" })) };
+  const otherParsed = extractEntries(buckets.other);
+  result.other = otherParsed.rest.join("\n").trim();
+  for (const e of otherParsed.entries) result.periods.find((p) => p.key === periodOf(e.min).key).entries.push(e);
+  for (const per of result.periods) {
+    const parsed = extractEntries(buckets[per.key]);
+    per.entries.push(...parsed.entries);
+    per.entries.sort((a, b) => a.min - b.min);
+    per.extra = parsed.rest.join("\n").trim();
+  }
+  return result;
+}
+
+/* ---------- view ---------- */
+
+class DailyHubView extends ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.navigation = true;
+    const now = new Date();
+    this.selectedDate = keyOf(now);
+    this.visibleMonth = monthStart(now);
+    this.calMode = Platform.isPhone && plugin.settings.phoneWeekView ? "week" : "month";
+    this.calProject = ""; // 日历按项目筛选（文件夹路径）
+    this.manage = false;
+    this.launcherExpanded = false;
+    this.showArchived = false;
+    this.folderSelection = new Map();
+    this.filesByDate = new Map();
+    this.notesComponent = null;
+    this.memoComponent = null;
+    this.notesToken = 0;
+    this.aiBusy = false;
+    this.els = {};
+  }
+
+  getViewType() {
+    return VIEW_TYPE;
+  }
+  getDisplayText() {
+    return `${this.plugin.settings.title} · 主页`;
+  }
+  getIcon() {
+    return "layout-dashboard";
+  }
+
+  async onOpen() {
+    this.buildIndex();
+    this.renderAll();
+  }
+
+  async onClose() {
+    this.disposeComponent("notesComponent");
+    this.disposeComponent("memoComponent");
+    this.disposeComponent("journalComponent");
+  }
+
+  disposeComponent(name) {
+    if (!this[name]) return;
+    this.removeChild(this[name]);
+    this[name] = null;
+  }
+
+  get s() {
+    return this.plugin.settings;
+  }
+
+  /* ----- data ----- */
+
+  buildIndex() {
+    const excluded = this.s.excludedFolderPrefixes
+      .map((p) => p.trim().replace(/\\/g, "/"))
+      .filter(Boolean);
+    const map = new Map();
+    const lifeRoot = normalizePath(this.s.lifeRoot || "").replace(/^\/$/, "");
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (!DATE_NAME_PATTERN.test(file.basename)) continue;
+      // 只看「生活」文件夹里的日期笔记，科研那边的日期笔记不进生活日历
+      if (lifeRoot && !file.path.startsWith(`${lifeRoot}/`)) continue;
+      if (excluded.some((p) => file.path.startsWith(p))) continue;
+      if (Number.isNaN(parseKey(file.basename).getTime())) continue;
+      const list = map.get(file.basename) || [];
+      list.push(file);
+      map.set(file.basename, list);
+    }
+    this.filesByDate = map;
+  }
+
+  /** 所有项目（含日期记录），已按用户顺序排好 */
+  projects() {
+    return this.plugin.getProjects();
+  }
+
+  projectByPath(path) {
+    return this.projects().find((p) => p.path === path);
+  }
+
+  labelForFolder(path) {
+    const p = this.projectByPath(path);
+    if (p) return p.label;
+    const root = this.s.projectRoot;
+    if (path.startsWith(`${root}/`)) return path.slice(root.length + 1).split("/").join(" / ");
+    return path || "根目录";
+  }
+
+  rankForFolder(path, list) {
+    const i = list.findIndex((p) => p.path === path);
+    return i === -1 ? 100000 : i;
+  }
+
+  filesFor(key) {
+    const files = this.filesByDate.get(key) || [];
+    if (!this.calProject) return files;
+    return files.filter((f) => f.parent?.path === this.calProject);
+  }
+
+  countOf(key) {
+    return this.filesFor(key).length;
+  }
+
+  stats() {
+    const todayKey = keyOf(new Date());
+    const prefix = monthPrefix(this.visibleMonth);
+    let monthDays = 0;
+    let total = 0;
+    for (const [k, files] of this.filesByDate) {
+      total += files.length;
+      if (k.startsWith(prefix)) monthDays += 1;
+    }
+    let cursor = parseKey(todayKey);
+    if (!this.filesByDate.has(todayKey)) cursor = addDays(cursor, -1);
+    let streak = 0;
+    while (this.filesByDate.has(keyOf(cursor))) {
+      streak += 1;
+      cursor = addDays(cursor, -1);
+    }
+    return { monthDays, total, streak };
+  }
+
+  projectDates(path) {
+    const out = [];
+    for (const [k, files] of this.filesByDate) {
+      if (files.some((f) => f.parent?.path === path)) out.push(k);
+    }
+    return out.sort();
+  }
+
+  pickInitialDate(month) {
+    const prefix = monthPrefix(month);
+    const dates = [...this.filesByDate.keys()]
+      .filter((k) => k.startsWith(prefix) && this.countOf(k) > 0)
+      .sort();
+    const todayKey = keyOf(new Date());
+    if (prefix === todayKey.slice(0, 7)) {
+      if (this.countOf(todayKey)) return todayKey;
+      return dates.find((k) => k >= todayKey) || dates.at(-1) || todayKey;
+    }
+    return dates[0] || `${prefix}-01`;
+  }
+
+  /** 当天内容分组：日期记录最前，其余按项目顺序 */
+  groupFiles(files) {
+    const list = this.projects();
+    const groups = new Map();
+    for (const f of files) {
+      const path = f.parent?.path || "";
+      const g = groups.get(path) || { path, label: this.labelForFolder(path), files: [] };
+      g.files.push(f);
+      groups.set(path, g);
+    }
+    for (const g of groups.values()) g.files.sort((a, b) => a.path.localeCompare(b.path, "zh-CN"));
+    return new Map(
+      [...groups.entries()].sort(
+        ([a, ga], [b, gb]) =>
+          this.rankForFolder(a, list) - this.rankForFolder(b, list) ||
+          ga.label.localeCompare(gb.label, "zh-CN")
+      )
+    );
+  }
+
+  selectionFor(key, groups) {
+    if (!this.folderSelection.has(key)) this.folderSelection.set(key, new Set(groups.keys()));
+    const sel = this.folderSelection.get(key);
+    for (const name of [...sel]) if (!groups.has(name)) sel.delete(name);
+    return sel;
+  }
+
+  async openFile(file, evt) {
+    const newTab = evt ? Keymap.isModEvent(evt) : false;
+    const leaf = this.app.workspace.getLeaf(newTab);
+    await leaf.openFile(file, { active: true, state: { mode: "source", source: false } });
+  }
+
+  /* ----- selection changes ----- */
+
+  selectDate(key) {
+    this.selectedDate = key;
+    const d = parseKey(key);
+    if (monthPrefix(d) !== monthPrefix(this.visibleMonth)) this.visibleMonth = monthStart(d);
+    this.renderHero();
+    this.renderCalendar();
+    this.renderLauncher();
+    this.renderDay();
+  }
+
+  shiftCalendar(dir) {
+    if (this.calMode === "week") {
+      this.selectDate(keyOf(addDays(parseKey(this.selectedDate), dir * 7)));
+      return;
+    }
+    this.visibleMonth = addMonths(this.visibleMonth, dir);
+    this.selectDate(this.pickInitialDate(this.visibleMonth));
+  }
+
+  showProjectTimeline(path) {
+    this.calProject = path;
+    if (path) {
+      const dates = this.projectDates(path);
+      if (dates.length && !dates.includes(this.selectedDate)) {
+        this.selectDate(dates.at(-1));
+      } else {
+        this.renderCalendar();
+      }
+    } else {
+      this.renderCalendar();
+    }
+    this.els.calendar?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  /* ----- full render ----- */
+
+  renderAll() {
+    const prevScroll = this.els.scroll?.scrollTop || 0;
+    const root = this.contentEl;
+    root.empty();
+    root.addClass("dh-view");
+    if (Platform.isMobile) root.addClass("dh-is-mobile");
+
+    const scroll = root.createDiv({ cls: "dh-scroll" });
+    const page = scroll.createDiv({ cls: "dh-page" });
+    this.els = { scroll };
+    this.els.hero = page.createDiv({ cls: "dh-hero" });
+
+    const grid = page.createDiv({ cls: "dh-grid" });
+    const side = grid.createDiv({ cls: "dh-side" });
+    const main = grid.createDiv({ cls: "dh-main" });
+
+    this.els.calendar = side.createEl("section", { cls: "dh-card dh-calendar-card" });
+    this.els.memo = side.createEl("section", { cls: "dh-card dh-memo-card" });
+    this.els.launcher = main.createEl("section", { cls: "dh-card dh-launcher" });
+    this.els.day = main.createEl("section", { cls: "dh-day" });
+
+    this.renderHero();
+    this.renderCalendar();
+    this.renderLauncher();
+    this.renderMemo();
+    this.renderDay();
+    scroll.scrollTop = prevScroll;
+  }
+
+  refresh() {
+    this.buildIndex();
+    const prev = this.els.scroll?.scrollTop || 0;
+    this.renderHero();
+    this.renderCalendar();
+    this.renderLauncher();
+    this.renderDay();
+    if (this.els.scroll) this.els.scroll.scrollTop = prev;
+  }
+
+  /* ----- hero ----- */
+
+  renderHero() {
+    const el = this.els.hero;
+    if (!el) return;
+    el.empty();
+    const now = new Date();
+    const { monthDays, total, streak } = this.stats();
+
+    const top = el.createDiv({ cls: "dh-hero-top" });
+    const text = top.createDiv({ cls: "dh-hero-text" });
+    text.createDiv({ cls: "dh-hero-eyebrow", text: `${greeting(now.getHours())} · ${this.s.title}` });
+    text.createEl("h1", { cls: "dh-hero-title", text: `${now.getMonth() + 1} 月 ${now.getDate()} 日` });
+    text.createDiv({ cls: "dh-hero-sub", text: `${WEEKDAY_FULL[now.getDay()]} · ${now.getFullYear()}` });
+
+    const actions = top.createDiv({ cls: "dh-hero-actions" });
+    const todayBtn = actions.createEl("button", { cls: "dh-btn dh-btn-soft", attr: { "aria-label": "回到今天" } });
+    setIcon(todayBtn.createSpan({ cls: "dh-btn-icon" }), "calendar-check");
+    todayBtn.createSpan({ cls: "dh-btn-label", text: "今天" });
+    todayBtn.addEventListener("click", () => {
+      this.visibleMonth = monthStart(new Date());
+      this.selectDate(keyOf(new Date()));
+    });
+    const refreshBtn = actions.createEl("button", { cls: "dh-btn dh-btn-icon-only", attr: { "aria-label": "刷新" } });
+    setIcon(refreshBtn, "refresh-cw");
+    refreshBtn.addEventListener("click", () => this.refresh());
+
+    const stats = el.createDiv({ cls: "dh-stats" });
+    const stat = (icon, value, label) => {
+      const s = stats.createDiv({ cls: "dh-stat" });
+      setIcon(s.createSpan({ cls: "dh-stat-icon" }), icon);
+      const t = s.createDiv({ cls: "dh-stat-text" });
+      t.createDiv({ cls: "dh-stat-value", text: String(value) });
+      t.createDiv({ cls: "dh-stat-label", text: label });
+    };
+    stat("flame", streak, "连续记录天数");
+    stat("calendar-days", monthDays, `${this.visibleMonth.getMonth() + 1} 月有记录的天数`);
+    stat("files", total, "日期笔记总数");
+  }
+
+  /* ----- calendar + timeline ----- */
+
+  renderCalendar() {
+    const card = this.els.calendar;
+    if (!card) return;
+    card.empty();
+    const isWeek = this.calMode === "week";
+    const sel = parseKey(this.selectedDate);
+    const ref = isWeek ? sel : this.visibleMonth;
+
+    // 项目筛选
+    const filterRow = card.createDiv({ cls: "dh-cal-filter" });
+    setIcon(filterRow.createSpan({ cls: "dh-cal-filter-icon" }), "folder-search");
+    const select = filterRow.createEl("select", { cls: "dropdown dh-select" });
+    select.createEl("option", { text: "日历显示：全部笔记", attr: { value: "" } });
+    const all = this.projects();
+    const active = all.filter((p) => !p.archived);
+    const archived = all.filter((p) => p.archived);
+    for (const p of active) select.createEl("option", { text: p.label, attr: { value: p.path } });
+    if (archived.length) {
+      const og = select.createEl("optgroup", { attr: { label: "已存档" } });
+      for (const p of archived) og.createEl("option", { text: p.label, attr: { value: p.path } });
+    }
+    select.value = this.calProject;
+    select.addEventListener("change", () => this.showProjectTimeline(select.value));
+    if (this.calProject) {
+      const clear = filterRow.createEl("button", { cls: "dh-btn dh-btn-icon-only", attr: { "aria-label": "显示全部" } });
+      setIcon(clear, "x");
+      clear.addEventListener("click", () => this.showProjectTimeline(""));
+    }
+    card.toggleClass("is-filtered", Boolean(this.calProject));
+
+    const head = card.createDiv({ cls: "dh-cal-head" });
+    const prev = head.createEl("button", { cls: "dh-btn dh-btn-icon-only", attr: { "aria-label": isWeek ? "上一周" : "上个月" } });
+    setIcon(prev, "chevron-left");
+    const title = head.createDiv({ cls: "dh-cal-title" });
+    title.createSpan({ cls: "dh-cal-year", text: `${ref.getFullYear()}` });
+    title.createSpan({ cls: "dh-cal-month", text: `${ref.getMonth() + 1} 月` });
+    const next = head.createEl("button", { cls: "dh-btn dh-btn-icon-only", attr: { "aria-label": isWeek ? "下一周" : "下个月" } });
+    setIcon(next, "chevron-right");
+    const mode = head.createEl("button", {
+      cls: "dh-btn dh-btn-soft dh-cal-mode",
+      attr: { "aria-label": isWeek ? "展开为月视图" : "收起为周视图" },
+    });
+    setIcon(mode.createSpan({ cls: "dh-btn-icon" }), isWeek ? "chevrons-up-down" : "chevrons-down-up");
+    mode.createSpan({ cls: "dh-btn-label", text: isWeek ? "月" : "周" });
+
+    prev.addEventListener("click", () => this.shiftCalendar(-1));
+    next.addEventListener("click", () => this.shiftCalendar(1));
+    mode.addEventListener("click", () => {
+      this.calMode = isWeek ? "month" : "week";
+      this.visibleMonth = monthStart(sel);
+      this.renderCalendar();
+    });
+
+    const grid = card.createDiv({ cls: `dh-cal-grid ${isWeek ? "is-week" : "is-month"}` });
+    for (const w of WEEKDAYS) grid.createDiv({ cls: "dh-cal-weekday", text: w });
+
+    const todayKey = keyOf(new Date());
+    const addDay = (d, outside) => {
+      const k = keyOf(d);
+      const count = this.countOf(k);
+      const btn = grid.createEl("button", {
+        cls: "dh-cal-day",
+        attr: { "aria-label": count ? `${k}，${count} 篇笔记` : `${k}，无笔记` },
+      });
+      btn.createSpan({ cls: "dh-cal-num", text: String(d.getDate()) });
+      const dots = btn.createSpan({ cls: "dh-cal-dots" });
+      for (let i = 0; i < Math.min(count, 3); i += 1) dots.createSpan({ cls: "dh-cal-dot" });
+      if (count) btn.addClass(this.calProject ? "heat-3" : `heat-${Math.min(count, 4)}`);
+      btn.toggleClass("is-outside", outside);
+      btn.toggleClass("is-today", k === todayKey);
+      btn.toggleClass("is-selected", k === this.selectedDate);
+      btn.toggleClass("is-weekend", d.getDay() === 0 || d.getDay() === 6);
+      btn.addEventListener("click", () => this.selectDate(k));
+    };
+
+    if (isWeek) {
+      const start = weekStart(sel);
+      for (let i = 0; i < 7; i += 1) addDay(addDays(start, i), false);
+    } else {
+      const first = this.visibleMonth;
+      const lead = (first.getDay() + 6) % 7;
+      const days = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
+      for (let i = lead; i > 0; i -= 1) addDay(addDays(first, -i), true);
+      for (let i = 0; i < days; i += 1) addDay(addDays(first, i), false);
+      const trailing = (7 - ((lead + days) % 7)) % 7;
+      const last = addDays(first, days - 1);
+      for (let i = 1; i <= trailing; i += 1) addDay(addDays(last, i), true);
+    }
+
+    if (!this.calProject) {
+      const legend = card.createDiv({ cls: "dh-cal-legend" });
+      legend.createSpan({ text: "少" });
+      for (let i = 0; i <= 4; i += 1) legend.createSpan({ cls: `dh-legend-swatch heat-${i}` });
+      legend.createSpan({ text: "多" });
+    } else {
+      this.renderTimeline(card);
+    }
+
+    let startX = null;
+    let startY = null;
+    grid.addEventListener("touchstart", (e) => {
+      startX = e.touches[0].clientX;
+      startY = e.touches[0].clientY;
+    }, { passive: true });
+    grid.addEventListener("touchend", (e) => {
+      if (startX === null) return;
+      const dx = e.changedTouches[0].clientX - startX;
+      const dy = e.changedTouches[0].clientY - startY;
+      startX = null;
+      if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) this.shiftCalendar(dx < 0 ? 1 : -1);
+    }, { passive: true });
+  }
+
+  renderTimeline(card) {
+    const dates = this.projectDates(this.calProject);
+    const wrap = card.createDiv({ cls: "dh-timeline" });
+    const head = wrap.createDiv({ cls: "dh-timeline-head" });
+    head.createDiv({ cls: "dh-timeline-title", text: `${this.labelForFolder(this.calProject)} · 时间线` });
+    if (!dates.length) {
+      wrap.createDiv({ cls: "dh-muted", text: "这个项目还没有日期笔记。" });
+      return;
+    }
+    head.createDiv({
+      cls: "dh-muted",
+      text: `共 ${dates.length} 天 · ${dates[0]} 起 · 最近 ${dates.at(-1)}`,
+    });
+    const byMonth = new Map();
+    for (const k of [...dates].reverse()) {
+      const m = k.slice(0, 7);
+      const list = byMonth.get(m) || [];
+      list.push(k);
+      byMonth.set(m, list);
+    }
+    const body = wrap.createDiv({ cls: "dh-timeline-body" });
+    for (const [m, list] of byMonth) {
+      const row = body.createDiv({ cls: "dh-timeline-month" });
+      const [y, mm] = m.split("-");
+      row.createDiv({ cls: "dh-timeline-label", text: `${y}.${mm}` });
+      const chips = row.createDiv({ cls: "dh-timeline-dates" });
+      for (const k of list) {
+        const d = parseKey(k);
+        const chip = chips.createEl("button", {
+          cls: "dh-date-chip",
+          text: String(d.getDate()),
+          attr: { "aria-label": k, title: `${k} ${WEEKDAY_FULL[d.getDay()]}` },
+        });
+        chip.toggleClass("is-selected", k === this.selectedDate);
+        chip.addEventListener("click", () => this.selectDate(k));
+      }
+    }
+  }
+
+  /* ----- launcher（今日内容） ----- */
+
+  renderLauncher() {
+    const card = this.els.launcher;
+    if (!card) return;
+    card.empty();
+    card.toggleClass("is-managing", this.manage);
+    const d = parseKey(this.selectedDate);
+    const isToday = this.selectedDate === keyOf(new Date());
+
+    const head = card.createDiv({ cls: "dh-card-head" });
+    const h = head.createDiv();
+    h.createEl("h2", { text: this.manage ? "管理项目" : isToday ? "今日内容" : "当日内容" });
+    h.createDiv({
+      cls: "dh-card-sub",
+      text: this.manage
+        ? "调整顺序（常用的往前）、存档不再使用的项目"
+        : `点按钮直接在弹窗里记录 ${d.getMonth() + 1} 月 ${d.getDate()} 日（${WEEKDAY_FULL[d.getDay()]}）的内容，Ctrl / ⌘ + 点击打开笔记`,
+    });
+    const actions = head.createDiv({ cls: "dh-head-actions" });
+    const addBtn = actions.createEl("button", { cls: "dh-btn dh-btn-soft", attr: { "aria-label": "新建项目" } });
+    setIcon(addBtn.createSpan({ cls: "dh-btn-icon" }), "folder-plus");
+    addBtn.createSpan({ cls: "dh-btn-label", text: "新项目" });
+    addBtn.addEventListener("click", () => new NewProjectModal(this.app, this.plugin).open());
+    const manageBtn = actions.createEl("button", {
+      cls: `dh-btn ${this.manage ? "dh-btn-primary" : "dh-btn-soft"}`,
+      attr: { "aria-label": this.manage ? "完成" : "管理项目" },
+    });
+    setIcon(manageBtn.createSpan({ cls: "dh-btn-icon" }), this.manage ? "check" : "settings-2");
+    manageBtn.createSpan({ cls: "dh-btn-label", text: this.manage ? "完成" : "管理" });
+    manageBtn.addEventListener("click", () => {
+      this.manage = !this.manage;
+      this.renderLauncher();
+    });
+
+    const projects = this.projects();
+    if (!projects.length) {
+      card.createDiv({ cls: "dh-muted", text: `未找到“${this.s.dateRecordFolder}”或“${this.s.projectRoot}”目录` });
+      return;
+    }
+    if (this.manage) this.renderManageList(card, projects);
+    else this.renderLaunchChips(card, projects);
+  }
+
+  renderLaunchChips(card, projects) {
+    const active = projects.filter((p) => !p.archived);
+    const archived = projects.filter((p) => p.archived);
+    const limit = this.s.launcherLimit > 0 ? this.s.launcherLimit : Infinity;
+    const shown = this.launcherExpanded ? active : active.slice(0, limit);
+    const hidden = active.length - shown.length;
+
+    const wrap = card.createDiv({ cls: "dh-chip-row dh-launch-row" });
+    for (const p of shown) this.launchChip(wrap, p);
+
+    if (hidden > 0 || (this.launcherExpanded && active.length > limit)) {
+      const more = wrap.createEl("button", { cls: "dh-launch dh-launch-more" });
+      setIcon(more.createSpan({ cls: "dh-launch-icon" }), this.launcherExpanded ? "chevron-up" : "more-horizontal");
+      more.createSpan({ cls: "dh-launch-label", text: this.launcherExpanded ? "收起" : `更多 ${hidden}` });
+      more.addEventListener("click", () => {
+        this.launcherExpanded = !this.launcherExpanded;
+        this.renderLauncher();
+      });
+    }
+
+    if (archived.length) {
+      const toggle = card.createEl("button", { cls: "dh-archive-toggle" });
+      setIcon(toggle.createSpan({ cls: "dh-btn-icon" }), this.showArchived ? "chevron-down" : "chevron-right");
+      toggle.createSpan({ text: `已存档 ${archived.length}` });
+      toggle.addEventListener("click", () => {
+        this.showArchived = !this.showArchived;
+        this.renderLauncher();
+      });
+      if (this.showArchived) {
+        const arch = card.createDiv({ cls: "dh-chip-row dh-launch-row is-archived" });
+        for (const p of archived) this.launchChip(arch, p);
+      }
+    }
+  }
+
+  launchChip(wrap, p) {
+    const path = normalizePath(`${p.path}/${this.selectedDate}.md`);
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    const btn = wrap.createEl("button", {
+      cls: "dh-launch",
+      attr: { title: path, "aria-label": `${existing ? "打开" : "创建"} ${p.label}` },
+    });
+    btn.toggleClass("is-done", Boolean(existing));
+    btn.toggleClass("is-primary", p.isRecord);
+    btn.toggleClass("is-archived", p.archived);
+    setIcon(btn.createSpan({ cls: "dh-launch-icon" }), existing ? "check" : "plus");
+    btn.createSpan({ cls: "dh-launch-label", text: p.label });
+    btn.addEventListener("click", async (evt) => {
+      if (btn.hasClass("is-busy")) return;
+      // Ctrl / Cmd + 点击：仍然直接打开笔记
+      if (Keymap.isModEvent(evt)) {
+        btn.addClass("is-busy");
+        try {
+          let file = this.app.vault.getAbstractFileByPath(path);
+          if (!file) file = await this.app.vault.create(path, "");
+          await this.openFile(file, evt);
+        } catch (err) {
+          console.error("[daily-hub] launch failed", err);
+          new Notice(`无法打开或创建：${path}`);
+        } finally {
+          btn.removeClass("is-busy");
+        }
+        return;
+      }
+      this.openRecordModal(p);
+    });
+  }
+
+  openRecordModal(project, entry = null, preset = null) {
+    new RecordModal(this.app, this.plugin, {
+      date: this.selectedDate,
+      project,
+      entry,
+      preset,
+      onDone: () => this.refresh(),
+    }).open();
+  }
+
+  recordProject() {
+    return this.projects().find((p) => p.isRecord) || {
+      path: normalizePath(this.s.dateRecordFolder),
+      label: this.s.dateRecordFolder,
+      isRecord: true,
+      archived: false,
+    };
+  }
+
+  renderManageList(card, projects) {
+    const tools = card.createDiv({ cls: "dh-manage-tools" });
+    const freq = tools.createEl("button", { cls: "dh-btn dh-btn-soft" });
+    setIcon(freq.createSpan({ cls: "dh-btn-icon" }), "bar-chart-3");
+    freq.createSpan({ cls: "dh-btn-label", text: "按近 30 天使用频率排序" });
+    freq.addEventListener("click", () => this.plugin.sortByFrequency(this.filesByDate));
+
+    const counts = new Map();
+    for (const files of this.filesByDate.values()) {
+      for (const f of files) {
+        const k = f.parent?.path || "";
+        counts.set(k, (counts.get(k) || 0) + 1);
+      }
+    }
+
+    const list = card.createDiv({ cls: "dh-manage-list" });
+    const movable = projects.filter((p) => !p.isRecord);
+    const renderRow = (p) => {
+      const row = list.createDiv({ cls: "dh-manage-row" });
+      row.toggleClass("is-archived", p.archived);
+      row.toggleClass("is-record", p.isRecord);
+      const info = row.createDiv({ cls: "dh-manage-info" });
+      info.createDiv({ cls: "dh-manage-name", text: p.label });
+      info.createDiv({
+        cls: "dh-manage-meta",
+        text: `${counts.get(p.path) || 0} 篇${p.isRecord ? " · 固定在最前" : ""}${p.archived ? " · 已存档" : ""}`,
+      });
+      const btns = row.createDiv({ cls: "dh-manage-btns" });
+      const iconBtn = (icon, label, fn, disabled = false) => {
+        const b = btns.createEl("button", { cls: "dh-btn dh-btn-icon-only", attr: { "aria-label": label, title: label } });
+        setIcon(b, icon);
+        b.disabled = disabled;
+        b.addEventListener("click", fn);
+        return b;
+      };
+      iconBtn("history", "查看时间线", () => {
+        this.manage = false;
+        this.renderLauncher();
+        this.showProjectTimeline(p.path);
+      });
+      if (p.isRecord) return;
+      const idx = movable.indexOf(p);
+      iconBtn("arrow-up-to-line", "置顶", () => this.plugin.moveProject(p.path, "top"), idx === 0);
+      iconBtn("chevron-up", "上移", () => this.plugin.moveProject(p.path, -1), idx === 0);
+      iconBtn("chevron-down", "下移", () => this.plugin.moveProject(p.path, 1), idx === movable.length - 1);
+      const arch = iconBtn(p.archived ? "archive-restore" : "archive", p.archived ? "取消存档" : "存档", () =>
+        this.plugin.toggleArchive(p.path)
+      );
+      arch.addClass(p.archived ? "is-restore" : "is-archive");
+    };
+    for (const p of projects.filter((x) => !x.archived)) renderRow(p);
+    const archived = projects.filter((x) => x.archived);
+    if (archived.length) {
+      list.createDiv({ cls: "dh-manage-section", text: "已存档（不在今日内容中显示，但历史笔记照常显示）" });
+      for (const p of archived) renderRow(p);
+    }
+  }
+
+  /* ----- 左下角卡片：写给自己 / 待办 / 链接 ----- */
+
+  renderMemo() {
+    const card = this.els.memo;
+    if (!card) return;
+    card.empty();
+    card.toggleClass("is-hidden", !this.s.showMemo);
+    if (!this.s.showMemo) return;
+    this.disposeComponent("memoComponent");
+    this.memoComponent = this.addChild(new Component());
+    const tab = ["memo", "todo", "links"].includes(this.s.sideTab) ? this.s.sideTab : "memo";
+    card.dataset.tab = tab;
+
+    const tabs = card.createDiv({ cls: "dh-tabs" });
+    const tabDefs = [
+      ["memo", "quote", "写给自己"],
+      ["todo", "list-checks", "待办"],
+      ["links", "link", "链接"],
+    ];
+    for (const [id, icon, label] of tabDefs) {
+      const b = tabs.createEl("button", { cls: "dh-tab", attr: { "aria-label": label } });
+      b.toggleClass("is-active", id === tab);
+      setIcon(b.createSpan({ cls: "dh-tab-icon" }), icon);
+      b.createSpan({ cls: "dh-tab-label", text: label });
+      if (id === "todo") this.els.todoBadge = b.createSpan({ cls: "dh-tab-badge" });
+      b.addEventListener("click", async () => {
+        if (this.s.sideTab === id) return;
+        this.s.sideTab = id;
+        await this.plugin.saveData(this.plugin.settings);
+        this.renderMemo();
+      });
+    }
+
+    const body = card.createDiv({ cls: "dh-side-body" });
+    if (tab === "memo") this.renderMemoTab(body);
+    else if (tab === "todo") this.renderTodoTab(body);
+    else this.renderLinksTab(body);
+    if (tab !== "todo") this.updateTodoBadge();
+  }
+
+  renderMemoTab(body) {
+    const memo = (this.s.memo || "").trim();
+    const bar = body.createDiv({ cls: "dh-side-bar" });
+    bar.createDiv({ cls: "dh-muted", text: "座右铭、提醒，支持 Markdown" });
+    const edit = bar.createEl("button", { cls: "dh-btn dh-btn-icon-only", attr: { "aria-label": "编辑（插件设置）" } });
+    setIcon(edit, "pencil");
+    edit.addEventListener("click", () => this.plugin.openSettings());
+    if (!memo) {
+      body.createDiv({ cls: "dh-side-empty", text: "还没有内容，点右上角的笔去设置里写几句。" });
+      return;
+    }
+    const md = body.createDiv({ cls: "dh-memo-body markdown-rendered" });
+    MarkdownRenderer.render(this.app, memo, md, "", this.memoComponent);
+    this.bindLinks(md, "");
+  }
+
+  async collectTodos() {
+    const folder = normalizePath(this.s.todoFolder || "");
+    const files = this.app.vault
+      .getMarkdownFiles()
+      .filter((f) => folder && (f.path.startsWith(`${folder}/`) || f.parent?.path === folder));
+    files.sort((a, b) => b.basename.localeCompare(a.basename, "zh-CN"));
+    const groups = [];
+    for (const file of files) {
+      const cache = this.app.metadataCache.getFileCache(file);
+      const items = (cache?.listItems || []).filter((li) => li.task !== undefined);
+      if (!items.length) continue;
+      const lines = (await this.app.vault.cachedRead(file)).split("\n");
+      const tasks = [];
+      for (const li of items) {
+        const line = li.position.start.line;
+        const raw = lines[line] || "";
+        const m = raw.match(/^\s*(?:[-*+]|\d+[.)])\s+\[(.)\]\s?(.*)$/);
+        if (!m) continue;
+        tasks.push({ file, line, raw, done: m[1] !== " ", text: m[2] });
+      }
+      if (tasks.length) groups.push({ file, tasks });
+    }
+    return groups;
+  }
+
+  async updateTodoBadge(groups) {
+    const badge = this.els.todoBadge;
+    if (!badge) return;
+    const g = groups || (await this.collectTodos());
+    const n = g.reduce((sum, x) => sum + x.tasks.filter((t) => !t.done).length, 0);
+    badge.setText(n ? String(n) : "");
+    badge.toggleClass("is-empty", !n);
+  }
+
+  async renderTodoTab(body) {
+    const folder = normalizePath(this.s.todoFolder || "");
+    const bar = body.createDiv({ cls: "dh-side-bar" });
+    const src = bar.createDiv({ cls: "dh-muted dh-todo-src", text: `来自「${folder || "未设置"}」` });
+    src.setAttr("title", "在插件设置中修改待办来源目录");
+    const showDone = bar.createEl("button", {
+      cls: "dh-btn dh-btn-icon-only",
+      attr: { "aria-label": this.s.showDoneTodos ? "隐藏已完成" : "显示已完成" },
+    });
+    setIcon(showDone, this.s.showDoneTodos ? "eye" : "eye-off");
+    showDone.toggleClass("is-on", this.s.showDoneTodos);
+    showDone.addEventListener("click", async () => {
+      this.s.showDoneTodos = !this.s.showDoneTodos;
+      await this.plugin.saveData(this.plugin.settings);
+      this.renderMemo();
+    });
+
+    // 添加待办：写到待办目录里今天的笔记
+    const add = body.createDiv({ cls: "dh-todo-add" });
+    const input = add.createEl("input", { attr: { type: "text", placeholder: "添加待办，回车保存到今天…" } });
+    const addBtn = add.createEl("button", { cls: "dh-btn dh-btn-soft dh-btn-icon-only", attr: { "aria-label": "添加" } });
+    setIcon(addBtn, "plus");
+    const submit = async () => {
+      const text = input.value.trim();
+      if (!text || !folder) return;
+      input.disabled = true;
+      try {
+        await this.plugin.addTodo(text);
+        input.value = "";
+        this.renderMemo();
+      } catch (err) {
+        new Notice(`添加失败：${err.message || err}`);
+      } finally {
+        input.disabled = false;
+      }
+    };
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.isComposing) submit();
+    });
+    addBtn.addEventListener("click", submit);
+
+    const listEl = body.createDiv({ cls: "dh-todo-list" });
+    if (!folder || !isFolder(this.app.vault.getAbstractFileByPath(folder))) {
+      listEl.createDiv({ cls: "dh-side-empty", text: `找不到目录「${folder}」，请在插件设置里修改待办来源目录。` });
+      return;
+    }
+    const token = (this.todoToken = (this.todoToken || 0) + 1);
+    const groups = await this.collectTodos();
+    if (token !== this.todoToken) return;
+    this.updateTodoBadge(groups);
+
+    let shown = 0;
+    for (const g of groups) {
+      const tasks = this.s.showDoneTodos ? g.tasks : g.tasks.filter((t) => !t.done);
+      if (!tasks.length) continue;
+      const sec = listEl.createDiv({ cls: "dh-todo-group" });
+      const gh = sec.createEl("button", { cls: "dh-todo-date", attr: { "aria-label": `打开 ${g.file.basename}` } });
+      gh.setText(DATE_NAME_PATTERN.test(g.file.basename) ? shortDate(g.file.basename) : g.file.basename);
+      gh.addEventListener("click", (evt) => this.openFile(g.file, evt));
+      for (const t of tasks) {
+        const row = sec.createEl("label", { cls: "dh-todo" });
+        row.toggleClass("is-done", t.done);
+        const cb = row.createEl("input", { cls: "task-list-item-checkbox", attr: { type: "checkbox" } });
+        cb.checked = t.done;
+        const txt = row.createSpan({ cls: "dh-todo-text" });
+        MarkdownRenderer.render(this.app, t.text || " ", txt, t.file.path, this.memoComponent).then(() => {
+          const p = txt.querySelector("p");
+          if (p && txt.childElementCount === 1) p.replaceWith(...p.childNodes);
+        });
+        this.bindLinks(txt, t.file.path);
+        cb.addEventListener("change", async () => {
+          row.toggleClass("is-done", cb.checked);
+          try {
+            await this.plugin.setTaskDone(t, cb.checked);
+          } catch (err) {
+            cb.checked = !cb.checked;
+            row.toggleClass("is-done", cb.checked);
+            new Notice(`更新失败：${err.message || err}`);
+          }
+        });
+        shown += 1;
+      }
+    }
+    if (!shown) {
+      listEl.createDiv({
+        cls: "dh-side-empty",
+        text: this.s.showDoneTodos ? "这个目录里还没有待办。" : "没有未完成的待办 🎉",
+      });
+    }
+  }
+
+  renderLinksTab(body) {
+    const bar = body.createDiv({ cls: "dh-side-bar" });
+    bar.createDiv({ cls: "dh-muted", text: "常用链接" });
+    const actions = bar.createDiv({ cls: "dh-head-actions" });
+    const add = actions.createEl("button", { cls: "dh-btn dh-btn-icon-only", attr: { "aria-label": "添加链接" } });
+    setIcon(add, "plus");
+    add.addEventListener("click", () => new LinkModal(this.app, this.plugin).open());
+    const edit = actions.createEl("button", { cls: "dh-btn dh-btn-icon-only", attr: { "aria-label": "管理链接（插件设置）" } });
+    setIcon(edit, "pencil");
+    edit.addEventListener("click", () => this.plugin.openSettings());
+
+    const links = (this.s.links || []).filter((l) => l && l.url);
+    if (!links.length) {
+      body.createDiv({ cls: "dh-side-empty", text: "还没有链接。点 + 添加，或在插件设置里管理。" });
+      return;
+    }
+    const grid = body.createDiv({ cls: "dh-links" });
+    links.forEach((l, i) => {
+      const name = (l.name || "").trim() || "未命名链接";
+      const btn = grid.createEl("button", { cls: "dh-link", attr: { "aria-label": name } });
+      const av = btn.createSpan({ cls: "dh-link-avatar", text: Array.from(name)[0].toUpperCase() });
+      av.style.setProperty("--dh-hue", String((i * 47 + name.charCodeAt(0) * 13) % 360));
+      btn.createSpan({ cls: "dh-link-name", text: name });
+      btn.addEventListener("click", (evt) => this.plugin.openLink(l.url, evt));
+    });
+  }
+
+  /* ----- day: filters + notes ----- */
+
+  recordFileFor(key) {
+    const path = normalizePath(`${this.s.dateRecordFolder}/${key}.md`);
+    return this.app.vault.getAbstractFileByPath(path);
+  }
+
+  renderDay() {
+    const el = this.els.day;
+    if (!el) return;
+    el.empty();
+    const files = this.filesByDate.get(this.selectedDate) || [];
+    const recordPath = normalizePath(this.s.dateRecordFolder);
+    const groups = this.groupFiles(files);
+    groups.delete(recordPath); // 日常记录单独以时间线展示
+    const otherCount = [...groups.values()].reduce((n, g) => n + g.files.length, 0);
+    const sel = this.selectionFor(this.selectedDate, groups);
+    const d = parseKey(this.selectedDate);
+
+    const head = el.createDiv({ cls: "dh-day-head" });
+    const h = head.createDiv();
+    h.createEl("h2", { text: `${d.getMonth() + 1} 月 ${d.getDate()} 日` });
+    h.createDiv({ cls: "dh-card-sub", text: `${WEEKDAY_FULL[d.getDay()]} · ${files.length} 篇笔记` });
+    const right = head.createDiv({ cls: "dh-day-actions" });
+    const record = this.recordFileFor(this.selectedDate);
+    if (record) {
+      const ai = right.createEl("button", {
+        cls: "dh-btn dh-btn-ai",
+        attr: { "aria-label": "AI 识别日常记录中属于其他项目的内容" },
+      });
+      setIcon(ai.createSpan({ cls: "dh-btn-icon" }), this.aiBusy ? "loader" : "sparkles");
+      ai.createSpan({ cls: "dh-btn-label", text: this.aiBusy ? "识别中…" : "AI 整理到项目" });
+      ai.toggleClass("is-busy", this.aiBusy);
+      ai.addEventListener("click", () => this.runAi(record));
+    }
+    this.els.dayCount = right.createDiv({ cls: "dh-pill" });
+
+    this.els.journal = el.createEl("section", { cls: "dh-card dh-journal" });
+    this.renderJournal();
+
+    if (otherCount) el.createDiv({ cls: "dh-subhead", text: "其他项目" });
+    this.els.filters = el.createDiv({ cls: "dh-chip-row dh-filter-row" });
+    this.els.notes = el.createDiv({ cls: "dh-notes" });
+
+    if (groups.size > 1) {
+      const all = this.els.filters.createEl("button", { cls: "dh-chip", text: "全部" });
+      all.toggleClass("is-active", groups.size === sel.size);
+      all.addEventListener("click", () => {
+        if (sel.size === groups.size) sel.clear();
+        else for (const k of groups.keys()) sel.add(k);
+        this.renderDay();
+      });
+    }
+    if (groups.size > 0) {
+      for (const [path, g] of groups) {
+        const chip = this.els.filters.createEl("button", { cls: "dh-chip" });
+        chip.createSpan({ text: g.label });
+        chip.createSpan({ cls: "dh-chip-count", text: String(g.files.length) });
+        chip.toggleClass("is-active", sel.has(path));
+        chip.addEventListener("click", () => {
+          if (sel.has(path)) sel.delete(path);
+          else sel.add(path);
+          this.renderDay();
+        });
+      }
+    } else {
+      this.els.filters.remove();
+    }
+
+    this.renderNotes(groups, sel, otherCount);
+  }
+
+  async renderJournal() {
+    const card = this.els.journal;
+    if (!card) return;
+    const token = (this.journalToken = (this.journalToken || 0) + 1);
+    const file = this.recordFileFor(this.selectedDate);
+    const text = file && "extension" in file ? await this.app.vault.cachedRead(file) : "";
+    if (token !== this.journalToken) return;
+    card.empty();
+    this.disposeComponent("journalComponent");
+    this.journalComponent = this.addChild(new Component());
+    const comp = this.journalComponent;
+    const data = parseDaily(text);
+    const total = data.periods.reduce((n, p) => n + p.entries.length, 0);
+    const isToday = this.selectedDate === keyOf(new Date());
+
+    const head = card.createDiv({ cls: "dh-journal-head" });
+    const title = head.createDiv({ cls: "dh-journal-title" });
+    setIcon(title.createSpan({ cls: "dh-journal-icon" }), "notebook-pen");
+    const tt = title.createDiv();
+    tt.createEl("h2", { text: this.s.dateRecordFolder || "日常记录" });
+    const all = data.periods.flatMap((p) => p.entries);
+    tt.createDiv({
+      cls: "dh-card-sub",
+      text: total ? `${total} 条 · 最近 ${all[all.length - 1].time}` : isToday ? "今天还没有记录" : "这一天没有带时间的记录",
+    });
+    const actions = head.createDiv({ cls: "dh-head-actions" });
+    if (file) {
+      const open = actions.createEl("button", { cls: "dh-btn dh-btn-icon-only", attr: { "aria-label": "打开原文" } });
+      setIcon(open, "file-text");
+      open.addEventListener("click", (evt) => this.openFile(file, evt));
+    }
+    const add = actions.createEl("button", { cls: "dh-btn dh-btn-primary dh-journal-add", attr: { "aria-label": "记录此刻" } });
+    setIcon(add.createSpan({ cls: "dh-btn-icon" }), "plus");
+    add.createSpan({ cls: "dh-btn-label", text: isToday ? "记录此刻" : "记录" });
+    add.addEventListener("click", () => this.openRecordModal(this.recordProject()));
+
+    const body = card.createDiv({ cls: "dh-journal-body" });
+    const md = (target, content) => {
+      const el = target.createDiv({ cls: "markdown-rendered" });
+      MarkdownRenderer.render(this.app, content, el, file ? file.path : "", comp);
+      this.bindLinks(el, file ? file.path : "");
+      return el;
+    };
+    if (data.other) md(body.createDiv({ cls: "dh-journal-other" }), data.other);
+
+    const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
+    let shown = 0;
+    for (const per of data.periods) {
+      const isNow = isToday && periodOf(nowMin) === PERIODS.find((p) => p.key === per.key);
+      const passed = isToday && per.from <= nowMin;
+      if (!per.entries.length && !per.extra && !isNow && !passed) continue;
+      shown += 1;
+      const sec = body.createDiv({ cls: "dh-period" });
+      sec.toggleClass("is-now", isNow);
+      const ph = sec.createDiv({ cls: "dh-period-head" });
+      setIcon(ph.createSpan({ cls: "dh-period-icon" }), per.icon);
+      ph.createSpan({ cls: "dh-period-name", text: per.key });
+      if (per.entries.length) ph.createSpan({ cls: "dh-period-count", text: `${per.entries.length}` });
+      // 已经过去（或正在进行）的时段可以直接补记，不带具体时间
+      if (!isToday || per.from <= nowMin) {
+        const recall = ph.createEl("button", { cls: "dh-period-recall", attr: { "aria-label": `补记${per.key}` } });
+        setIcon(recall.createSpan({ cls: "dh-period-recall-icon" }), "history");
+        recall.createSpan({ text: "补记" });
+        recall.addEventListener("click", (evt) => {
+          evt.stopPropagation();
+          this.openRecordModal(this.recordProject(), null, per.key);
+        });
+      }
+
+      // 原有的整段文字（没有时间的部分）先显示，和笔记里的顺序一致
+      if (per.extra) md(sec.createDiv({ cls: "dh-tl-extra" }), per.extra);
+      const tl = sec.createDiv({ cls: "dh-tl" });
+      for (const e of per.entries) {
+        const item = tl.createDiv({ cls: "dh-tl-item", attr: { role: "button", tabindex: "0", "aria-label": `编辑 ${e.time} 的记录` } });
+        item.createDiv({ cls: "dh-tl-time", text: e.time });
+        item.createDiv({ cls: "dh-tl-dot" });
+        const content = item.createDiv({ cls: "dh-tl-body" });
+        if (e.text) md(content, e.text);
+        else content.createDiv({ cls: "dh-muted", text: "（空）" });
+        item.addEventListener("click", (evt) => {
+          if (evt.target.closest?.("a")) return;
+          this.openRecordModal(this.recordProject(), e);
+        });
+      }
+      if (!per.entries.length && !per.extra && !isNow) {
+        sec.createDiv({ cls: "dh-muted dh-period-empty", text: `${per.key}还没有记录，忘了写可以点右边的「补记」` });
+      }
+      if (isNow) {
+        const now = tl.createDiv({ cls: "dh-tl-item dh-tl-now", attr: { role: "button", tabindex: "0" } });
+        now.createDiv({ cls: "dh-tl-time", text: fmtTime(nowMin) });
+        now.createDiv({ cls: "dh-tl-dot" });
+        now.createDiv({ cls: "dh-tl-body dh-muted", text: "现在在做什么？点这里记一笔" });
+        now.addEventListener("click", () => this.openRecordModal(this.recordProject()));
+      }
+    }
+    if (!shown && !data.other) {
+      const empty = body.createDiv({ cls: "dh-journal-empty" });
+      empty.createDiv({ text: "这一天还没有日常记录。" });
+      const b = empty.createEl("button", { cls: "dh-btn dh-btn-soft" });
+      setIcon(b.createSpan({ cls: "dh-btn-icon" }), "plus");
+      b.createSpan({ cls: "dh-btn-label", text: "写第一条" });
+      b.addEventListener("click", () => this.openRecordModal(this.recordProject()));
+    }
+  }
+
+  async renderNotes(groups, sel, totalCount) {
+    const token = ++this.notesToken;
+    this.disposeComponent("notesComponent");
+    const component = this.addChild(new Component());
+    this.notesComponent = component;
+    const container = this.els.notes;
+    container.empty();
+
+    const visible = [...groups.entries()].filter(([path]) => sel.has(path));
+    const visibleCount = visible.reduce((n, [, g]) => n + g.files.length, 0);
+    this.els.dayCount.setText(`${visibleCount} / ${totalCount}`);
+
+    if (!totalCount) {
+      container.createDiv({ cls: "dh-muted dh-notes-empty", text: "其他项目这一天没有笔记，点「今日内容」里的项目按钮即可记录。" });
+      return;
+    }
+    if (!visible.length) {
+      this.emptyState(container, "filter", "没有选中的分类", "点上方的标签来选择要查看的内容");
+      return;
+    }
+
+    for (const [path, g] of visible) {
+      const group = container.createEl("section", { cls: "dh-group" });
+      group.toggleClass("is-record", path === normalizePath(this.s.dateRecordFolder));
+      const gh = group.createDiv({ cls: "dh-group-head" });
+      setIcon(gh.createSpan({ cls: "dh-group-icon" }), path === normalizePath(this.s.dateRecordFolder) ? "notebook-pen" : "folder");
+      gh.createEl("h3", { text: g.label });
+      gh.createSpan({ cls: "dh-group-count", text: `${g.files.length}` });
+      if (this.projectByPath(path)?.archived) gh.createSpan({ cls: "dh-tag", text: "已存档" });
+      const tl = gh.createEl("button", { cls: "dh-btn dh-btn-icon-only dh-group-tl", attr: { "aria-label": "查看该项目时间线" } });
+      setIcon(tl, "history");
+      tl.addEventListener("click", () => this.showProjectTimeline(path));
+
+      for (const file of g.files) {
+        if (token !== this.notesToken) return;
+        const card = group.createEl("article", { cls: "dh-note" });
+        const nh = card.createDiv({ cls: "dh-note-head" });
+        const toggle = nh.createEl("button", { cls: "dh-note-toggle", attr: { "aria-label": "折叠/展开" } });
+        setIcon(toggle, "chevron-down");
+        const pth = nh.createDiv({ cls: "dh-note-path", text: file.parent?.path || "/" });
+        pth.setAttr("title", file.path);
+        const open = nh.createEl("button", { cls: "dh-btn dh-btn-soft dh-note-open", attr: { "aria-label": "打开原文" } });
+        setIcon(open.createSpan({ cls: "dh-btn-icon" }), "external-link");
+        open.createSpan({ cls: "dh-btn-label", text: "打开" });
+        open.addEventListener("click", (evt) => {
+          this.openFile(file, evt).catch((err) => {
+            console.error("[daily-hub] open failed", err);
+            new Notice(`无法打开：${file.path}`);
+          });
+        });
+        const flip = () => card.toggleClass("is-collapsed", !card.hasClass("is-collapsed"));
+        toggle.addEventListener("click", flip);
+        pth.addEventListener("click", flip);
+
+        const body = card.createDiv({ cls: "dh-note-body markdown-rendered" });
+        const md = await this.app.vault.cachedRead(file);
+        if (token !== this.notesToken) return;
+        if (!md.trim()) {
+          body.createDiv({ cls: "dh-muted", text: "笔记为空" });
+          continue;
+        }
+        await MarkdownRenderer.render(this.app, md, body, file.path, component);
+        if (token !== this.notesToken) return;
+        this.bindLinks(body, file.path);
+
+        if (this.s.clampLongNotes) {
+          window.requestAnimationFrame(() => {
+            if (body.scrollHeight <= 460) return;
+            card.addClass("is-clamped");
+            const more = card.createEl("button", { cls: "dh-note-more", text: "展开全文" });
+            more.addEventListener("click", () => {
+              const clamped = card.hasClass("is-clamped");
+              card.toggleClass("is-clamped", !clamped);
+              more.setText(clamped ? "收起" : "展开全文");
+            });
+          });
+        }
+      }
+    }
+  }
+
+  /* ----- AI ----- */
+
+  async runAi(recordFile) {
+    if (this.aiBusy) return;
+    const prov = providerOf(this.s.aiProvider);
+    if (!prov.noKey && !this.plugin.currentAiKey()) {
+      new Notice(`请先在插件设置里填写 ${prov.name} 的 API Key`);
+      this.plugin.openSettings();
+      return;
+    }
+    this.aiBusy = true;
+    this.renderDay();
+    const date = this.selectedDate;
+    try {
+      const items = await this.plugin.analyzeDay(date, recordFile);
+      if (!items.length) {
+        new Notice("没有发现属于其他项目的内容");
+        return;
+      }
+      new AiReviewModal(this.app, this.plugin, date, recordFile, items).open();
+    } catch (err) {
+      console.error("[daily-hub] AI failed", err);
+      new Notice(`AI 识别失败：${err.message || err}`, 8000);
+    } finally {
+      this.aiBusy = false;
+      this.renderDay();
+    }
+  }
+
+  bindLinks(el, sourcePath) {
+    el.addEventListener("click", (evt) => {
+      const a = evt.target.closest?.("a.internal-link");
+      if (!a) return;
+      evt.preventDefault();
+      const href = a.getAttr("data-href") || a.getAttr("href");
+      if (href) this.app.workspace.openLinkText(href, sourcePath, Keymap.isModEvent(evt));
+    });
+  }
+
+  emptyState(container, icon, title, desc) {
+    const e = container.createDiv({ cls: "dh-empty" });
+    setIcon(e.createDiv({ cls: "dh-empty-icon" }), icon);
+    e.createDiv({ cls: "dh-empty-title", text: title });
+    e.createDiv({ cls: "dh-empty-desc", text: desc });
+  }
+}
+
+/* ---------- modals ---------- */
+
+class RecordModal extends Modal {
+  constructor(app, plugin, { date, project, entry = null, preset = null, onDone }) {
+    super(app);
+    this.plugin = plugin;
+    this.preset = preset;
+    this.date = date;
+    this.project = project;
+    this.entry = entry;
+    this.onDone = onDone;
+    this.component = new Component();
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    this.component.load();
+    this.modalEl.addClass("dh-modal", "dh-record-modal");
+    const isRecord = this.project.isRecord;
+    const path = normalizePath(`${this.project.path}/${this.date}.md`);
+    const file = this.app.vault.getAbstractFileByPath(path);
+    const title = `${this.entry ? "编辑记录" : isRecord ? "日常记录" : this.project.label} · ${shortDate(this.date)}`;
+    if (this.setTitle) this.setTitle(title);
+    else contentEl.createEl("h3", { text: title });
+
+    // 记录方式：edit 修改已有条目；now 此刻（精确时间）；recall 回忆补记（不带时间，可选时段）
+    const isToday = this.date === keyOf(new Date());
+    const openedAt = new Date();
+    const nowMin = openedAt.getHours() * 60 + openedAt.getMinutes();
+    let mode = !isRecord ? "project" : this.entry ? "edit" : isToday && !this.preset ? "now" : "recall";
+    let periodKey = this.preset || null;
+    let timeInput = null;
+
+    if (isRecord && this.entry) {
+      const row = contentEl.createDiv({ cls: "dh-record-meta" });
+      setIcon(row.createSpan({ cls: "dh-record-meta-icon" }), "clock");
+      timeInput = row.createEl("input", { cls: "dh-record-time", attr: { type: "time" } });
+      timeInput.value = this.entry.time;
+      const per = row.createSpan({ cls: "dh-record-period" });
+      const upd = () => {
+        const m = parseTime(timeInput.value);
+        per.setText(m === null ? "" : `→ 写入「${periodOf(m).key}」`);
+      };
+      upd();
+      timeInput.addEventListener("input", upd);
+    } else if (isRecord) {
+      const row = contentEl.createDiv({ cls: "dh-record-meta" });
+      const seg = row.createDiv({ cls: "dh-seg" });
+      const opts = isToday
+        ? [["now", `此刻 ${fmtTime(nowMin)}`], ...PERIODS.map((p) => [p.key, `补记${p.key}`, p.from > nowMin])]
+        : [[null, "不分时段"], ...PERIODS.map((p) => [p.key, p.key])];
+      const hint = contentEl.createDiv({ cls: "dh-muted dh-record-mode-hint" });
+      const btns = [];
+      const sync = () => {
+        const cur = mode === "now" ? "now" : periodKey;
+        btns.forEach(([k, el]) => el.toggleClass("is-active", k === cur));
+        if (mode === "now") hint.setText(`记下精确时间 ${fmtTime(nowMin)}，写入「${periodOf(nowMin).key}」`);
+        else if (periodKey) hint.setText(`回忆补记，不记录具体时间，写在「${periodKey}」末尾`);
+        else hint.setText("不记录时间，写在这一天笔记的开头");
+        ta && (ta.placeholder = mode === "now" ? "此刻在做什么、想到什么…" : "回忆一下当时做了什么…");
+      };
+      for (const [key, label, disabled] of opts) {
+        const b = seg.createEl("button", { cls: "dh-seg-btn", text: label });
+        if (disabled) {
+          b.disabled = true;
+          b.setAttr("title", "这个时段还没到");
+        }
+        b.addEventListener("click", () => {
+          if (key === "now") {
+            mode = "now";
+            periodKey = null;
+          } else {
+            mode = "recall";
+            periodKey = key;
+          }
+          sync();
+        });
+        btns.push([key, b]);
+      }
+      // 打开时若是今天又没有指定时段，默认「此刻」；若指定了还没到的时段，退回「此刻」
+      if (isToday && periodKey && PERIODS.find((p) => p.key === periodKey).from > nowMin) {
+        mode = "now";
+        periodKey = null;
+      }
+      this.syncMode = sync;
+    }
+    if (file && !this.entry && mode !== "now") {
+      // 先看看当天已有的内容
+      const prev = contentEl.createEl("details", { cls: "dh-record-prev" });
+      prev.createEl("summary", { text: "当天已有内容" });
+      const box = prev.createDiv({ cls: "markdown-rendered" });
+      this.app.vault.cachedRead(file).then((t) => {
+        if (t.trim()) MarkdownRenderer.render(this.app, t, box, file.path, this.component);
+        else box.createDiv({ cls: "dh-muted", text: "（空）" });
+      });
+    }
+
+    let ta = null;
+    ta = contentEl.createEl("textarea", {
+      cls: "dh-record-text",
+      attr: {
+        placeholder: !isRecord ? `写点${this.project.label}的内容…` : mode === "recall" ? "回忆一下当时做了什么…" : "此刻在做什么、想到什么…",
+        rows: "6",
+      },
+    });
+    this.syncMode?.();
+    if (this.entry) ta.value = this.entry.text;
+    contentEl.createDiv({ cls: "dh-muted dh-record-hint", text: Platform.isMobile ? "" : "Ctrl / ⌘ + Enter 保存" });
+
+    const actions = contentEl.createDiv({ cls: "dh-modal-actions" });
+    if (file) {
+      const open = actions.createEl("button", { cls: "dh-record-open", text: "打开笔记" });
+      open.addEventListener("click", async () => {
+        this.close();
+        await this.app.workspace.getLeaf(false).openFile(file);
+      });
+    }
+    if (this.entry) {
+      const del = actions.createEl("button", { cls: "mod-warning", text: "删除" });
+      del.addEventListener("click", async () => {
+        await this.plugin.writeDailyEntry(this.date, null, this.entry.raw);
+        new Notice("已删除这条记录");
+        this.close();
+        this.onDone?.();
+      });
+    }
+    actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    const ok = actions.createEl("button", { cls: "mod-cta", text: "保存" });
+    const save = async () => {
+      const text = ta.value.replace(/\s+$/, "");
+      if (!text.trim()) {
+        if (!this.entry) {
+          ta.focus();
+          return;
+        }
+      }
+      ok.disabled = true;
+      try {
+        if (mode === "recall") {
+          await this.plugin.writeDailyEntry(this.date, null, null, { key: periodKey, text });
+          new Notice(periodKey ? `已补记到「${periodKey}」` : "已记录");
+        } else if (mode === "now") {
+          await this.plugin.writeDailyEntry(this.date, { min: nowMin, text });
+          new Notice(`已记录到「${periodOf(nowMin).key}」${fmtTime(nowMin)}`);
+        } else if (mode === "edit") {
+          const min = parseTime(timeInput.value);
+          if (min === null) {
+            new Notice("时间格式不对");
+            ok.disabled = false;
+            return;
+          }
+          await this.plugin.writeDailyEntry(this.date, text.trim() ? { min, text } : null, this.entry ? this.entry.raw : null);
+          new Notice(`已记录到「${periodOf(min).key}」${fmtTime(min)}`);
+        } else {
+          await this.plugin.appendProjectRecord(this.project.path, this.date, text);
+          new Notice(`已写入「${this.project.label}」`);
+        }
+        this.close();
+        this.onDone?.();
+      } catch (err) {
+        console.error("[daily-hub] save record failed", err);
+        new Notice(`保存失败：${err.message || err}`);
+        ok.disabled = false;
+      }
+    };
+    ok.addEventListener("click", save);
+    ta.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) {
+        e.preventDefault();
+        save();
+      }
+    });
+    window.setTimeout(() => ta.focus(), 60);
+  }
+
+  onClose() {
+    this.component.unload();
+    this.contentEl.empty();
+  }
+}
+
+class NewProjectModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    this.modalEl.addClass("dh-modal");
+    this.setTitle?.("新建项目");
+    if (!this.setTitle) contentEl.createEl("h3", { text: "新建项目" });
+    contentEl.createDiv({
+      cls: "dh-muted",
+      text: `会在「${this.plugin.settings.projectRoot}」下新建文件夹。可用 / 建子项目，例如：论文/新方向`,
+    });
+    const input = contentEl.createEl("input", { cls: "dh-input", attr: { type: "text", placeholder: "项目名称" } });
+    const row = contentEl.createDiv({ cls: "dh-modal-actions" });
+    const cancel = row.createEl("button", { text: "取消" });
+    const ok = row.createEl("button", { cls: "mod-cta", text: "创建" });
+    cancel.addEventListener("click", () => this.close());
+    const submit = async () => {
+      const name = input.value.trim().replace(/^\/+|\/+$/g, "");
+      if (!name) return;
+      if (/[\\:*?"<>|]/.test(name)) {
+        new Notice("名称里不能包含 \\ : * ? \" < > |");
+        return;
+      }
+      try {
+        await this.plugin.createProject(name);
+        this.close();
+      } catch (err) {
+        new Notice(`创建失败：${err.message || err}`);
+      }
+    };
+    ok.addEventListener("click", submit);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.isComposing) submit();
+    });
+    window.setTimeout(() => input.focus(), 50);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+class LinkModal extends Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    this.modalEl.addClass("dh-modal");
+    if (this.setTitle) this.setTitle("添加链接");
+    else contentEl.createEl("h3", { text: "添加链接" });
+    const name = contentEl.createEl("input", { cls: "dh-input", attr: { type: "text", placeholder: "名称，例如：课程表" } });
+    const url = contentEl.createEl("input", { cls: "dh-input", attr: { type: "text", placeholder: "地址，例如：https://example.com" } });
+    contentEl.createDiv({ cls: "dh-muted", text: "主页上只显示名称。地址不带 https:// 时会当作库里的笔记名打开。" });
+    const row = contentEl.createDiv({ cls: "dh-modal-actions" });
+    row.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    const ok = row.createEl("button", { cls: "mod-cta", text: "添加" });
+    const submit = async () => {
+      let u = url.value.trim();
+      const n = name.value.trim();
+      if (!u) return;
+      if (/^www\./i.test(u)) u = `https://${u}`;
+      this.plugin.settings.links = [...(this.plugin.settings.links || []), { name: n || u, url: u }];
+      await this.plugin.saveSettings();
+      this.close();
+    };
+    ok.addEventListener("click", submit);
+    for (const el of [name, url]) {
+      el.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.isComposing) submit();
+      });
+    }
+    window.setTimeout(() => name.focus(), 50);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+class AiReviewModal extends Modal {
+  constructor(app, plugin, date, recordFile, items) {
+    super(app);
+    this.plugin = plugin;
+    this.date = date;
+    this.recordFile = recordFile;
+    this.items = items.map((it) => ({ ...it, checked: true }));
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    this.modalEl.addClass("dh-modal", "dh-ai-modal");
+    const title = `AI 识别结果 · ${shortDate(this.date)}`;
+    if (this.setTitle) this.setTitle(title);
+    else contentEl.createEl("h3", { text: title });
+    contentEl.createDiv({
+      cls: "dh-muted",
+      text: "勾选要写入的条目，可以改项目和内容。日常记录不会被修改；同一天重复运行会替换之前 AI 写入的那一段。",
+    });
+
+    const projects = this.plugin.getProjects().filter((p) => !p.isRecord);
+    const list = contentEl.createDiv({ cls: "dh-ai-list" });
+    for (const it of this.items) {
+      const row = list.createDiv({ cls: "dh-ai-item" });
+      const top = row.createDiv({ cls: "dh-ai-item-top" });
+      const cb = top.createEl("input", { attr: { type: "checkbox" } });
+      cb.checked = it.checked;
+      cb.addEventListener("change", () => {
+        it.checked = cb.checked;
+        row.toggleClass("is-off", !cb.checked);
+      });
+      const sel = top.createEl("select", { cls: "dropdown" });
+      for (const p of projects) {
+        sel.createEl("option", { text: p.archived ? `${p.label}（已存档）` : p.label, attr: { value: p.path } });
+      }
+      sel.value = it.path;
+      const status = top.createSpan({ cls: "dh-ai-status" });
+      const updateStatus = () => {
+        const exists = this.app.vault.getAbstractFileByPath(normalizePath(`${it.path}/${this.date}.md`));
+        status.setText(exists ? "追加到已有笔记" : "新建笔记");
+      };
+      updateStatus();
+      sel.addEventListener("change", () => {
+        it.path = sel.value;
+        updateStatus();
+      });
+      const ta = row.createEl("textarea", { cls: "dh-ai-text" });
+      ta.value = it.summary;
+      ta.rows = Math.min(8, Math.max(3, it.summary.split("\n").length + 1));
+      ta.addEventListener("input", () => (it.summary = ta.value));
+      if (it.reason) row.createDiv({ cls: "dh-ai-reason", text: `依据：${it.reason}` });
+    }
+
+    const actions = contentEl.createDiv({ cls: "dh-modal-actions" });
+    actions.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    const ok = actions.createEl("button", { cls: "mod-cta", text: "写入所选项目" });
+    ok.addEventListener("click", async () => {
+      const chosen = this.items.filter((it) => it.checked && it.summary.trim());
+      if (!chosen.length) {
+        this.close();
+        return;
+      }
+      ok.disabled = true;
+      try {
+        const n = await this.plugin.writeAiItems(this.date, this.recordFile, chosen);
+        new Notice(`已写入 ${n} 个项目`);
+        this.close();
+      } catch (err) {
+        console.error("[daily-hub] write failed", err);
+        new Notice(`写入失败：${err.message || err}`);
+        ok.disabled = false;
+      }
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+/* ---------- settings ---------- */
+
+class DailyHubSettingTab extends PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
+    const s = this.plugin.settings;
+    const save = async () => this.plugin.saveSettings();
+    const text = (name, desc, key, placeholder = "") =>
+      new Setting(containerEl)
+        .setName(name)
+        .setDesc(desc)
+        .addText((t) =>
+          t.setPlaceholder(placeholder).setValue(s[key]).onChange(async (v) => {
+            s[key] = v.trim();
+            await save();
+          })
+        );
+    const toggle = (name, desc, key) =>
+      new Setting(containerEl)
+        .setName(name)
+        .setDesc(desc)
+        .addToggle((t) =>
+          t.setValue(s[key]).onChange(async (v) => {
+            s[key] = v;
+            await save();
+          })
+        );
+
+    new Setting(containerEl).setName("基础").setHeading();
+    text("主页标题", "", "title");
+    text("日期记录目录", "「今日内容」里固定排在最前的分类，当天内容也优先显示它。", "dateRecordFolder");
+    text("项目根目录", "该目录下的子目录会作为项目。", "projectRoot");
+    new Setting(containerEl)
+      .setName("忽略的文件夹名")
+      .setDesc("这些名字的文件夹不算项目，只写文件夹名、用逗号分隔，例如：attachments, assets, 附件")
+      .addText((t) =>
+        t.setPlaceholder("attachments, assets, 附件").setValue(s.ignoredFolderNames.join(", ")).onChange(async (v) => {
+          s.ignoredFolderNames = v.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
+          await save();
+        })
+      );
+    new Setting(containerEl)
+      .setName("今日内容默认显示数量")
+      .setDesc("超过的项目收进「更多」。0 表示全部显示。顺序在主页的「管理」里调整。")
+      .addSlider((sl) =>
+        sl.setLimits(0, 30, 1).setDynamicTooltip().setValue(s.launcherLimit).onChange(async (v) => {
+          s.launcherLimit = v;
+          await save();
+        })
+      );
+    new Setting(containerEl)
+      .setName("排除的目录")
+      .setDesc(
+        createFragment((f) => {
+          f.appendText("这些目录里的日期笔记不会出现在主页上。每行写一个，从库的根目录开始写，用 / 分隔，开头不加 /。");
+          f.createEl("br");
+          f.appendText("例如：");
+          f.createEl("code", { text: "99_归档/" });
+          f.appendText(" 排除整个归档文件夹；");
+          f.createEl("code", { text: "项目/旧项目/" });
+          f.appendText(" 只排除某个项目；");
+          f.createEl("code", { text: "templates/" });
+          f.appendText(" 排除模板。结尾的 / 建议保留，避免误伤同名开头的其他文件夹。");
+        })
+      )
+      .addTextArea((t) => {
+        t.inputEl.rows = 4;
+        t.inputEl.style.width = "100%";
+        t.setPlaceholder("99_归档/\n项目/旧项目/\ntemplates/").setValue(s.excludedFolderPrefixes.join("\n")).onChange(async (v) => {
+          s.excludedFolderPrefixes = v.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+          await save();
+        });
+      });
+
+    new Setting(containerEl).setName("AI 识别").setHeading();
+    const prov = providerOf(s.aiProvider);
+    new Setting(containerEl)
+      .setName("AI 服务")
+      .setDesc("切换服务时会自动填入对应的接口地址和推荐模型；每个服务的 API Key 分开保存。")
+      .addDropdown((d) => {
+        for (const p of AI_PROVIDERS) d.addOption(p.id, p.name);
+        d.setValue(prov.id).onChange(async (v) => {
+          const np = providerOf(v);
+          s.aiProvider = np.id;
+          if (np.id !== "custom") {
+            s.aiBaseUrl = np.baseUrl;
+            s.aiModel = np.model;
+          }
+          await save();
+          this.display();
+        });
+      });
+    if (!prov.noKey) {
+      new Setting(containerEl)
+        .setName(`${prov.name} API Key`)
+        .setDesc("保存在本插件的 data.json 中，会随库一起同步，不要把它提交到公开仓库。")
+        .addText((t) => {
+          t.inputEl.type = "password";
+          t.setPlaceholder(prov.format === "anthropic" ? "sk-ant-..." : "sk-...")
+            .setValue((s.aiKeys || {})[prov.id] || "")
+            .onChange(async (v) => {
+              s.aiKeys = { ...(s.aiKeys || {}), [prov.id]: v.trim() };
+              await save();
+            });
+        });
+    }
+    text("接口地址", prov.id === "custom" ? "填写 OpenAI 兼容接口的地址，例如 https://example.com/v1" : `默认 ${prov.baseUrl}，一般不用改。`, "aiBaseUrl", prov.baseUrl);
+    text("模型", `推荐 ${prov.model || "按服务商文档填写"}，也可以换成该服务支持的其他模型。`, "aiModel", prov.model);
+    new Setting(containerEl)
+      .setName("测试连接")
+      .setDesc("发送一句很短的测试请求，检查 Key、地址和模型是否可用。")
+      .addButton((btn) =>
+        btn.setButtonText("测试").onClick(async () => {
+          btn.setDisabled(true);
+          btn.setButtonText("测试中…");
+          try {
+            const out = await this.plugin.callAi("只回复 JSON。", '回复 {"ok":true}');
+            new Notice(`连接成功：${String(out).slice(0, 60)}`);
+          } catch (err) {
+            new Notice(`连接失败：${err.message || err}`, 8000);
+          } finally {
+            btn.setDisabled(false);
+            btn.setButtonText("测试");
+          }
+        })
+      );
+    new Setting(containerEl)
+      .setName("项目说明")
+      .setDesc("可选，每行「项目名: 说明」，帮助 AI 更准确地判断归属。例如：记账: 花钱、收入、价格")
+      .addTextArea((t) => {
+        t.inputEl.rows = 6;
+        t.inputEl.style.width = "100%";
+        t.setValue(s.projectHints).onChange(async (v) => {
+          s.projectHints = v;
+          await save();
+        });
+      });
+    new Setting(containerEl)
+      .setName("额外要求")
+      .setDesc("可选，补充给 AI 的整理要求。")
+      .addTextArea((t) => {
+        t.inputEl.rows = 3;
+        t.inputEl.style.width = "100%";
+        t.setValue(s.aiExtraPrompt).onChange(async (v) => {
+          s.aiExtraPrompt = v;
+          await save();
+        });
+      });
+
+    new Setting(containerEl).setName("同步到笔记文件").setHeading();
+    containerEl.createDiv({
+      cls: "setting-item-description",
+      text: "把「写给自己」「常用链接」「项目说明」「排除的目录」「额外要求」保存到库里的一个笔记中，和这里的设置双向同步。这样它们会随笔记一起同步到其他设备，也能直接在笔记里编辑。这个笔记不会出现在主页里。API Key 不会写进去。",
+    });
+    new Setting(containerEl)
+      .setName("开启同步")
+      .addToggle((t) =>
+        t.setValue(s.syncToFile).onChange(async (v) => {
+          s.syncToFile = v;
+          await this.plugin.saveData(s);
+          if (v) await this.plugin.syncFromFile({ createIfMissing: true });
+        })
+      );
+    new Setting(containerEl)
+      .setName("设置文件位置")
+      .setDesc("从库的根目录开始写，例如：项目/主页设置.md。修改后会在新位置创建文件，旧文件不会删除。")
+      .addText((t) =>
+        t.setPlaceholder("项目/主页设置.md").setValue(s.syncFilePath).onChange(async (v) => {
+          s.syncFilePath = v.trim();
+          await this.plugin.saveData(s);
+        })
+      );
+    new Setting(containerEl)
+      .setName("手动同步")
+      .setDesc("一般不需要：修改会自动同步。")
+      .addButton((b) =>
+        b.setButtonText("打开文件").onClick(async () => {
+          const path = this.plugin.syncPath();
+          if (!this.app.vault.getAbstractFileByPath(path)) await this.plugin.writeSyncFile();
+          const file = this.app.vault.getAbstractFileByPath(path);
+          if (file) {
+            this.app.setting?.close?.();
+            await this.app.workspace.getLeaf(true).openFile(file);
+          }
+        })
+      )
+      .addButton((b) =>
+        b.setButtonText("从文件读取").onClick(async () => {
+          this.plugin.lastSyncWrite = null;
+          await this.plugin.syncFromFile({ notify: true });
+          this.display();
+        })
+      )
+      .addButton((b) =>
+        b.setButtonText("写入文件").onClick(async () => {
+          await this.plugin.writeSyncFile();
+          new Notice("已写入设置文件");
+        })
+      );
+
+    new Setting(containerEl).setName("显示").setHeading();
+    toggle("显示左下角卡片", "包含「写给自己」「待办」「链接」三个页签，可在主页上切换。", "showMemo");
+    new Setting(containerEl)
+      .setName("「写给自己」内容")
+      .setDesc("支持 Markdown。")
+      .addTextArea((t) => {
+        t.inputEl.rows = 8;
+        t.inputEl.style.width = "100%";
+        t.setValue(s.memo).onChange(async (v) => {
+          s.memo = v;
+          await save();
+        });
+      });
+    new Setting(containerEl)
+      .setName("待办来源目录")
+      .setDesc("「待办」页签显示这个目录里所有笔记的任务（- [ ] 格式），可以直接打勾；新加的待办写到该目录今天的笔记里。例如：项目/待办规划")
+      .addText((t) =>
+        t.setPlaceholder("项目/待办规划").setValue(s.todoFolder).onChange(async (v) => {
+          s.todoFolder = v.trim().replace(/^\/+|\/+$/g, "");
+          await save();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("常用链接")
+      .setDesc("「链接」页签里显示的网址。主页上只显示名称，点击后打开地址。地址不带 https:// 时当作库里的笔记名。")
+      .addButton((b) =>
+        b.setButtonText("添加链接").onClick(async () => {
+          s.links = [...(s.links || []), { name: "", url: "" }];
+          await this.plugin.saveData(s);
+          this.display();
+        })
+      );
+    (s.links || []).forEach((link, i) => {
+      const row = new Setting(containerEl).setClass("dh-link-setting");
+      row.addText((t) =>
+        t.setPlaceholder("名称").setValue(link.name || "").onChange(async (v) => {
+          link.name = v.trim();
+          await save();
+        })
+      );
+      row.addText((t) => {
+        t.inputEl.style.width = "100%";
+        t.setPlaceholder("https://...").setValue(link.url || "").onChange(async (v) => {
+          link.url = v.trim();
+          await save();
+        });
+      });
+      row.addExtraButton((b) =>
+        b.setIcon("arrow-up").setTooltip("上移").setDisabled(i === 0).onClick(async () => {
+          const arr = s.links;
+          [arr[i - 1], arr[i]] = [arr[i], arr[i - 1]];
+          await save();
+          this.display();
+        })
+      );
+      row.addExtraButton((b) =>
+        b.setIcon("trash-2").setTooltip("删除").onClick(async () => {
+          s.links = s.links.filter((_, j) => j !== i);
+          await save();
+          this.display();
+        })
+      );
+    });
+
+    toggle("长笔记折叠", "超过一定高度的笔记先显示一部分。", "clampLongNotes");
+    toggle("手机默认周视图", "在手机上打开时，日历默认收起为一周。", "phoneWeekView");
+    toggle("启动时打开主页", "", "openOnStartup");
+    toggle("新标签页显示主页", "打开空白标签页时自动显示主页。", "replaceNewTabs");
+  }
+}
+
+/* ---------- plugin ---------- */
+
+const DailyHubPlugin = class DailyHubPlugin extends Plugin {
+  async onload() {
+    await this.loadSettings();
+    this.registerView(VIEW_TYPE, (leaf) => new DailyHubView(leaf, this));
+    this.addRibbonIcon("layout-dashboard", "打开主页", () => this.activateView());
+    this.addCommand({ id: "open", name: "打开主页", callback: () => this.activateView() });
+    this.addCommand({
+      id: "ai-today",
+      name: "AI 整理今天的日常记录到项目",
+      callback: async () => {
+        await this.activateView();
+        const view = this.getView ? this.getView() : this.app.workspace.getLeavesOfType(VIEW_TYPE)[0]?.view;
+        if (!(view instanceof DailyHubView)) return;
+        view.selectDate(keyOf(new Date()));
+        const record = view.recordFileFor(view.selectedDate);
+        if (record) view.runAi(record);
+        else new Notice("今天还没有日常记录");
+      },
+    });
+    this.settingTab = new DailyHubSettingTab(this.app, this);
+    this.addSettingTab(this.settingTab);
+
+    let timer = null;
+    const schedule = () => {
+      if (timer) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        timer = null;
+        this.forEachView((v) => v.refresh());
+      }, 400);
+    };
+    this.register(() => timer && window.clearTimeout(timer));
+    const relevant = (file, oldPath) =>
+      isFolder(file) ||
+      DATE_NAME_PATTERN.test(file?.basename || "") ||
+      (oldPath && DATE_NAME_PATTERN.test(oldPath.split("/").pop().replace(/\.md$/, "")));
+    this.registerEvent(this.app.vault.on("create", (f) => relevant(f) && schedule()));
+    this.registerEvent(this.app.vault.on("delete", (f) => relevant(f) && schedule()));
+    this.registerEvent(this.app.vault.on("rename", (f, old) => relevant(f, old) && schedule()));
+    this.registerEvent(
+      this.app.vault.on("modify", (f) => {
+        if (!DATE_NAME_PATTERN.test(f?.basename || "")) return;
+        let shown = false;
+        this.forEachView((v) => (shown = shown || v.selectedDate === f.basename));
+        if (shown) schedule();
+      })
+    );
+    let todoTimer = null;
+    this.registerEvent(
+      this.app.metadataCache.on("changed", (file) => {
+        const folder = normalizePath(this.settings.todoFolder || "");
+        if (!folder || !file.path.startsWith(`${folder}/`)) return;
+        if (todoTimer) window.clearTimeout(todoTimer);
+        todoTimer = window.setTimeout(() => {
+          todoTimer = null;
+          this.forEachView((v) => (this.settings.sideTab === "todo" ? v.renderMemo() : v.updateTodoBadge()));
+        }, 500);
+      })
+    );
+    this.register(() => todoTimer && window.clearTimeout(todoTimer));
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", (leaf) => {
+        if (leaf && this.settings.replaceNewTabs && leaf.getViewState().type === "empty") {
+          leaf.setViewState({ type: VIEW_TYPE, active: true });
+        }
+      })
+    );
+    // 设置文件被修改（包括其他设备同步过来）时读回设置
+    let syncReadTimer = null;
+    const onSyncFileChange = (f) => {
+      if (!this.settings.syncToFile || !this.syncReady || f?.path !== this.syncPath()) return;
+      if (syncReadTimer) window.clearTimeout(syncReadTimer);
+      syncReadTimer = window.setTimeout(() => {
+        syncReadTimer = null;
+        this.syncFromFile().catch((err) => console.error("[daily-hub] sync read failed", err));
+      }, 500);
+    };
+    this.registerEvent(this.app.vault.on("modify", onSyncFileChange));
+    this.registerEvent(this.app.vault.on("create", onSyncFileChange));
+    this.register(() => {
+      if (syncReadTimer) window.clearTimeout(syncReadTimer);
+      if (this.syncTimer) window.clearTimeout(this.syncTimer);
+    });
+
+    this.app.workspace.onLayoutReady(async () => {
+      if (this.settings.syncToFile) {
+        try {
+          // 生活文件夹还不存在（还没用过生活面板）时不主动建设置文件
+          await this.syncFromFile({ createIfMissing: !!this.app.vault.getAbstractFileByPath(normalizePath(this.settings.lifeRoot || "")) });
+        } catch (err) {
+          console.error("[daily-hub] initial sync failed", err);
+        }
+      }
+      this.syncReady = true;
+      if (this.settings.openOnStartup) this.activateView();
+    });
+  }
+
+  onunload() {}
+
+  forEachView(fn) {
+    if (this.hostViews) { for (const v of this.hostViews()) if (v instanceof DailyHubView) fn(v); return; }
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+      if (leaf.view instanceof DailyHubView) fn(leaf.view);
+    }
+  }
+
+  openSettings() {
+    const setting = this.app.setting;
+    if (setting?.open) {
+      setting.open();
+      setting.openTabById?.(this.manifest.id);
+    }
+  }
+
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, (await this.loadData()) || {});
+    for (const k of ["excludedFolderPrefixes", "projectOrder", "archivedProjects", "ignoredFolderNames", "links"]) {
+      if (!Array.isArray(this.settings[k])) this.settings[k] = [...DEFAULT_SETTINGS[k]];
+    }
+    if (!this.settings.aiKeys || typeof this.settings.aiKeys !== "object") this.settings.aiKeys = {};
+    // 旧版只有一个 Key：归到 DeepSeek
+    if (this.settings.aiApiKey && !this.settings.aiKeys.deepseek) {
+      this.settings.aiKeys.deepseek = this.settings.aiApiKey;
+    }
+    this.settings.aiApiKey = "";
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
+    this.scheduleSyncWrite();
+    this.forEachView((v) => {
+      v.buildIndex();
+      v.renderAll();
+    });
+  }
+
+  /* ----- 同步到笔记文件 ----- */
+
+  syncPath() {
+    const p = normalizePath((this.settings.syncFilePath || "").trim());
+    if (!p) return "";
+    return p.endsWith(".md") ? p : `${p}.md`;
+  }
+
+  syncSnapshot() {
+    const s = this.settings;
+    return JSON.stringify(SYNC_SECTIONS.map(([k]) => s[k]));
+  }
+
+  scheduleSyncWrite() {
+    if (!this.settings.syncToFile || !this.syncReady) return;
+    if (this.syncTimer) window.clearTimeout(this.syncTimer);
+    this.syncTimer = window.setTimeout(() => {
+      this.syncTimer = null;
+      this.writeSyncFile().catch((err) => console.error("[daily-hub] sync write failed", err));
+    }, 800);
+  }
+
+  async writeSyncFile() {
+    const path = this.syncPath();
+    if (!path) return;
+    const content = buildSyncFile(this.settings);
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file) {
+      const cur = await this.app.vault.read(file);
+      // 只比较同步内容，避免无意义的改写
+      if (cur === content) return;
+      this.lastSyncWrite = content;
+      await this.app.vault.modify(file, content);
+    } else {
+      const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+      if (dir && !this.app.vault.getAbstractFileByPath(dir)) await this.app.vault.createFolder(dir);
+      this.lastSyncWrite = content;
+      await this.app.vault.create(path, content);
+    }
+  }
+
+  /** 从笔记文件读回设置；文件不存在时用当前设置创建 */
+  async syncFromFile({ createIfMissing = false, notify = false } = {}) {
+    const path = this.syncPath();
+    if (!path) return;
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!file || !("extension" in file)) {
+      if (createIfMissing) await this.writeSyncFile();
+      return;
+    }
+    const text = await this.app.vault.read(file);
+    if (text === this.lastSyncWrite) return;
+    const parsed = parseSyncFile(text);
+    if (!Object.keys(parsed).length) {
+      if (notify) new Notice("文件里没有找到同步标记，未做修改");
+      return;
+    }
+    const before = this.syncSnapshot();
+    Object.assign(this.settings, parsed);
+    if (this.syncSnapshot() === before) return;
+    await this.saveData(this.settings);
+    this.forEachView((v) => {
+      v.buildIndex();
+      v.renderAll();
+    });
+    const tab = this.settingTab;
+    if (tab && tab.containerEl && tab.containerEl.isConnected && !tab.containerEl.contains(document.activeElement)) {
+      tab.display();
+    }
+    if (notify) new Notice("已从笔记文件读取设置");
+  }
+
+  /* ----- projects ----- */
+
+  getProjects() {
+    const s = this.settings;
+    const vault = this.app.vault;
+    const out = [];
+    const record = vault.getAbstractFileByPath(normalizePath(s.dateRecordFolder));
+    if (isFolder(record)) {
+      out.push({ path: record.path, label: record.name, isRecord: true, archived: false });
+    }
+    const root = vault.getAbstractFileByPath(normalizePath(s.projectRoot));
+    if (!isFolder(root)) return out;
+    const ignored = new Set(s.ignoredFolderNames);
+    const archived = new Set(s.archivedProjects);
+    const order = new Map(s.projectOrder.map((p, i) => [p, i]));
+    const list = collectProjectTargets(root, root.path, ignored).map((folder) => ({
+      path: folder.path,
+      label: folder.path.slice(root.path.length + 1).split("/").join(" / "),
+      isRecord: false,
+      archived: archived.has(folder.path),
+    }));
+    list.sort((a, b) => {
+      const ia = order.has(a.path) ? order.get(a.path) : Infinity;
+      const ib = order.has(b.path) ? order.get(b.path) : Infinity;
+      if (ia !== ib) return ia - ib;
+      return a.label.localeCompare(b.label, "zh-CN");
+    });
+    return out.concat(list);
+  }
+
+  currentOrder() {
+    return this.getProjects().filter((p) => !p.isRecord).map((p) => p.path);
+  }
+
+  async moveProject(path, delta) {
+    const order = this.currentOrder();
+    const i = order.indexOf(path);
+    if (i === -1) return;
+    order.splice(i, 1);
+    if (delta === "top") order.unshift(path);
+    else order.splice(Math.max(0, Math.min(order.length, i + delta)), 0, path);
+    this.settings.projectOrder = order;
+    await this.saveSettings();
+  }
+
+  async toggleArchive(path) {
+    const set = new Set(this.settings.archivedProjects);
+    if (set.has(path)) set.delete(path);
+    else set.add(path);
+    this.settings.archivedProjects = [...set];
+    await this.saveSettings();
+  }
+
+  async sortByFrequency(filesByDate) {
+    const since = keyOf(addDays(new Date(), -30));
+    const counts = new Map();
+    for (const [k, files] of filesByDate) {
+      if (k < since) continue;
+      for (const f of files) {
+        const p = f.parent?.path || "";
+        counts.set(p, (counts.get(p) || 0) + 1);
+      }
+    }
+    const order = this.currentOrder();
+    const pos = new Map(order.map((p, i) => [p, i]));
+    order.sort((a, b) => (counts.get(b) || 0) - (counts.get(a) || 0) || pos.get(a) - pos.get(b));
+    this.settings.projectOrder = order;
+    await this.saveSettings();
+    new Notice("已按近 30 天的笔记数量重新排序");
+  }
+
+  async createProject(name) {
+    const path = normalizePath(`${this.settings.projectRoot}/${name}`);
+    if (this.app.vault.getAbstractFileByPath(path)) throw new Error("同名项目已存在");
+    await this.app.vault.createFolder(path);
+    this.settings.projectOrder = [...this.currentOrder().filter((p) => p !== path), path];
+    await this.saveSettings();
+    new Notice(`已创建项目：${name}`);
+  }
+
+  /* ----- AI ----- */
+
+  async analyzeDay(date, recordFile) {
+    const s = this.settings;
+    const daily = (await this.app.vault.cachedRead(recordFile)).trim();
+    if (!daily) return [];
+    const projects = this.getProjects().filter((p) => !p.isRecord && !p.archived);
+    // 科研相关的内容交给科研工作台的「科研日志」，生活和科研分开记
+    if (__dh.__host && s.researchTarget !== false) projects.push({ path: "__research_log", label: "科研日志", isRecord: false, archived: false, research: true });
+    if (!projects.length) return [];
+
+    const hints = new Map();
+    for (const line of (s.projectHints || "").split(/\r?\n/)) {
+      const m = line.match(/^\s*(.+?)\s*[:：]\s*(.+)$/);
+      if (m) hints.set(m[1].trim(), m[2].trim());
+    }
+    const projectLines = projects.map((p) => {
+      if (p.research) return `- ${p.label}：科研相关的事（读文献、实验、写论文、组会、和导师沟通、科研工具），会写进科研工作台的科研日志`;
+      const h = hints.get(p.label) || hints.get(p.label.replace(/ \/ /g, "/"));
+      return `- ${p.label}${h ? `：${h}` : ""}`;
+    });
+
+    const existing = [];
+    for (const p of projects) {
+      if (p.research) continue;
+      const f = this.app.vault.getAbstractFileByPath(normalizePath(`${p.path}/${date}.md`));
+      if (!f || !("extension" in f)) continue;
+      const txt = stripAiBlock(await this.app.vault.cachedRead(f)).trim();
+      if (txt) existing.push(`### ${p.label}\n${txt.slice(0, 800)}`);
+    }
+
+    const system = [
+      "你是个人笔记整理助手。用户每天主要写「日常记录」，里面常常夹带属于其他项目的内容。",
+      "任务：找出日常记录中属于给定项目的内容，按项目归类，为每个项目写简短摘要。",
+      "规则：",
+      "1. project 必须与项目列表中的名称完全一致，不能编造新项目。",
+      "2. 摘要用中文 Markdown 无序列表，每个项目 1-5 条，每条尽量不超过 40 字，保留关键数字、名称、时间和结论。",
+      "3. 只归类有明确依据的内容；不确定、或是无法归入任何项目的普通生活流水，一律忽略。",
+      "4. 如果该项目当天已有笔记且已经记录了相同信息，不要重复输出。",
+      "5. 只输出 JSON：{\"items\":[{\"project\":\"项目名\",\"summary\":\"- 要点\\n- 要点\",\"reason\":\"一句话说明依据\"}]}，没有则输出 {\"items\":[]}。",
+      s.aiExtraPrompt ? `补充要求：${s.aiExtraPrompt}` : "",
+    ].filter(Boolean).join("\n");
+
+    const user = [
+      `日期：${date}`,
+      "",
+      "【项目列表】",
+      ...projectLines,
+      "",
+      existing.length ? "【这些项目当天已有的内容（不要重复）】\n" + existing.join("\n\n") : "【这些项目当天均无笔记】",
+      "",
+      "【日常记录】",
+      daily.slice(0, 12000),
+    ].join("\n");
+
+    const content = await this.callAi(system, user);
+    const parsed = parseJsonLoose(content);
+    const byLabel = new Map(projects.map((p) => [p.label, p]));
+    const byLoose = new Map(projects.map((p) => [p.label.replace(/\s/g, ""), p]));
+    const merged = new Map();
+    for (const it of Array.isArray(parsed?.items) ? parsed.items : []) {
+      const name = String(it.project || "").trim();
+      const p = byLabel.get(name) || byLoose.get(name.replace(/\s/g, ""));
+      const summary = String(it.summary || "").trim();
+      if (!p || !summary) continue;
+      const prev = merged.get(p.path);
+      if (prev) prev.summary += `\n${summary}`;
+      else merged.set(p.path, { path: p.path, label: p.label, summary, reason: String(it.reason || "").trim() });
+    }
+    return [...merged.values()];
+  }
+
+  currentAiKey() {
+    const s = this.settings;
+    return ((s.aiKeys && s.aiKeys[s.aiProvider]) || "").trim();
+  }
+
+  async callAi(system, user) {
+    const s = this.settings;
+    const host = __dh.__host;
+    if (host && s.useHostAi !== false) {
+      if (!host.directAiReady()) throw new Error("先在 设置 → 科研工作台 → AI 填接口地址和密钥（生活面板和科研共用这套 AI）");
+      return host.directChat([{ role: "system", content: system }, { role: "user", content: user }], { quick: true });
+    }
+    const prov = providerOf(s.aiProvider);
+    const key = this.currentAiKey();
+    const base = (s.aiBaseUrl || prov.baseUrl || "").trim().replace(/\/+$/, "");
+    const model = (s.aiModel || prov.model || "").trim();
+    if (!base) throw new Error("请先在设置里填写接口地址");
+    if (!model) throw new Error("请先在设置里填写模型名称");
+    const errMsg = (res) => {
+      let msg = "";
+      try {
+        msg = res.json?.error?.message || res.json?.message || "";
+      } catch (e) {
+        msg = "";
+      }
+      return `${prov.name} 返回 ${res.status}${msg ? `：${msg}` : ""}`;
+    };
+
+    if (prov.format === "anthropic") {
+      const res = await requestUrl({
+        url: `${base}/messages`,
+        method: "POST",
+        throw: false,
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": key,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 2048,
+          temperature: 0.2,
+          system,
+          messages: [{ role: "user", content: user }],
+        }),
+      });
+      if (res.status >= 400) throw new Error(errMsg(res));
+      return (res.json?.content || []).map((c) => c.text || "").join("");
+    }
+
+    const url = /\/chat\/completions$/.test(base) ? base : `${base}/chat/completions`;
+    const headers = { "Content-Type": "application/json" };
+    if (key) headers.Authorization = `Bearer ${key}`;
+    const send = (jsonMode) =>
+      requestUrl({
+        url,
+        method: "POST",
+        throw: false,
+        headers,
+        body: JSON.stringify({
+          model,
+          temperature: 0.2,
+          ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: user },
+          ],
+        }),
+      });
+    let res = await send(true);
+    // 部分服务不支持 JSON 模式，去掉后重试一次
+    if (res.status === 400 || res.status === 422) res = await send(false);
+    if (res.status >= 400) throw new Error(errMsg(res));
+    return res.json?.choices?.[0]?.message?.content || "";
+  }
+
+  /* ----- 待办与链接 ----- */
+
+  async setTaskDone(task, done) {
+    await this.app.vault.process(task.file, (text) => {
+      const lines = text.split("\n");
+      let idx = task.line;
+      if (lines[idx] !== task.raw) idx = lines.indexOf(task.raw);
+      if (idx === -1) throw new Error("这条待办在笔记里已被修改，请刷新后再试");
+      lines[idx] = lines[idx].replace(/^(\s*(?:[-*+]|\d+[.)])\s+\[)(.)(\])/, `$1${done ? "x" : " "}$3`);
+      task.raw = lines[idx];
+      task.line = idx;
+      return lines.join("\n");
+    });
+  }
+
+  /** 写入 / 修改 / 删除一条日常记录，并整理为上午、下午、晚上 */
+  async writeDailyEntry(date, add, removeRaw = null, addText = null) {
+    const folder = normalizePath(this.settings.dateRecordFolder);
+    const path = normalizePath(`${folder}/${date}.md`);
+    const adds = add ? [add] : [];
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!file) {
+      if (!adds.length && !addText) return;
+      if (!isFolder(this.app.vault.getAbstractFileByPath(folder))) await this.app.vault.createFolder(folder);
+      await this.app.vault.create(path, organizeDaily("", { add: adds, addText }));
+      return;
+    }
+    await this.app.vault.process(file, (t) => organizeDaily(t, { add: adds, removeRaw, addText }));
+  }
+
+  /** 项目：在当天笔记末尾追加一段 */
+  async appendProjectRecord(projectPath, date, text) {
+    const path = normalizePath(`${projectPath}/${date}.md`);
+    const file = this.app.vault.getAbstractFileByPath(path);
+    const body = text.replace(/\s+$/, "");
+    if (!file) {
+      if (!isFolder(this.app.vault.getAbstractFileByPath(projectPath))) await this.app.vault.createFolder(projectPath);
+      await this.app.vault.create(path, `${body}\n`);
+      return;
+    }
+    await this.app.vault.process(file, (t) => {
+      const trimmed = t.replace(/\s+$/, "");
+      return `${trimmed}${trimmed ? "\n\n" : ""}${body}\n`;
+    });
+  }
+
+  async addTodo(text) {
+    const folder = normalizePath(this.settings.todoFolder);
+    if (!isFolder(this.app.vault.getAbstractFileByPath(folder))) await this.app.vault.createFolder(folder);
+    const path = normalizePath(`${folder}/${keyOf(new Date())}.md`);
+    const line = `- [ ] ${text}`;
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!file) await this.app.vault.create(path, `${line}\n`);
+    else
+      await this.app.vault.process(file, (t) => {
+        const trimmed = t.replace(/\s+$/, "");
+        return `${trimmed}${trimmed ? "\n" : ""}${line}\n`;
+      });
+  }
+
+  openLink(url, evt) {
+    const u = String(url || "").trim();
+    if (!u) return;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(u)) {
+      window.open(u, "_blank");
+      return;
+    }
+    // 没有协议的当作库内笔记
+    this.app.workspace.openLinkText(u.replace(/^\[\[|\]\]$/g, ""), "", Keymap.isModEvent(evt));
+  }
+
+  async writeAiItems(date, recordFile, items) {
+    const link = this.app.fileManager.generateMarkdownLink
+      ? this.app.fileManager.generateMarkdownLink(recordFile, "", "", "日常记录")
+      : `[[${recordFile.path.replace(/\.md$/, "")}|日常记录]]`;
+    let n = 0;
+    for (const it of items) {
+      if (it.path === "__research_log" && __dh.__host) {
+        const when = parseKey(date);
+        when.setHours(21, 0, 0, 0);
+        for (const l of it.summary.split("\n").map((x) => x.replace(/^\s*[-*+]\s*/, "").trim()).filter(Boolean)) {
+          await __dh.__host.addLog({ text: l, when, tags: ["日记整理"] });
+        }
+        n += 1;
+        continue;
+      }
+      const path = normalizePath(`${it.path}/${date}.md`);
+      const block = `${AI_START}\n> [!abstract] 摘自${link}（AI 整理）\n${it.summary
+        .trim()
+        .split("\n")
+        .map((l) => `> ${l}`)
+        .join("\n")}\n${AI_END}`;
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!file) {
+        await this.app.vault.create(path, `${block}\n`);
+      } else {
+        await this.app.vault.process(file, (text) => {
+          const s = text.indexOf(AI_START);
+          const e = text.indexOf(AI_END);
+          if (s !== -1 && e > s) return text.slice(0, s) + block + text.slice(e + AI_END.length);
+          const trimmed = text.replace(/\s+$/, "");
+          return `${trimmed}${trimmed ? "\n\n" : ""}${block}\n`;
+        });
+      }
+      n += 1;
+    }
+    return n;
+  }
+
+  async activateView() {
+    const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
+    if (existing) {
+      this.app.workspace.revealLeaf(existing);
+      return;
+    }
+    const leaf = this.app.workspace.getLeaf(true);
+    await leaf.setViewState({ type: VIEW_TYPE, active: true });
+    this.app.workspace.revealLeaf(leaf);
+  }
+};
+
+function parseJsonLoose(text) {
+  const t = String(text).replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  try {
+    return JSON.parse(t);
+  } catch (e) {
+    const s = t.indexOf("{");
+    const end = t.lastIndexOf("}");
+    if (s !== -1 && end > s) {
+      try {
+        return JSON.parse(t.slice(s, end + 1));
+      } catch (e2) {
+        /* fallthrough */
+      }
+    }
+  }
+  throw new Error("AI 返回的内容无法解析");
+}
+
+module.exports = DailyHubPlugin;
+module.exports._classes = { DailyHubPlugin, DailyHubView, DailyHubSettingTab, VIEW_TYPE, DEFAULT_SETTINGS, keyOf, organizeDaily };
+
+  })(__dh, __dh.exports, (n) => (n === 'obsidian' ? obsidian : require(n)));
+  __dh.loaded = true;
+  return __dh.exports;
+}
+/* ======== DAILY-HUB-END ======== */
+
 module.exports = class ResearchWorkbenchPlugin extends Plugin {
   /* 移动端：量出底部悬浮工具栏挡住的高度，写进 --rw-nav-inset，输入框等据此让开 */
   /* ---------- Mindflow（合并进来的划线追问对话） ---------- */
@@ -13639,6 +16740,50 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     tip.textContent = '正在使用科研工作台的 AI 接口（上面「AI」一节：' + (this.settings.llmModel || '未设置模型') + '）。想给 Mindflow 单独配接口，关掉上面的「Mindflow 使用工作台的 AI 接口」。';
     a.after(tip);
   }
+  /* ---------- 生活面板（合并进来的 Daily Hub） ---------- */
+  setupLife() {
+    let M;
+    try { M = __loadDailyHub(this); } catch (e) { console.error('[科研工作台] 生活面板代码加载失败', e); return; }
+    const C = (this.dhClasses = M._classes);
+    if (this.app.plugins && this.app.plugins.enabledPlugins && this.app.plugins.enabledPlugins.has && this.app.plugins.enabledPlugins.has('daily-hub')) {
+      new Notice('Daily Hub 已合并进科研工作台的「生活」面板：请在 设置 → 第三方插件 里关掉独立的 Daily Hub，避免重复', 10000);
+    }
+    const dh = new C.DailyHubPlugin(this.app, this.manifest);
+    this.dailyHub = dh;
+    dh.loadData = async () => this.settings.life || null;
+    dh.saveData = async (d) => { this.settings.life = JSON.parse(JSON.stringify(d)); await this.saveSettings(); };
+    dh.registerView = () => {};
+    dh.addRibbonIcon = () => null;
+    const addCmd = dh.addCommand.bind(dh);
+    dh.addCommand = (c) => addCmd(Object.assign({}, c, { id: 'life-' + c.id, name: '生活：' + c.name }));
+    dh.addSettingTab = (tab) => { this.lifeSettingTab = tab; };
+    dh.activateView = () => this.openLife();
+    dh.hostViews = () => this.lifeViews();
+    dh.getView = () => this.lifeViews()[0] || null;
+    dh.openSettings = () => this.openSettings();
+    const ol = dh.onload.bind(dh);
+    let ready;
+    this._lifeReady = new Promise((r) => (ready = r));
+    dh.onload = async () => { try { await ol(); } catch (e) { console.error('[科研工作台] 生活面板启动失败', e); } ready(); };
+    this.addChild(dh);
+  }
+  lifeViews() { return this.app.workspace.getLeavesOfType(VIEW_TYPE).map((l) => l.view && l.view.lifeView).filter(Boolean); }
+  async openLife() {
+    await this.activateView();
+    const leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
+    const wb = leaf && leaf.view;
+    if (!wb || !wb.setMode) return null;
+    wb.setMode('life', 'life');
+    return wb.showLife();
+  }
+  /* 路径属于科研 / 生活 / 知识库 哪一边 */
+  scopeOfPath(path) {
+    const lr = normalizePath(this.settings.lifeFolder || '生活');
+    if (path === lr || String(path).startsWith(lr + '/')) return 'life';
+    const kb = normalizePath(this.settings.kbFolder || '知识库');
+    if (path === kb || String(path).startsWith(kb + '/')) return 'kb';
+    return 'research';
+  }
   mfViews() {
     return this.app.workspace.getLeavesOfType(VIEW_TYPE).map((l) => l.view && l.view.mfView).filter(Boolean);
   }
@@ -13703,6 +16848,10 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     this.registerView(READER_VIEW, (leaf) => new ReaderView(leaf, this));
     this.registerView(PAPER_READER_VIEW, (leaf) => new PaperReaderView(leaf, this));
     this.setupMindflow();
+    this.setupLife();
+    this.addCommand({ id: 'open-life', name: '打开生活面板', callback: () => this.openLife() });
+    this.addCommand({ id: 'open-research', name: '打开科研面板', callback: async () => { await this.activateView(); const l = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0]; if (l && l.view && l.view.setMode) l.view.setMode('research'); } });
+    this.addCommand({ id: 'import-vault', name: '从另一个库导入（合并自学集等）', callback: () => this.importVaultModal() });
     // .html 直接在 Obsidian 里打开（论文 HTML 阅读页、速成手册等）
     try {
       this.registerView(HTML_VIEW, (leaf) => new HtmlFileView(leaf, this));
@@ -14440,7 +17589,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
   actQuiet(path, ms) { (this._actQuiet = this._actQuiet || new Map()).set(path, Date.now() + (ms || 8000)); }
   actIsQuiet(path) { const t = this._actQuiet && this._actQuiet.get(path); return !!t && t > Date.now(); }
   act(e) {
-    if (this.settings.activityOn === false) return;
+    if (this.settings.activityOn === false || this._actMute) return;
     e.t = e.t || Date.now();
     e.id = e.id || uid();
     (this._actQ = this._actQ || []).push(e);
@@ -14946,6 +18095,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
 
   newProjectModal(preset) { new NewProjectModal(this.app, this, preset).open(); }
   newNoteModal(preset) { if (preset && preset.type === 'meeting') return this.newMeetingModal(preset); new NewNoteModal(this.app, this, preset).open(); }
+  importVaultModal() { new ImportVaultModal(this.app, this).open(); }
   newMeetingModal(preset) { new NewMeetingModal(this.app, this, preset || {}).open(); }
   /* 新建会议纪要：标题 + 简介 + 材料（录音 / 视频 / PPT / PDF…）一步完成，材料放进纪要自己的附件文件夹 */
   async createMeeting(v) {
@@ -16696,7 +19846,11 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
   pickPdfFor(n) { new PdfPickModal(this.app, this, n).open(); }
 
   /* ---------- 项目文件夹 ---------- */
-  projectDir(name) { return normalizePath(this.settings.rootFolder + '/项目/' + name); }
+  projectDir(name) {
+    if (name === '__kb') return normalizePath(this.settings.kbFolder || '知识库');
+    if (name === '__life') return normalizePath(this.settings.lifeFolder || '生活');
+    return normalizePath(this.settings.rootFolder + '/项目/' + name);
+  }
   listDir(path) {
     const f = this.app.vault.getAbstractFileByPath(path);
     const kids = (f && f.children) || [];
