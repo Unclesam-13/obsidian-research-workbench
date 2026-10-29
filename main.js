@@ -8266,6 +8266,7 @@ function ftReaderPage(o) {
   const css = `
 :root{--bg:#fbfaf7;--fg:#1f2328;--muted:#6b7280;--line:#e5e2da;--card:#fff;--accent:#7c3aed;--fs:17px;--lh:1.8;--w:860px}
 [data-theme=dark]{--bg:#16171a;--fg:#e6e6e6;--muted:#9aa0a6;--line:#2c2e33;--card:#1d1f23;--accent:#a78bfa}
+[data-theme=white]{--bg:#ffffff;--card:#ffffff;--line:#e6e6e6}
 @media (prefers-color-scheme:dark){[data-theme=auto]{--bg:#16171a;--fg:#e6e6e6;--muted:#9aa0a6;--line:#2c2e33;--card:#1d1f23;--accent:#a78bfa}}
 *{box-sizing:border-box}html,body{margin:0;padding:0}
 body{background:var(--bg);color:var(--fg);font-family:"Iowan Old Style","Source Han Serif SC","Noto Serif CJK SC","Songti SC",Georgia,serif;font-size:var(--fs);line-height:var(--lh)}
@@ -8307,8 +8308,8 @@ function apply(){document.documentElement.style.setProperty('--fs',fs+'px');docu
 document.querySelectorAll('[data-m]').forEach(function(x){x.onclick=function(){b.setAttribute('data-mode',x.getAttribute('data-m'));ls.set('rw-ft-mode',x.getAttribute('data-m'));apply()}});
 document.getElementById('fs-').onclick=function(){fs=Math.max(12,fs-1);ls.set('rw-ft-fs',fs);apply()};document.getElementById('fs+').onclick=function(){fs=Math.min(28,fs+1);ls.set('rw-ft-fs',fs);apply()};
 document.getElementById('font').onclick=function(){b.classList.toggle('sans');ls.set('rw-ft-sans',b.classList.contains('sans')?'1':'0')};
-document.getElementById('theme').onclick=function(){th=th==='auto'?'dark':th==='dark'?'light':'auto';document.documentElement.setAttribute('data-theme',th);ls.set('rw-ft-theme',th);this.textContent={auto:'自动',dark:'深色',light:'浅色'}[th]};
-document.getElementById('theme').textContent={auto:'自动',dark:'深色',light:'浅色'}[th];
+document.getElementById('theme').onclick=function(){th=th==='auto'?'white':th==='white'?'light':th==='light'?'dark':'auto';document.documentElement.setAttribute('data-theme',th);ls.set('rw-ft-theme',th);this.textContent={auto:'自动',dark:'深色',light:'米黄',white:'纯白'}[th]};
+document.getElementById('theme').textContent={auto:'自动',dark:'深色',light:'米黄',white:'纯白'}[th];
 document.getElementById('toc').onclick=function(){if(window.innerWidth<=760)b.classList.toggle('showtoc');else b.classList.toggle('notoc')};
 function buildToc(){var nav=document.querySelector('nav');nav.innerHTML='';var side=b.getAttribute('data-mode')==='zh'?'.zh':'.en';document.querySelectorAll(side+' h1,'+side+' h2,'+side+' h3').forEach(function(h){var a=document.createElement('a');a.textContent=h.textContent;a.href='#'+h.id;a.className='l'+h.tagName.slice(1);a.onclick=function(e){e.preventDefault();h.scrollIntoView({behavior:'smooth',block:'start'});b.classList.remove('showtoc')};nav.appendChild(a)});if(!nav.children.length)nav.innerHTML='<div style="color:var(--muted)">没有标题</div>'}
 apply();})();`;
@@ -8336,6 +8337,8 @@ const HTML_BRIDGE = '<script>(function(){var t=null,last="";function hov(){retur
   'function restore(p){rest=true;armed=false;var t0=Date.now(),okN=0,user=false;var stop=function(){user=true};["wheel","touchstart","keydown","mousedown"].forEach(function(n){window.addEventListener(n,stop,{capture:true,once:true})});' +
   'var go=function(){var se=document.scrollingElement||document.documentElement;var ok=true;if(p.y){se.scrollTop=p.y;if(Math.abs(se.scrollTop-p.y)>4)ok=false}if(p.ei!=null){var e=allEls()[p.ei];if(e){e.scrollTop=p.ey;if(Math.abs(e.scrollTop-p.ey)>4)ok=false}}return ok};' +
   'var tick=function(){if(user){rest=false;armed=true;return}var ok=go();okN=ok?okN+1:0;if(okN>=3||Date.now()-t0>15000){rest=false;return}setTimeout(tick,300)};tick()}' +
+  'function paper(v){try{var st=document.getElementById("rw-paper");if(!st){st=document.createElement("style");st.id="rw-paper";(document.head||document.documentElement).appendChild(st)}if(v==="white"){var hasVar=getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();st.textContent=hasVar?":root[data-theme=light],:root[data-theme=white],:root:not([data-theme]){--bg:#fff!important;--card:#fff!important}@media (prefers-color-scheme:light){:root[data-theme=auto]{--bg:#fff!important;--card:#fff!important}}":"html,body{background:#fff!important}"}else st.textContent=""}catch(x){}}' +
+  'window.addEventListener("message",function(e){if(e.data&&e.data.rwHtml==="paper"){var v=e.data.v;if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",function(){paper(v)});else paper(v)}});' +
   'window.addEventListener("message",function(e){if(e.data&&e.data.rwHtml==="restore"){var p=e.data.pos;if(document.readyState==="complete")restore(p);else window.addEventListener("load",function(){restore(p)})}});' +
   'window.addEventListener("message",function(e){if(e.data&&e.data.rwHtml==="clearSel"){last="";try{getSelection().removeAllRanges()}catch(x){}}})})();<\/script>';
 const HtmlViewBase = obsidian.FileView || ItemView;
@@ -8410,6 +8413,14 @@ class HtmlFileView extends HtmlViewBase {
     h(bar, 'span', { cls: 'rw-tp-sp' });
     const btn = (icon, title, fn) => { const b = h(bar, 'button', { cls: 'rw-tp-btn', title }); ic(b, icon); b.addEventListener('click', fn); return b; };
     btn('refresh-cw', '重新载入', () => this.renderFile(file));
+    const paperB = btn(st.htmlPaper === 'white' ? 'square' : 'palette', '页面背景：' + (st.htmlPaper === 'white' ? '纯白（点一下换回页面自带的颜色）' : '页面自带（比如米黄）——点一下换成纯白'), () => {
+      st.htmlPaper = st.htmlPaper === 'white' ? 'page' : 'white';
+      pl.saveSettingsSoon();
+      ic(paperB, st.htmlPaper === 'white' ? 'square' : 'palette');
+      paperB.title = '页面背景：' + (st.htmlPaper === 'white' ? '纯白（点一下换回页面自带的颜色）' : '页面自带（比如米黄）——点一下换成纯白');
+      if (this.sendPaper) this.sendPaper();
+    });
+    paperB.classList.add('rw-html-paper');
     if (this.ctx.pdf) btn('book-open-text', '打开对应的 PDF（文献阅读视图）', () => pl.openPaperReader(this.ctx.pdf)).classList.add('rw-hide-narrow');
     if (this.ctx.note) btn('file-text', '打开文献笔记', () => pl.openFile(this.ctx.note)).classList.add('rw-hide-narrow');
     if (!IS_MOBILE) btn('external-link', '用系统浏览器打开', () => pl.openWithDefault(file));
@@ -8430,7 +8441,9 @@ class HtmlFileView extends HtmlViewBase {
     } catch (e) { console.warn('[科研工作台] HTML 注入失败，按原样打开', e); fr.src = res; }
     // 快照：页面每次载入（包括切回标签时 iframe 重新载入）都回到上次的位置
     const sendRestore = () => { const pos = pl.readPos(file.path); if (pos && (pos.y || pos.ei != null)) { try { fr.contentWindow.postMessage({ rwHtml: 'restore', pos }, '*'); } catch (e) { /* ignore */ } } };
-    fr.addEventListener('load', sendRestore);
+    const sendPaper = () => { try { fr.contentWindow.postMessage({ rwHtml: 'paper', v: st.htmlPaper || 'page' }, '*'); } catch (e) { /* ignore */ } };
+    fr.addEventListener('load', () => { sendPaper(); sendRestore(); });
+    this.sendPaper = sendPaper;
     // 标签页被切走时页面高度变成 0，浏览器会把滚动位置清零；切回来（重新有高度）时按快照恢复
     if (this._frRo) { try { this._frRo.disconnect(); } catch (e) { /* ignore */ } }
     let wasHidden = false;
