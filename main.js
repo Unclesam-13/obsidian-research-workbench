@@ -6951,7 +6951,18 @@ class MindflowPanel {
       tgt.classList.add('is-flash'); setTimeout(() => tgt.classList.remove('is-flash'), 1400);
       this.focusMsg = null;
     } else if (prevScroll != null) this.msgsEl.scrollTop = prevScroll;
-    else setTimeout(() => { if (this.msgsEl) this.msgsEl.scrollTop = this.msgsEl.scrollHeight; }, 0);
+    else {
+      // 快照：同一个窗口上次看到哪里就回到哪里；没有记录才滚到最新
+      const snapKey = 'mf|' + (s.key || '') + '|' + node.id;
+      const snap = this.plugin.readPos(snapKey);
+      const box = this.msgsEl;
+      if (snap && snap.y != null && !snap.bottom) { const go = () => { if (box.isConnected) box.scrollTop = snap.y; }; setTimeout(go, 0); setTimeout(go, 250); setTimeout(go, 700); }
+      else setTimeout(() => { if (box) box.scrollTop = box.scrollHeight; }, 0);
+    }
+    {
+      const box = this.msgsEl, snapKey = 'mf|' + (s.key || '') + '|' + node.id;
+      box.addEventListener('scroll', () => { clearTimeout(this._mfSnapT); this._mfSnapT = setTimeout(() => { if (!box.isConnected || !box.clientHeight) return; this.plugin.setReadPos(snapKey, { y: Math.round(box.scrollTop), bottom: box.scrollTop + box.clientHeight >= box.scrollHeight - 30 }); }, 400); });
+    }
   }
   renderMsg(m) {
     const s = this.session, node = this.node;
@@ -7287,12 +7298,48 @@ class PdfPane {
     this.layout();
     this.io = new IntersectionObserver((ents) => { for (const e of ents) if (e.isIntersecting) this.renderPage(Number(e.target.getAttribute('data-page-number'))); }, { root: this.scroller, rootMargin: '800px 0px' });
     for (const pg of this.pages) this.io.observe(pg);
-    this.scroller.addEventListener('scroll', () => { clearTimeout(this._st); this._st = setTimeout(() => { this.updatePageNo(); this.unloadFar(); }, 120); });
-    this.ro = new ResizeObserver(() => { if (this.fit) { const s = this.fitScale(); if (Math.abs(s - this.scale) > 0.01) this.setScale(s, true); } });
+    this.scroller.addEventListener('scroll', () => {
+      clearTimeout(this._st); this._st = setTimeout(() => { this.updatePageNo(); this.unloadFar(); }, 120);
+      // 记住读到哪里（快照）：切走再回来、下次再打开都停在这里
+      if (this._restoring) return;
+      clearTimeout(this._snapT); this._snapT = setTimeout(() => this.saveSnap(), 400);
+    });
+    // 标签页被切走时窗格宽度变成 0：不要跟着重算缩放（以前会把滚动位置清回第一页）
+    this.ro = new ResizeObserver(() => { if (!this.scroller.clientWidth || !this.scroller.clientHeight) return; if (this.fit) { const s = this.fitScale(); if (Math.abs(s - this.scale) > 0.01) this.setScale(s, true); } });
     this.ro.observe(this.scroller);
-    if (this.opts.page) setTimeout(() => this.goto(this.opts.page), 50);
+    const snap0 = this.plugin.readPos(this.file.path);
+    // 指定了页码（从摘录跳转等）就去那一页；和快照是同一页（Obsidian 恢复布局时）就用更精确的快照
+    const snap = !this.opts.page || (snap0 && snap0.page === Number(this.opts.page)) ? snap0 : null;
+    if (snap && snap.page) this.restoreSnap(snap);
+    else if (this.opts.page) setTimeout(() => this.goto(this.opts.page), 50);
   }
-  destroy() { if (this.io) this.io.disconnect(); if (this.ro) this.ro.disconnect(); try { if (this.doc) this.doc.destroy(); } catch (e) { /* ignore */ } }
+  /* 快照：第几页 + 页内位置 + 缩放 */
+  saveSnap() {
+    if (!this.pages.length || !this.scroller.clientHeight) return;
+    const top = this.scroller.scrollTop;
+    let n = 1;
+    for (let i = 0; i < this.pages.length; i++) { if (this.pageTop(this.pages[i]) <= top + 1) n = i + 1; else break; }
+    const pg = this.pages[n - 1];
+    if (!pg) return;
+    const off = pg.offsetHeight ? Math.max(0, Math.min(1, (top - this.pageTop(pg)) / pg.offsetHeight)) : 0;
+    this.plugin.setReadPos(this.file.path, { page: n, off: Math.round(off * 1000) / 1000, scale: this.fit ? 0 : Math.round(this.scale * 100) / 100 });
+  }
+  restoreSnap(snap) {
+    this._restoring = true;
+    this._snap = snap;
+    const apply = (this._applySnap = () => {
+      const n = Math.max(1, Math.min(this.n || 1, snap.page));
+      const pg = this.pages[n - 1];
+      if (!pg) return;
+      this.scroller.scrollTop = this.pageTop(pg) + (snap.off || 0) * pg.offsetHeight;
+      this._cur = n; if (this.pageInput) this.pageInput.value = String(n);
+    });
+    for (const t of [30, 300, 900, 1500]) setTimeout(apply, t);
+    setTimeout(() => { apply(); this._restoring = false; this._snap = null; }, 2200);
+  }
+  /* 页面在滚动区域里的位置（不受 offsetParent 影响） */
+  pageTop(pg) { return pg.getBoundingClientRect().top - this.scroller.getBoundingClientRect().top + this.scroller.scrollTop; }
+  destroy() { try { this.saveSnap(); } catch (e) { /* ignore */ } if (this.io) this.io.disconnect(); if (this.ro) this.ro.disconnect(); try { if (this.doc) this.doc.destroy(); } catch (e) { /* ignore */ } }
   fitScale() { const w = (this.scroller.clientWidth || 800) - 36; return Math.max(0.4, Math.min(3, w / this.base.w)); }
   buildBar() {
     const bar = this.bar;
@@ -7316,6 +7363,8 @@ class PdfPane {
   zoomBy(f) { this.fit = false; this.plugin.settings.pdfZoomMode = 'manual'; this.setScale(Math.max(0.4, Math.min(4, this.scale * f))); this.plugin.settings.pdfZoom = this.scale; this.plugin.saveSettingsSoon(); }
   setScale(s, keepFit) {
     const sc = this.scroller;
+    if (!sc.scrollHeight || !sc.clientHeight) { this.scale = s; if (!keepFit) this.fit = false; this.layout(); return; }
+    if (this._restoring && this._applySnap) { this.scale = s; if (!keepFit) this.fit = false; this.layout(); for (const [n, st] of this.rendered) if (st.scale !== s) { this.rendered.delete(n); const pg = this.pages[n - 1]; if (this.isNear(pg)) this.renderPage(n); } this._applySnap(); return; }
     const ratio = sc.scrollHeight ? (sc.scrollTop + sc.clientHeight / 3) / sc.scrollHeight : 0;
     this.scale = s;
     if (!keepFit) this.fit = false;
@@ -8281,6 +8330,10 @@ const HTML_BRIDGE = '<script>(function(){var t=null,last="";function hov(){retur
   'document.addEventListener("mouseup",function(){later(30)});document.addEventListener("touchend",function(){later(450)});document.addEventListener("keyup",function(e){if(e.key==="Shift")later(30)});' +
   'document.addEventListener("selectionchange",function(){later(hov()?450:700)});document.addEventListener("mousedown",function(){last="";parent.postMessage({rwHtml:"down"},"*")});' +
   'window.addEventListener("scroll",function(){parent.postMessage({rwHtml:"scroll"},"*")},true);' +
+  'var sv=null;function allEls(){return document.querySelectorAll("*")}function snap(){var se=document.scrollingElement||document.documentElement;var o={rwHtml:"pos",y:se.scrollTop,h:se.scrollHeight};var b=null,bt=0;var a=allEls();for(var i=0;i<a.length;i++){var e=a[i];if(e.scrollTop>bt&&e!==se&&e.scrollHeight>e.clientHeight+20){b=i;bt=e.scrollTop}}if(b!==null){o.ei=b;o.ey=bt}parent.postMessage(o,"*")}' +
+  'window.addEventListener("scroll",function(){clearTimeout(sv);sv=setTimeout(snap,300)},true);' +
+  'function restore(p){var go=function(){var se=document.scrollingElement||document.documentElement;if(p.y)se.scrollTop=p.y;if(p.ei!=null){var e=allEls()[p.ei];if(e)e.scrollTop=p.ey}};go();setTimeout(go,250);setTimeout(go,800);setTimeout(go,1800)}' +
+  'window.addEventListener("message",function(e){if(e.data&&e.data.rwHtml==="restore"){var p=e.data.pos;if(document.readyState==="complete")restore(p);else window.addEventListener("load",function(){restore(p)})}});' +
   'window.addEventListener("message",function(e){if(e.data&&e.data.rwHtml==="clearSel"){last="";try{getSelection().removeAllRanges()}catch(x){}}})})();<\/script>';
 const HtmlViewBase = obsidian.FileView || ItemView;
 class HtmlFileView extends HtmlViewBase {
@@ -8371,10 +8424,13 @@ class HtmlFileView extends HtmlViewBase {
       this._blob = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
       fr.src = this._blob;
     } catch (e) { console.warn('[科研工作台] HTML 注入失败，按原样打开', e); fr.src = res; }
+    // 快照：页面每次载入（包括切回标签时 iframe 重新载入）都回到上次的位置
+    fr.addEventListener('load', () => { const pos = pl.readPos(file.path); if (pos && (pos.y || pos.ei != null)) { try { fr.contentWindow.postMessage({ rwHtml: 'restore', pos }, '*'); } catch (e) { /* ignore */ } } });
     this._msg = (e) => {
       if (!this.frame || e.source !== this.frame.contentWindow || !e.data || !e.data.rwHtml) return;
       const pop = pl.popupFor(document);
       const d = e.data;
+      if (d.rwHtml === 'pos') { pl.setReadPos(file.path, { y: Math.round(d.y || 0), ei: d.ei != null ? d.ei : undefined, ey: d.ey != null ? Math.round(d.ey) : undefined }); return; }
       if (d.rwHtml === 'down' || d.rwHtml === 'scroll' || d.rwHtml === 'clear') { if (pop.isOpen() && !pop.isPinned() && pop.ctx && pop.ctx.htmlView === this) pop.hide(); return; }
       if (d.rwHtml !== 'sel') return;
       const trig = st.transTrigger || 'auto';
@@ -18199,6 +18255,15 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
   newProjectModal(preset) { new NewProjectModal(this.app, this, preset).open(); }
   newNoteModal(preset) { if (preset && preset.type === 'meeting') return this.newMeetingModal(preset); new NewNoteModal(this.app, this, preset).open(); }
   importVaultModal() { new ImportVaultModal(this.app, this).open(); }
+  /* 阅读位置快照（PDF / HTML）：按文件记，最多记 300 个 */
+  readPos(path) { const m = this.settings.readPos; return m && m[path] ? m[path] : null; }
+  setReadPos(path, pos) {
+    const m = (this.settings.readPos = this.settings.readPos || {});
+    m[path] = Object.assign({}, pos, { t: Date.now() });
+    const keys = Object.keys(m);
+    if (keys.length > 300) keys.sort((a, b) => (m[a].t || 0) - (m[b].t || 0)).slice(0, keys.length - 300).forEach((k) => delete m[k]);
+    this.saveSettingsSoon();
+  }
   newMeetingModal(preset) { new NewMeetingModal(this.app, this, preset || {}).open(); }
   /* 新建会议纪要：标题 + 简介 + 材料（录音 / 视频 / PPT / PDF…）一步完成，材料放进纪要自己的附件文件夹 */
   async createMeeting(v) {
@@ -19621,7 +19686,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     let leaf = ws.getLeavesOfType(PAPER_READER_VIEW).find((l) => l.view && l.view.path === path);
     if (leaf) { ws.revealLeaf(leaf); if (page && leaf.view.pane) leaf.view.pane.goto(page); return leaf; }
     leaf = ws.getLeaf('tab');
-    await leaf.setViewState({ type: PAPER_READER_VIEW, active: true, state: { path, page: page || 1 } });
+    await leaf.setViewState({ type: PAPER_READER_VIEW, active: true, state: page ? { path, page } : { path } });
     ws.revealLeaf(leaf);
     return leaf;
   }
