@@ -8330,9 +8330,12 @@ const HTML_BRIDGE = '<script>(function(){var t=null,last="";function hov(){retur
   'document.addEventListener("mouseup",function(){later(30)});document.addEventListener("touchend",function(){later(450)});document.addEventListener("keyup",function(e){if(e.key==="Shift")later(30)});' +
   'document.addEventListener("selectionchange",function(){later(hov()?450:700)});document.addEventListener("mousedown",function(){last="";parent.postMessage({rwHtml:"down"},"*")});' +
   'window.addEventListener("scroll",function(){parent.postMessage({rwHtml:"scroll"},"*")},true);' +
-  'var sv=null;function allEls(){return document.querySelectorAll("*")}function snap(){var se=document.scrollingElement||document.documentElement;var o={rwHtml:"pos",y:se.scrollTop,h:se.scrollHeight};var b=null,bt=0;var a=allEls();for(var i=0;i<a.length;i++){var e=a[i];if(e.scrollTop>bt&&e!==se&&e.scrollHeight>e.clientHeight+20){b=i;bt=e.scrollTop}}if(b!==null){o.ei=b;o.ey=bt}parent.postMessage(o,"*")}' +
+  'var sv=null,armed=false,rest=false;function arm(){if(!rest)armed=true}["wheel","touchstart","keydown","mousedown"].forEach(function(n){window.addEventListener(n,arm,true)});' +
+  'function allEls(){return document.querySelectorAll("*")}function snap(){if(!armed)return;var se=document.scrollingElement||document.documentElement;if(!window.innerHeight||!se.clientHeight||document.visibilityState==="hidden")return;var o={rwHtml:"pos",y:se.scrollTop,h:se.scrollHeight,dbg:[window.innerHeight,se.clientHeight,document.visibilityState,window.scrollY,document.body.scrollTop].join(",")};var b=null,bt=0;var a=allEls();for(var i=0;i<a.length;i++){var e=a[i];if(e.scrollTop>bt&&e!==se&&e.scrollHeight>e.clientHeight+20){b=i;bt=e.scrollTop}}if(b!==null){o.ei=b;o.ey=bt}parent.postMessage(o,"*")}' +
   'window.addEventListener("scroll",function(){clearTimeout(sv);sv=setTimeout(snap,300)},true);' +
-  'function restore(p){var go=function(){var se=document.scrollingElement||document.documentElement;if(p.y)se.scrollTop=p.y;if(p.ei!=null){var e=allEls()[p.ei];if(e)e.scrollTop=p.ey}};go();setTimeout(go,250);setTimeout(go,800);setTimeout(go,1800)}' +
+  'function restore(p){rest=true;armed=false;var t0=Date.now(),okN=0,user=false;var stop=function(){user=true};["wheel","touchstart","keydown","mousedown"].forEach(function(n){window.addEventListener(n,stop,{capture:true,once:true})});' +
+  'var go=function(){var se=document.scrollingElement||document.documentElement;var ok=true;if(p.y){se.scrollTop=p.y;if(Math.abs(se.scrollTop-p.y)>4)ok=false}if(p.ei!=null){var e=allEls()[p.ei];if(e){e.scrollTop=p.ey;if(Math.abs(e.scrollTop-p.ey)>4)ok=false}}return ok};' +
+  'var tick=function(){if(user){rest=false;armed=true;return}var ok=go();okN=ok?okN+1:0;if(okN>=3||Date.now()-t0>15000){rest=false;return}setTimeout(tick,300)};tick()}' +
   'window.addEventListener("message",function(e){if(e.data&&e.data.rwHtml==="restore"){var p=e.data.pos;if(document.readyState==="complete")restore(p);else window.addEventListener("load",function(){restore(p)})}});' +
   'window.addEventListener("message",function(e){if(e.data&&e.data.rwHtml==="clearSel"){last="";try{getSelection().removeAllRanges()}catch(x){}}})})();<\/script>';
 const HtmlViewBase = obsidian.FileView || ItemView;
@@ -8349,6 +8352,7 @@ class HtmlFileView extends HtmlViewBase {
     if (this.mf) { try { this.mf.destroy(); } catch (e) { /* ignore */ } this.mf = null; }
     if (this._blob) { try { URL.revokeObjectURL(this._blob); } catch (e) { /* ignore */ } this._blob = null; }
     if (this._msg) { window.removeEventListener('message', this._msg); this._msg = null; }
+    if (this._frRo) { try { this._frRo.disconnect(); } catch (e) { /* ignore */ } this._frRo = null; }
   }
   /* 这个 HTML 是哪篇文献的：全文文件夹里的 full.html → 读「来源.json」找回 PDF / 文献笔记 */
   async ctxFor(file) {
@@ -8425,12 +8429,22 @@ class HtmlFileView extends HtmlViewBase {
       fr.src = this._blob;
     } catch (e) { console.warn('[科研工作台] HTML 注入失败，按原样打开', e); fr.src = res; }
     // 快照：页面每次载入（包括切回标签时 iframe 重新载入）都回到上次的位置
-    fr.addEventListener('load', () => { const pos = pl.readPos(file.path); if (pos && (pos.y || pos.ei != null)) { try { fr.contentWindow.postMessage({ rwHtml: 'restore', pos }, '*'); } catch (e) { /* ignore */ } } });
+    const sendRestore = () => { const pos = pl.readPos(file.path); if (pos && (pos.y || pos.ei != null)) { try { fr.contentWindow.postMessage({ rwHtml: 'restore', pos }, '*'); } catch (e) { /* ignore */ } } };
+    fr.addEventListener('load', sendRestore);
+    // 标签页被切走时页面高度变成 0，浏览器会把滚动位置清零；切回来（重新有高度）时按快照恢复
+    if (this._frRo) { try { this._frRo.disconnect(); } catch (e) { /* ignore */ } }
+    let wasHidden = false;
+    this._frRo = new ResizeObserver(() => {
+      const hgt = fr.clientHeight;
+      if (!hgt) { wasHidden = true; return; }
+      if (wasHidden) { wasHidden = false; setTimeout(sendRestore, 30); }
+    });
+    this._frRo.observe(fr);
     this._msg = (e) => {
       if (!this.frame || e.source !== this.frame.contentWindow || !e.data || !e.data.rwHtml) return;
       const pop = pl.popupFor(document);
       const d = e.data;
-      if (d.rwHtml === 'pos') { pl.setReadPos(file.path, { y: Math.round(d.y || 0), ei: d.ei != null ? d.ei : undefined, ey: d.ey != null ? Math.round(d.ey) : undefined }); return; }
+      if (d.rwHtml === 'pos') { pl.setReadPos(file.path, { y: Math.round(d.y || 0), ei: d.ei != null ? d.ei : undefined, ey: d.ey != null ? Math.round(d.ey) : undefined, dbg: d.dbg }); (pl._posLog = pl._posLog || []).push([Date.now(), d.y, d.dbg]); pl.settings.posLog = pl._posLog.slice(-20); return; }
       if (d.rwHtml === 'down' || d.rwHtml === 'scroll' || d.rwHtml === 'clear') { if (pop.isOpen() && !pop.isPinned() && pop.ctx && pop.ctx.htmlView === this) pop.hide(); return; }
       if (d.rwHtml !== 'sel') return;
       const trig = st.transTrigger || 'auto';
