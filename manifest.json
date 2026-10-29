@@ -1,7 +1,7 @@
 {
   "id": "research-workbench",
   "name": "科研工作台 Research Workbench",
-  "version": "0.23.1",
+  "version": "0.23.2",
   "minAppVersion": "1.4.0",
   "description": "科研 × 生活工作台：多项目科研流程（文献、AI 问答树、PDF 全文翻译、Mindflow）＋ 生活面板（日记日历、类别记录、AI 整理）。",
   "author": "Unclesam-13",

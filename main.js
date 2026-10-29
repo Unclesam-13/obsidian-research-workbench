@@ -4063,6 +4063,42 @@ function addMeetingFm(text, rel) {
   return '---\n' + add.join('\n') + '\n---\n' + text;
 }
 
+/* 文献阅读 · 右侧 AI 问答的提示词：一处改全 */
+class ReaderPromptsModal extends Modal {
+  constructor(app, plugin) { super(app); this.plugin = plugin; }
+  onOpen() {
+    const c = this.contentEl, s = this.plugin.settings, pl = this.plugin;
+    this.modalEl.classList.add('rw-rdprompt-modal');
+    this.titleEl.setText('文献阅读 AI 提示词');
+    c.classList.add('rw-modal');
+    h(c, 'div', { cls: 'rw-muted', text: '这些是看文献时右侧 AI 问答用的提示词。改完马上生效；清空某一项 = 恢复默认。' });
+    const area = (label, desc, key, def, rows) => {
+      h(c, 'div', { cls: 'rw-field-label', text: label });
+      if (desc) h(c, 'div', { cls: 'rw-muted rw-rdp-desc', text: desc });
+      const ta = h(c, 'textarea', { cls: 'rw-rdp-ta', attr: { rows: String(rows || 3), placeholder: def } });
+      ta.value = Array.isArray(s[key]) ? s[key].join('\n') : s[key] || '';
+      ta.addEventListener('input', () => {
+        if (key === 'mfPresets') s.mfPresets = ta.value.split('\n').map((x) => x.trim()).filter(Boolean);
+        else s[key] = ta.value.trim();
+        pl.saveSettingsSoon();
+      });
+      const rs = h(c, 'button', { cls: 'rw-linkbtn rw-rdp-reset', text: '恢复默认' });
+      rs.addEventListener('click', () => { ta.value = ''; if (key === 'mfPresets') s.mfPresets = []; else s[key] = ''; pl.saveSettingsSoon(); });
+    };
+    area('系统提示词（AI 的角色和回答要求）', '每次提问都会带上，后面自动接论文正文。{title} 会换成论文标题。', 'rdSysPrompt', RD_SYS_PROMPT, 5);
+    area('AI 回答里划线追问的快捷问题', '在右侧 AI 回答里划一段，弹出的追问小窗里一点就发的按钮。一行一个。', 'mfPresets', MF_PRESETS.join('\n'), 5);
+    area('回答里划线追问、没写问题时', '划线后直接点「追问」不写字，用这句。', 'rdAnchorAsk', RD_ANCHOR_ASK, 2);
+    area('引用论文原文提问、没写问题时', '在 PDF 里划一段发到右侧问答（「引用后自己问」）不写字，用这句。', 'rdQuoteAsk', RD_QUOTE_ASK, 2);
+    const tip = h(c, 'div', { cls: 'rw-muted rw-rdp-tip' });
+    tip.setText('PDF 正文里划词弹出的「解释 / 总结 / 问 AI」按钮的提示词在：设置 → 科研工作台 → 划词翻译与文献阅读 →「划词按钮」。');
+    const bar = h(c, 'div', { cls: 'rw-kind-ed-bar' });
+    const ob = h(bar, 'button', { cls: 'rw-btn', text: '打开划词按钮设置' }); ob.addEventListener('click', () => { this.close(); pl.openSettings(); });
+    h(bar, 'span', { cls: 'rw-spacer' });
+    const done = h(bar, 'button', { cls: 'rw-btn mod-cta', text: '完成' }); done.addEventListener('click', () => this.close());
+  }
+  onClose() { clear(this.contentEl); this.plugin.saveSettings(); }
+}
+
 /* 待办窗口：在计划页 / 日历里点待办，直接在这里改内容、日期、时间、备注、完成，不用跳到原笔记 */
 class TaskModal extends Modal {
   constructor(app, plugin, t, onDone) { super(app); this.plugin = plugin; this.t = t; this.onDone = onDone; }
@@ -6609,6 +6645,11 @@ function excerptToMd(x) {
 /* ───────────────────────── 文献阅读：PDF（中）+ Mindflow 式 AI 问答树（右） ───────────────────────── */
 const PAPER_READER_VIEW = 'research-workbench-paper';
 const MF_PRESETS = ['详细解释这段', '举个例子说明', '这段在论文里起什么作用？', '有哪些前提或假设？'];
+/* 文献阅读右侧 AI 问答的提示词（设置里可改；{title} = 论文标题） */
+const RD_SYS_PROMPT = '你是论文阅读助手，正在陪用户精读论文《{title}》。回答要基于论文内容，用简体中文，条理清楚；引用论文时注明页码（正文里有 [第 N 页] 标记）；公式用 LaTeX（行内 $…$，独立 $$…$$）。论文里没有的内容要说明是你的补充。';
+const RD_QUOTE_ASK = '请详细解释这段，并说明它和全文论点的关系。';
+const RD_ANCHOR_ASK = '请详细解释这段。';
+const rdPrompt = (st, key, def) => { const v = String((st && st[key]) || '').trim(); return v || def; };
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const trunc = (s, n) => { s = String(s || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '…' : s; };
 
@@ -7109,6 +7150,7 @@ class MindflowPanel {
     const s = this.session;
     m.addItem((i) => i.setTitle('回到主窗口').setIcon('home').onClick(() => s && this.openNode(s.rootId)));
     m.addItem((i) => i.setTitle('把问答树写进文献笔记').setIcon('file-down').onClick(() => s && this.plugin.mfExportToNote(this.ctx, s)));
+    m.addItem((i) => i.setTitle('编辑 AI 提示词…').setIcon('pencil').onClick(() => new ReaderPromptsModal(this.app, this.plugin).open()));
     m.addSeparator();
     m.addItem((i) => i.setTitle('清空这篇的全部问答…').setIcon('trash-2').onClick(async () => {
       if (!s) return;
@@ -7169,6 +7211,8 @@ class MindflowPanel {
     const chips = h(pop, 'div', { cls: 'rw-chat-quick' });
     const presets = Array.isArray(this.plugin.settings.mfPresets) && this.plugin.settings.mfPresets.length ? this.plugin.settings.mfPresets : MF_PRESETS;
     for (const p of presets) { const b = h(chips, 'button', { cls: 'rw-catchip', text: p }); b.addEventListener('click', () => this.followUp(anchor, p)); }
+    const edit = h(chips, 'button', { cls: 'rw-catchip rw-mf-pop-edit', title: '修改这些快捷问题和 AI 提示词' }); ic(edit, 'pencil');
+    edit.addEventListener('click', () => { this.closePop(); new ReaderPromptsModal(this.app, this.plugin).open(); });
     const row = h(pop, 'div', { cls: 'rw-chat-input' });
     const ta = h(row, 'textarea', { cls: 'rw-rd-ta', attr: { rows: '1', placeholder: '针对这段追问…（留空 = 详细解释）' } });
     const go = h(row, 'button', { cls: 'rw-btn rw-btn-sm mod-cta' }); ic(go, 'corner-down-right'); h(go, 'span', { text: '追问' });
@@ -7687,8 +7731,8 @@ class WorkbenchSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName('AI 读论文的长度').setDesc('每次把论文正文的前多少个字符发给 AI（越大越全，也越贵）。默认 60000')
       .addText((t) => t.setValue(String(s.aiContextChars || 60000)).onChange(async (v) => { const n = Number(v); if (n >= 2000) { s.aiContextChars = n; await this.plugin.saveSettings(); } }))
       .addButton((b) => b.setButtonText('测试 AI').onClick(async () => { try { const r = await this.plugin.directChat([{ role: 'user', content: '用一句话介绍你自己' }]); new Notice('✅ ' + r.slice(0, 120), 6000); } catch (e) { new Notice('❌ ' + e.message, 8000); } }));
-    new Setting(containerEl).setName('划线追问的预设问题').setDesc('在 AI 回答里划线后，追问小窗里一点就发。一行一个')
-      .addTextArea((t) => t.setValue((Array.isArray(s.mfPresets) && s.mfPresets.length ? s.mfPresets : MF_PRESETS).join('\n')).onChange(async (v) => { s.mfPresets = v.split('\n').map((x) => x.trim()).filter(Boolean); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('文献阅读 AI 提示词').setDesc('看文献时右侧 AI 问答用的：系统提示词、AI 回答里划线追问的快捷问题、没写问题时的默认追问')
+      .addButton((b) => b.setButtonText('编辑…').onClick(() => new ReaderPromptsModal(this.app, this.plugin).open()));
     new Setting(containerEl).setName('AI 翻译提示词').setDesc('{lang} 会替换成目标语言。留空用默认：' + DEFAULT_LLM_PROMPT)
       .addTextArea((t) => t.setValue(s.llmPrompt || '').onChange(async (v) => { s.llmPrompt = v; await this.plugin.saveSettings(); }));
     // ── Mindflow（合并进来的划线追问对话） ──
@@ -19430,7 +19474,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     const title = this.paperTitle(ctx);
     const text = await this.paperText(ctx);
     const lim = Number(this.settings.aiContextChars) || 60000;
-    const sys = '你是论文阅读助手，正在陪用户精读论文《' + title + '》。回答要基于论文内容，用简体中文，条理清楚；引用论文时注明页码（正文里有 [第 N 页] 标记）；公式用 LaTeX（行内 $…$，独立 $$…$$）。论文里没有的内容要说明是你的补充。' + (text ? '\n\n=== 论文正文（可能截断） ===\n' + text.slice(0, lim) : '\n\n（没有读到论文正文，只能根据标题和用户提供的内容回答。）');
+    const sys = rdPrompt(this.settings, 'rdSysPrompt', RD_SYS_PROMPT).replace(/\{title\}/g, title) + (text ? '\n\n=== 论文正文（可能截断） ===\n' + text.slice(0, lim) : '\n\n（没有读到论文正文，只能根据标题和用户提供的内容回答。）');
     const out = [{ role: 'system', content: sys }];
     const chain = mfChain(s, nodeId);
     chain.forEach((node, ci) => {
@@ -19440,8 +19484,8 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       msgs.forEach((m, mi) => {
         if (m.role === 'assistant') { if (m.content && !m.error) out.push({ role: 'assistant', content: m.content }); return; }
         let c = m.content || '';
-        if (m.quote) c = '关于论文中的这段原文' + (m.quotePage ? '（第 ' + m.quotePage + ' 页）' : '') + '：\n> ' + m.quote.replace(/\n/g, '\n> ') + '\n\n' + (c || '请详细解释这段，并说明它和全文论点的关系。');
-        if (mi === 0 && node.anchor) c = '针对你上面回答里的这段：「' + node.anchor.text + '」\n' + (c || '请详细解释这段。');
+        if (m.quote) c = '关于论文中的这段原文' + (m.quotePage ? '（第 ' + m.quotePage + ' 页）' : '') + '：\n> ' + m.quote.replace(/\n/g, '\n> ') + '\n\n' + (c || rdPrompt(this.settings, 'rdQuoteAsk', RD_QUOTE_ASK));
+        if (mi === 0 && node.anchor) c = '针对你上面回答里的这段：「' + node.anchor.text + '」\n' + (c || rdPrompt(this.settings, 'rdAnchorAsk', RD_ANCHOR_ASK));
         if (m.images && m.images.length) { out.push({ role: 'user', content: c || '请结合这篇论文解释这张图。', images: m.images }); return; }
         out.push({ role: 'user', content: c || '请继续。' });
       });
