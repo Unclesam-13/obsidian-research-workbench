@@ -8331,7 +8331,7 @@ const HTML_BRIDGE = '<script>(function(){var t=null,last="";function hov(){retur
   'document.addEventListener("selectionchange",function(){later(hov()?450:700)});document.addEventListener("mousedown",function(){last="";parent.postMessage({rwHtml:"down"},"*")});' +
   'window.addEventListener("scroll",function(){parent.postMessage({rwHtml:"scroll"},"*")},true);' +
   'var sv=null,armed=false,rest=false;function arm(){if(!rest)armed=true}["wheel","touchstart","keydown","mousedown"].forEach(function(n){window.addEventListener(n,arm,true)});' +
-  'function allEls(){return document.querySelectorAll("*")}function snap(){if(!armed)return;var se=document.scrollingElement||document.documentElement;if(!window.innerHeight||!se.clientHeight||document.visibilityState==="hidden")return;var o={rwHtml:"pos",y:se.scrollTop,h:se.scrollHeight,dbg:[window.innerHeight,se.clientHeight,document.visibilityState,window.scrollY,document.body.scrollTop].join(",")};var b=null,bt=0;var a=allEls();for(var i=0;i<a.length;i++){var e=a[i];if(e.scrollTop>bt&&e!==se&&e.scrollHeight>e.clientHeight+20){b=i;bt=e.scrollTop}}if(b!==null){o.ei=b;o.ey=bt}parent.postMessage(o,"*")}' +
+  'function allEls(){return document.querySelectorAll("*")}function snap(){if(!armed)return;var se=document.scrollingElement||document.documentElement;if(!window.innerHeight||!se.clientHeight||document.visibilityState==="hidden")return;var o={rwHtml:"pos",y:se.scrollTop,h:se.scrollHeight};var b=null,bt=0;var a=allEls();for(var i=0;i<a.length;i++){var e=a[i];if(e.scrollTop>bt&&e!==se&&e.scrollHeight>e.clientHeight+20){b=i;bt=e.scrollTop}}if(b!==null){o.ei=b;o.ey=bt}parent.postMessage(o,"*")}' +
   'window.addEventListener("scroll",function(){clearTimeout(sv);sv=setTimeout(snap,300)},true);' +
   'function restore(p){rest=true;armed=false;var t0=Date.now(),okN=0,user=false;var stop=function(){user=true};["wheel","touchstart","keydown","mousedown"].forEach(function(n){window.addEventListener(n,stop,{capture:true,once:true})});' +
   'var go=function(){var se=document.scrollingElement||document.documentElement;var ok=true;if(p.y){se.scrollTop=p.y;if(Math.abs(se.scrollTop-p.y)>4)ok=false}if(p.ei!=null){var e=allEls()[p.ei];if(e){e.scrollTop=p.ey;if(Math.abs(e.scrollTop-p.ey)>4)ok=false}}return ok};' +
@@ -8444,7 +8444,7 @@ class HtmlFileView extends HtmlViewBase {
       if (!this.frame || e.source !== this.frame.contentWindow || !e.data || !e.data.rwHtml) return;
       const pop = pl.popupFor(document);
       const d = e.data;
-      if (d.rwHtml === 'pos') { pl.setReadPos(file.path, { y: Math.round(d.y || 0), ei: d.ei != null ? d.ei : undefined, ey: d.ey != null ? Math.round(d.ey) : undefined, dbg: d.dbg }); (pl._posLog = pl._posLog || []).push([Date.now(), d.y, d.dbg]); pl.settings.posLog = pl._posLog.slice(-20); return; }
+      if (d.rwHtml === 'pos') { pl.setReadPos(file.path, { y: Math.round(d.y || 0), ei: d.ei != null ? d.ei : undefined, ey: d.ey != null ? Math.round(d.ey) : undefined }); return; }
       if (d.rwHtml === 'down' || d.rwHtml === 'scroll' || d.rwHtml === 'clear') { if (pop.isOpen() && !pop.isPinned() && pop.ctx && pop.ctx.htmlView === this) pop.hide(); return; }
       if (d.rwHtml !== 'sel') return;
       const trig = st.transTrigger || 'auto';
