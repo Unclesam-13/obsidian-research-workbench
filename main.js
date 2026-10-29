@@ -2207,6 +2207,11 @@ class WorkbenchView extends ItemView {
     const nb = h(acts, 'button', { cls: 'rw-btn rw-btn-sm', title: '在当前位置新建文件夹' });
     ic(nb, 'folder-plus'); h(nb, 'span', { text: '新建文件夹' });
     nb.addEventListener('click', () => pl.promptText('新文件夹名称（建在「' + (rel || p.title) + '」里）', '', async (v) => { const np = await pl.createFolderIn(cur, v); if (np) st[p.name] = np.slice(base.length + 1); }));
+    if (!String(p.name).startsWith('__')) {
+      const nn = h(acts, 'button', { cls: 'rw-btn rw-btn-sm', title: '在当前文件夹里新建笔记' });
+      ic(nn, 'file-plus'); h(nn, 'span', { text: '新建笔记' });
+      nn.addEventListener('click', () => pl.newNoteModal({ project: p.name, folder: cur }));
+    }
     const ub = h(acts, 'button', { cls: 'rw-iconbtn', title: '导入文件到这个文件夹' });
     ic(ub, 'upload');
     ub.addEventListener('click', () => pl.pickFiles({ project: p.name, folder: cur }));
@@ -2297,6 +2302,7 @@ class WorkbenchView extends ItemView {
     const m = new Menu();
     m.addItem((i) => i.setTitle('打开文件夹').setIcon('folder-open').onClick(() => { this.filters.dir[p.name] = r2; this.render(); }));
     m.addItem((i) => i.setTitle('导入文件到这里…').setIcon('upload').onClick(() => pl.pickFiles({ project: p.name, folder: f.path })));
+    if (!String(p.name).startsWith('__')) m.addItem((i) => i.setTitle('在这里新建笔记…').setIcon('file-plus').onClick(() => pl.newNoteModal({ project: p.name, folder: f.path })));
     m.addItem((i) => i.setTitle('在里面新建子文件夹…').setIcon('folder-plus').onClick(() => pl.promptText('子文件夹名称', '', (v) => pl.createFolderIn(f.path, v))));
     m.addItem((i) => i.setTitle('重命名…').setIcon('pencil').onClick(() => pl.promptText('重命名文件夹', f.name, (v) => pl.renameFolder(f, v))));
     m.addItem((i) => i.setTitle('移动文件夹到…（可跨项目）').setIcon('folder-input').onClick(() => pl.pickFolder(p.name, { title: '把文件夹「' + f.name + '」移动到…', exclude: f.path }, (dest) => pl.moveFolderTo(f, dest))));
@@ -4177,7 +4183,8 @@ class NewMeetingModal extends Modal {
     dt.addText((t) => { t.inputEl.type = 'date'; t.setValue(this.v.date).onChange((x) => (this.v.date = x)); });
     dt.addText((t) => { t.inputEl.type = 'time'; t.setValue(this.v.time).onChange((x) => (this.v.time = x)); });
     const projects = this.plugin.buildIndex().projects.filter((p) => p.status !== '已完成' || p.name === this.v.project);
-    new Setting(c).setName('所属项目').addDropdown((d) => { d.addOption('', '（不属于项目）'); projects.forEach((p) => d.addOption(p.name, p.title)); d.setValue(this.v.project || '').onChange((x) => (this.v.project = x)); });
+    new Setting(c).setName('所属项目').addDropdown((d) => { d.addOption('', '（不属于项目）'); projects.forEach((p) => d.addOption(p.name, p.title)); d.setValue(this.v.project || '').onChange((x) => { this.v.project = x; this.v.folder = ''; if (this.fs) this.fs.refresh(); }); });
+    this.fs = noteFolderSetting(c, this.plugin, this.v, () => 'meeting');
     new Setting(c).setName('参会人').addText((t) => t.setPlaceholder('可选，比如：导师、张三、李四').setValue(this.v.attendees).onChange((x) => (this.v.attendees = x)));
     h(c, 'div', { cls: 'rw-field-label', text: '简介' });
     const ta = h(c, 'textarea', { cls: 'rw-meet-summary', attr: { rows: '3', placeholder: '这次会议讲了什么、要解决什么问题（会显示在会议列表里，回看时一眼知道是哪次会）' } });
@@ -4558,6 +4565,55 @@ class NewProjectModal extends Modal {
   onClose() { this.contentEl.empty ? this.contentEl.empty() : clear(this.contentEl); }
 }
 
+/* 新建笔记时选「放在项目里的哪个文件夹」：默认 = 项目/<类型文件夹>，也可以选项目根目录或任意子文件夹 */
+function noteFolderSetting(container, plugin, v, typeOf) {
+  const set = new Setting(container).setName('存放位置');
+  let dd = null;
+  const fill = () => {
+    if (!dd) return;
+    const sel = dd.selectEl;
+    clear(sel);
+    const type = typeOf();
+    const def = NOTE_TYPES[type] || NOTE_TYPES.idea;
+    if (!v.project) {
+      dd.addOption('', '默认：' + normalizePath(plugin.settings.rootFolder + '/' + def.folder));
+      v.folder = '';
+      dd.setValue('');
+      set.setDesc('选了所属项目后，可以放进项目里的任意文件夹');
+      return;
+    }
+    const base = plugin.projectDir(v.project);
+    dd.addOption('', '默认：' + def.folder + '/（按类型自动归档）');
+    dd.addOption(base, '项目根目录（自由空间）');
+    for (const f of plugin.projectFolderList(v.project)) dd.addOption(f.path, '\u00a0\u00a0'.repeat(f.depth) + '📁 ' + f.rel);
+    dd.addOption('__new', '＋ 新建文件夹…');
+    if (v.folder && !(v.folder === base || plugin.projectFolderList(v.project).some((f) => f.path === v.folder))) v.folder = '';
+    dd.setValue(v.folder || '');
+    set.setDesc('在「' + v.project + '」里的位置');
+  };
+  set.addDropdown((d) => {
+    dd = d;
+    d.selectEl.classList.add('rw-folder-dd');
+    d.onChange((x) => {
+      if (x === '__new') {
+        d.setValue(v.folder || '');
+        new TextPromptModal(plugin.app, '新文件夹名称（建在「' + v.project + '」里，可用 / 建多级）', '', async (name) => {
+          const parts = String(name || '').split('/').map((q) => sanitize(q.trim())).filter(Boolean);
+          if (!parts.length) return;
+          const np = normalizePath(plugin.projectDir(v.project) + '/' + parts.join('/'));
+          await plugin.ensureFolder(np);
+          v.folder = np;
+          fill();
+        }).open();
+        return;
+      }
+      v.folder = x;
+    });
+  });
+  fill();
+  return { refresh: fill };
+}
+
 class NewNoteModal extends Modal {
   constructor(app, plugin, preset) {
     super(app);
@@ -4568,13 +4624,14 @@ class NewNoteModal extends Modal {
     const { contentEl } = this;
     this.titleEl.setText('新建科研笔记');
     contentEl.classList.add('rw-modal');
-    new Setting(contentEl).setName('类型').addDropdown((d) => { Object.keys(NOTE_TYPES).forEach((k) => d.addOption(k, NOTE_TYPES[k].label)); d.setValue(this.v.type).onChange((x) => (this.v.type = x)); });
+    new Setting(contentEl).setName('类型').addDropdown((d) => { Object.keys(NOTE_TYPES).forEach((k) => d.addOption(k, NOTE_TYPES[k].label)); d.setValue(this.v.type).onChange((x) => { this.v.type = x; if (this.fs) this.fs.refresh(); }); });
     new Setting(contentEl).setName('标题').addText((t) => { t.setPlaceholder('例如：2026-10 组会 / Smith 2024 综述').setValue(this.v.title).onChange((x) => (this.v.title = x)); setTimeout(() => t.inputEl.focus(), 30); });
     const projects = this.plugin.buildIndex().projects.filter((p) => p.status !== '已完成' || p.name === this.v.project);
-    new Setting(contentEl).setName('所属项目').addDropdown((d) => { d.addOption('', '（不归属项目）'); projects.forEach((p) => d.addOption(p.name, p.title)); d.setValue(this.v.project || '').onChange((x) => (this.v.project = x)); });
+    new Setting(contentEl).setName('所属项目').addDropdown((d) => { d.addOption('', '（不归属项目）'); projects.forEach((p) => d.addOption(p.name, p.title)); d.setValue(this.v.project || '').onChange((x) => { this.v.project = x; this.v.folder = ''; if (this.fs) this.fs.refresh(); }); });
+    this.fs = noteFolderSetting(contentEl, this.plugin, this.v, () => this.v.type);
     new Setting(contentEl).setName('创建后打开').addToggle((t) => t.setValue(this.v.open).onChange((x) => (this.v.open = x)));
     new Setting(contentEl).addButton((b) => b.setButtonText('创建').setCta().onClick(() => this.submit()));
-    contentEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) this.submit(); });
+    contentEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing && e.target.tagName !== 'SELECT') this.submit(); });
   }
   async submit() {
     if (this.busy) return;
@@ -17993,9 +18050,11 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     const def = NOTE_TYPES[type];
     let title = sanitize(o.title || '未命名');
     if ((type === 'meeting' || type === 'experiment') && !/^\d{4}-\d{2}-\d{2}/.test(title)) title = today() + ' ' + title;
-    const folder = o.project
-      ? normalizePath(this.settings.rootFolder + '/项目/' + o.project + '/' + def.folder)
-      : normalizePath(this.settings.rootFolder + '/' + def.folder);
+    const folder = o.folder
+      ? normalizePath(o.folder)
+      : o.project
+        ? normalizePath(this.settings.rootFolder + '/项目/' + o.project + '/' + def.folder)
+        : normalizePath(this.settings.rootFolder + '/' + def.folder);
     await this.ensureFolder(folder);
     const path = this.uniquePath(folder, title);
     const file = await this.app.vault.create(path, noteTemplate(type, Object.assign({}, o, { title: title })));
@@ -18106,7 +18165,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     if (v.time) fm.time = v.time;
     if (summary) fm.summary = summary.replace(/\s+/g, ' ').slice(0, 300);
     const prepend = summary ? '> [!abstract] 简介\n' + summary.split('\n').map((l) => '> ' + l).join('\n') : '';
-    const file = await this.createNote({ type: 'meeting', title, project: v.project || '', fm, prepend, silent: true, status: v.items && v.items.length ? '待整理' : undefined });
+    const file = await this.createNote({ type: 'meeting', title, project: v.project || '', folder: v.folder || '', fm, prepend, silent: true, status: v.items && v.items.length ? '待整理' : undefined });
     if (v.items && v.items.length) {
       await this.addAttachments(file, v.items, { move: !!v.move });
       await new Promise((r) => setTimeout(r, 80));
