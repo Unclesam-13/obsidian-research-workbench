@@ -4172,9 +4172,9 @@ tr:hover .rw-att-chip.is-empty, .rw-pgc .rw-att-chip.is-empty { opacity: .7; }
   .dh-main {
     display: contents;
   }
-  .dh-calendar-card { order: 1; }
-  .dh-launcher { order: 2; }
-  .dh-day { order: 3; }
+  .dh-launcher { order: 1; }
+  .dh-day { order: 2; }
+  .dh-calendar-card { order: 3; }
   .dh-memo-card { order: 4; }
   .dh-cal-grid.is-month {
     max-width: 520px;
@@ -4342,9 +4342,9 @@ tr:hover .rw-att-chip.is-empty, .rw-pgc .rw-att-chip.is-empty { opacity: .7; }
   .is-phone .dh-main {
     display: contents;
   }
-  .is-phone .dh-calendar-card { order: 1; }
-  .is-phone .dh-launcher { order: 2; }
-  .is-phone .dh-day { order: 3; }
+  .is-phone .dh-launcher { order: 1; }
+  .is-phone .dh-day { order: 2; }
+  .is-phone .dh-calendar-card { order: 3; }
   .is-phone .dh-memo-card { order: 4; }
   .is-phone .dh-page {
     padding: 12px 12px 80px;
@@ -4391,3 +4391,51 @@ tr:hover .rw-att-chip.is-empty, .rw-pgc .rw-att-chip.is-empty { opacity: .7; }
 .rw-rdp-tip { margin-top: 10px; font-size: 12px; }
 .rw-mf-pop-edit { padding: 2px 7px !important; }
 .rw-mf-pop-edit svg { width: 12px; height: 12px; }
+
+/* ======== v0.23.6 生活面板：随手记放最前 + 按钮更醒目 ======== */
+.dh-view { position: relative; }
+.dh-quick { margin-bottom: 0; border: 1.5px solid var(--dh-accent-line) !important; background: linear-gradient(180deg, var(--dh-accent-soft), var(--dh-card, var(--background-primary)) 70%) !important; }
+.dh-quick-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.dh-quick-badge { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; flex: none; border-radius: 10px; background: var(--dh-accent); color: var(--text-on-accent); }
+.dh-quick-badge svg { width: 18px; height: 18px; }
+.dh-quick-title { font-size: 1.15em; font-weight: 700; color: var(--text-normal); }
+.dh-quick-sub { font-size: var(--font-ui-smaller); color: var(--text-muted); margin-top: 2px; }
+.dh-view textarea.dh-quick-input { width: 100%; min-height: 76px; resize: vertical; padding: 10px 12px; border-radius: 12px; border: 1.5px solid var(--dh-border); background: var(--background-primary); font-size: 1em; line-height: 1.6; box-sizing: border-box; }
+.dh-view textarea.dh-quick-input:focus { border-color: var(--dh-accent); box-shadow: 0 0 0 3px var(--dh-accent-soft); outline: none; }
+.dh-quick-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.dh-view button.dh-qbtn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 44px; padding: 0 16px; border-radius: 12px; border: 1.5px solid var(--dh-accent-line); background: var(--background-primary); color: var(--dh-accent); font-weight: 650; font-size: var(--font-ui-medium); box-shadow: 0 1px 2px rgba(0,0,0,.06); cursor: pointer; transition: transform .1s, background .15s; }
+.dh-view button.dh-qbtn:hover { background: var(--dh-accent-soft); }
+.dh-view button.dh-qbtn:active { transform: scale(.96); }
+.dh-view button.dh-qbtn.is-main { flex: 1 1 160px; background: var(--dh-accent); border-color: var(--dh-accent); color: var(--text-on-accent); font-size: 1.05em; box-shadow: 0 3px 10px var(--dh-accent-line); }
+.dh-view button.dh-qbtn.is-main:hover { filter: brightness(1.06); background: var(--dh-accent); }
+.dh-qbtn-icon { display: inline-flex; }
+.dh-qbtn-icon svg { width: 18px; height: 18px; }
+.dh-quick-dest { margin-top: 12px; }
+.dh-quick-destlabel { display: block; font-size: var(--font-ui-smaller); font-weight: 600; color: var(--text-muted); margin-bottom: 6px; }
+.dh-quick-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.dh-view button.dh-qchip { display: inline-flex; align-items: center; gap: 6px; height: 40px; padding: 0 14px 0 10px; border-radius: 999px; border: 1.5px solid var(--dh-accent-line); background: var(--dh-accent-soft); color: var(--text-normal); font-weight: 600; cursor: pointer; box-shadow: none; }
+.dh-view button.dh-qchip:active { transform: scale(.96); }
+.dh-qchip-icon { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; background: var(--dh-accent); color: var(--text-on-accent); }
+.dh-qchip-icon svg { width: 13px; height: 13px; }
+.dh-view button.dh-qchip.is-done { border-color: var(--dh-accent); }
+/* 今日内容的按钮也更醒目 */
+.dh-launch { min-height: 42px; border-width: 1.5px; font-weight: 600; font-size: var(--font-ui-medium); background: var(--background-primary); box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+.dh-launch .dh-launch-icon { background: var(--dh-accent-soft); color: var(--dh-accent); width: 24px; height: 24px; }
+.dh-launch.is-primary { border-style: solid; border-color: var(--dh-accent); }
+/* 手机：悬浮“记一笔” */
+.dh-fab { position: absolute; right: 16px; bottom: calc(18px + var(--rw-nav-inset, 0px) + env(safe-area-inset-bottom)); z-index: 20; display: inline-flex; align-items: center; gap: 6px; height: 52px !important; padding: 0 20px !important; border-radius: 26px !important; border: none !important; background: var(--dh-accent) !important; color: var(--text-on-accent) !important; font-weight: 700; font-size: 1.05em; box-shadow: 0 6px 18px rgba(0,0,0,.25) !important; }
+.dh-fab:active { transform: scale(.95); }
+.dh-fab-icon { display: inline-flex; }
+.dh-fab-icon svg { width: 20px; height: 20px; }
+@container dh (max-width: 560px) {
+  .dh-quick { padding: 14px; }
+  .dh-view button.dh-qbtn { height: 48px; padding: 0 12px; flex: 1 1 0; }
+  .dh-view button.dh-qbtn.is-main { flex: 1 1 100%; height: 52px; }
+  .dh-quick-chips { flex-wrap: nowrap; overflow-x: auto; margin: 0 -14px; padding: 2px 14px 4px; scrollbar-width: none; }
+  .dh-quick-chips::-webkit-scrollbar { display: none; }
+  .dh-view button.dh-qchip { flex-shrink: 0; height: 44px; white-space: nowrap; }
+  .dh-hero { padding: 12px 14px; }
+  .dh-is-mobile .dh-hero .dh-stats { display: none; }
+  .dh-is-mobile .dh-view .dh-hero-title, .dh-is-mobile .dh-hero-title { font-size: 1.4em; }
+  .dh-launch { min-height: 46px; }
+}

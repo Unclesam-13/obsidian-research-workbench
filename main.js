@@ -14691,6 +14691,7 @@ class DailyHubView extends ItemView {
     const scroll = root.createDiv({ cls: "dh-scroll" });
     const page = scroll.createDiv({ cls: "dh-page" });
     this.els = { scroll };
+    this.els.quick = page.createEl("section", { cls: "dh-card dh-quick" });
     this.els.hero = page.createDiv({ cls: "dh-hero" });
 
     const grid = page.createDiv({ cls: "dh-grid" });
@@ -14702,17 +14703,158 @@ class DailyHubView extends ItemView {
     this.els.launcher = main.createEl("section", { cls: "dh-card dh-launcher" });
     this.els.day = main.createEl("section", { cls: "dh-day" });
 
+    this.renderQuick();
     this.renderHero();
     this.renderCalendar();
     this.renderLauncher();
     this.renderMemo();
     this.renderDay();
     scroll.scrollTop = prevScroll;
+    if (Platform.isMobile) {
+      const fab = root.createEl("button", { cls: "dh-fab", attr: { "aria-label": "记一笔" } });
+      setIcon(fab.createSpan({ cls: "dh-fab-icon" }), "pen-line");
+      fab.createSpan({ cls: "dh-fab-label", text: "记一笔" });
+      fab.addEventListener("click", () => {
+        const ta = this.els.quickInput;
+        if (ta && this.els.scroll) {
+          this.els.scroll.scrollTo({ top: 0, behavior: "smooth" });
+          setTimeout(() => ta.focus(), 250);
+        } else this.openTodayRecord(this.recordProject());
+      });
+    }
+  }
+
+  /* ----- 随手记：放在最前面，打开就能记 ----- */
+
+  openTodayRecord(project) {
+    new RecordModal(this.app, this.plugin, {
+      date: keyOf(new Date()),
+      project,
+      onDone: () => this.refresh(),
+    }).open();
+  }
+
+  renderQuick() {
+    const el = this.els.quick;
+    if (!el) return;
+    el.empty();
+    const now = new Date();
+    const today = keyOf(now);
+    const head = el.createDiv({ cls: "dh-quick-head" });
+    setIcon(head.createSpan({ cls: "dh-quick-badge" }), "pen-line");
+    const ht = head.createDiv({ cls: "dh-quick-htext" });
+    ht.createDiv({ cls: "dh-quick-title", text: "随手记" });
+    ht.createDiv({ cls: "dh-quick-sub", text: `${now.getMonth() + 1} 月 ${now.getDate()} 日 ${WEEKDAY_FULL[now.getDay()]} · 写完点「记到日记」，或点下面的分类` });
+
+    const ta = el.createEl("textarea", { cls: "dh-quick-input", attr: { rows: "3", placeholder: "此刻在做什么、想到了什么……" } });
+    ta.value = this._quickDraft || "";
+    ta.addEventListener("input", () => { this._quickDraft = ta.value; });
+    this.els.quickInput = ta;
+    const take = () => {
+      const t = ta.value.replace(/\s+$/, "");
+      if (!t.trim()) { ta.focus(); return null; }
+      return t;
+    };
+    const done = (msg) => {
+      ta.value = "";
+      this._quickDraft = "";
+      new Notice(msg);
+      if (this.selectedDate !== today) this.selectedDate = today;
+      this.refresh();
+    };
+    const toDiary = async (btn) => {
+      const text = take();
+      if (text === null) return;
+      btn.disabled = true;
+      try {
+        const d = new Date();
+        const min = d.getHours() * 60 + d.getMinutes();
+        await this.plugin.writeDailyEntry(today, { min, text });
+        done(`已记到今天的日记 ${fmtTime(min)}`);
+      } catch (err) {
+        console.error("[daily-hub] quick record failed", err);
+        new Notice(`保存失败：${err.message || err}`);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+    ta.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); toDiary(main); }
+    });
+
+    const row = el.createDiv({ cls: "dh-quick-actions" });
+    const main = row.createEl("button", { cls: "dh-qbtn is-main" });
+    setIcon(main.createSpan({ cls: "dh-qbtn-icon" }), "calendar-plus");
+    main.createSpan({ text: "记到日记" });
+    main.addEventListener("click", () => toDiary(main));
+
+    const diary = row.createEl("button", { cls: "dh-qbtn" });
+    setIcon(diary.createSpan({ cls: "dh-qbtn-icon" }), "notebook-pen");
+    diary.createSpan({ text: "写日记" });
+    diary.setAttr("aria-label", "打开记录窗口（可补记某个时段）");
+    diary.addEventListener("click", () => this.openTodayRecord(this.recordProject()));
+
+    const note = row.createEl("button", { cls: "dh-qbtn" });
+    setIcon(note.createSpan({ cls: "dh-qbtn-icon" }), "file-plus-2");
+    note.createSpan({ text: "新笔记" });
+    note.setAttr("aria-label", "存为知识库里的一篇新笔记（没写内容就新建空白笔记）");
+    note.addEventListener("click", () => this.quickNote(ta.value, () => { ta.value = ""; this._quickDraft = ""; }));
+
+    const projects = this.projects().filter((p) => !p.archived && !p.isRecord && !p.research);
+    if (projects.length) {
+      const dest = el.createDiv({ cls: "dh-quick-dest" });
+      dest.createSpan({ cls: "dh-quick-destlabel", text: "记到分类" });
+      const chips = dest.createDiv({ cls: "dh-quick-chips" });
+      for (const p of projects.slice(0, 10)) {
+        const path = normalizePath(`${p.path}/${today}.md`);
+        const has = Boolean(this.app.vault.getAbstractFileByPath(path));
+        const b = chips.createEl("button", { cls: "dh-qchip", attr: { title: path } });
+        b.toggleClass("is-done", has);
+        setIcon(b.createSpan({ cls: "dh-qchip-icon" }), has ? "check" : "plus");
+        b.createSpan({ text: p.label });
+        b.addEventListener("click", async () => {
+          const text = ta.value.replace(/\s+$/, "");
+          if (!text.trim()) { this.openTodayRecord(p); return; }
+          b.disabled = true;
+          try {
+            await this.plugin.appendProjectRecord(p.path, today, text);
+            done(`已写入「${p.label}」`);
+          } catch (err) {
+            new Notice(`保存失败：${err.message || err}`);
+          } finally {
+            b.disabled = false;
+          }
+        });
+      }
+    }
+  }
+
+  async quickNote(raw, clear) {
+    const host = __dh.__host;
+    const base = normalizePath(`${(host && host.settings.kbFolder) || "知识库"}/随手笔记`);
+    const text = (raw || "").replace(/\s+$/, "");
+    const d = new Date();
+    const stamp = `${keyOf(d)} ${pad(d.getHours())}${pad(d.getMinutes())}`;
+    const first = text.split("\n").map((x) => x.replace(/^[#>*\-\s]+/, "").trim()).find(Boolean) || "";
+    const title = (first.slice(0, 30).replace(/[\\/:*?"<>|#^[\]]/g, " ").trim()) || `随手笔记 ${stamp}`;
+    try {
+      if (!isFolder(this.app.vault.getAbstractFileByPath(base))) await this.app.vault.createFolder(base).catch(() => {});
+      let path = normalizePath(`${base}/${title}.md`);
+      for (let i = 2; this.app.vault.getAbstractFileByPath(path); i++) path = normalizePath(`${base}/${title} ${i}.md`);
+      const file = await this.app.vault.create(path, text ? `${text}\n` : "");
+      if (text) clear?.();
+      new Notice(`已新建笔记：${path}`);
+      await this.app.workspace.getLeaf(Platform.isMobile ? false : "tab").openFile(file);
+    } catch (err) {
+      console.error("[daily-hub] quick note failed", err);
+      new Notice(`新建笔记失败：${err.message || err}`);
+    }
   }
 
   refresh() {
     this.buildIndex();
     const prev = this.els.scroll?.scrollTop || 0;
+    if (document.activeElement !== this.els.quickInput) this.renderQuick();
     this.renderHero();
     this.renderCalendar();
     this.renderLauncher();
