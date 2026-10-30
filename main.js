@@ -825,7 +825,8 @@ class WorkbenchView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
-    this.tab = plugin.settings.lastTab || plugin.settings.defaultTab || 'home';
+    this.tab = plugin.settings.appMode === 'life' ? (plugin.settings.lastLifeTab || 'life') : (plugin.settings.lastTab || plugin.settings.defaultTab || 'home');
+    if (plugin.settings.appMode === 'life' && !LIFE_TABS.some((t) => t.id === this.tab)) this.tab = 'life';
     this.filters = {};
     this.dragging = false;
     this.searchSel = -1;
@@ -932,7 +933,14 @@ class WorkbenchView extends ItemView {
       try { if (v.containerEl && v.containerEl !== this.lifeHost) v.containerEl.remove(); } catch (e) { /* ignore */ }
       clear(this.lifeHost);
       v.containerEl = this.lifeHost;
+      // 手机上输入框获得焦点/键盘弹出时，浏览器可能把 overflow:hidden 的外层也滚下去，留下一块空白；这里始终拉回顶部
+      if (!this._lifeScrollGuard) {
+        this._lifeScrollGuard = true;
+        const pin = (el) => el && el.addEventListener('scroll', () => { if (el.scrollTop && (el !== this.contentEl || this.contentEl.classList.contains('rw-mfmode'))) el.scrollTop = 0; });
+        pin(this.contentEl); pin(this.lifeHost);
+      }
       v.contentEl = h(this.lifeHost, 'div', { cls: 'view-content rw-dh-embed' });
+      v.contentEl.addEventListener('scroll', () => { if (v.contentEl.scrollTop) v.contentEl.scrollTop = 0; });
       v.load();
       await v.onOpen();
       this.lifeView = v;
@@ -14691,6 +14699,7 @@ class DailyHubView extends ItemView {
     const scroll = root.createDiv({ cls: "dh-scroll" });
     const page = scroll.createDiv({ cls: "dh-page" });
     this.els = { scroll };
+    if (Platform.isMobile) this.renderMobileNav(page);
     this.els.quick = page.createEl("section", { cls: "dh-card dh-quick" });
     this.els.hero = page.createDiv({ cls: "dh-hero" });
 
@@ -14715,6 +14724,7 @@ class DailyHubView extends ItemView {
       setIcon(fab.createSpan({ cls: "dh-fab-icon" }), "pen-line");
       fab.createSpan({ cls: "dh-fab-label", text: "记一笔" });
       fab.addEventListener("click", () => {
+        if (this.mpage && this.mpage !== "today") this.setMobilePage("today");
         const ta = this.els.quickInput;
         if (ta && this.els.scroll) {
           this.els.scroll.scrollTo({ top: 0, behavior: "smooth" });
@@ -14722,6 +14732,42 @@ class DailyHubView extends ItemView {
         } else this.openTodayRecord(this.recordProject());
       });
     }
+  }
+
+  /* ----- 手机：顶部切换按钮（今天 / 日历 / 待办 / 备忘），窄屏一次只显示一块 ----- */
+
+  renderMobileNav(page) {
+    const nav = page.createDiv({ cls: "dh-mnav" });
+    this.els.mnav = nav;
+    const defs = [
+      ["today", "sun", "今天"],
+      ["cal", "calendar-days", "日历"],
+      ["todo", "list-checks", "待办"],
+      ["memo", "quote", "备忘"],
+    ];
+    for (const [id, icon, label] of defs) {
+      const b = nav.createEl("button", { cls: "dh-mnav-btn", attr: { "data-page": id, "aria-label": label } });
+      setIcon(b.createSpan({ cls: "dh-mnav-icon" }), icon);
+      b.createSpan({ cls: "dh-mnav-label", text: label });
+      if (id === "todo") this.els.mnavBadge = b.createSpan({ cls: "dh-mnav-badge" });
+      b.addEventListener("click", () => this.setMobilePage(id));
+    }
+    this.setMobilePage(this.mpage || "today", true);
+  }
+
+  async setMobilePage(id, silent) {
+    this.mpage = id;
+    this.contentEl.dataset.mpage = id;
+    for (const b of this.els.mnav?.querySelectorAll(".dh-mnav-btn") || []) b.toggleClass("is-active", b.dataset.page === id);
+    if (silent) return;
+    if ((id === "todo" || id === "memo") && this.s.sideTab !== id) {
+      if (!(id === "memo" && this.s.sideTab === "links")) {
+        this.s.sideTab = id;
+        await this.plugin.saveData(this.plugin.settings);
+        this.renderMemo();
+      }
+    }
+    if (this.els.scroll) this.els.scroll.scrollTop = 0;
   }
 
   /* ----- 随手记：放在最前面，打开就能记 ----- */
@@ -15333,6 +15379,7 @@ class DailyHubView extends ItemView {
     const n = g.reduce((sum, x) => sum + x.tasks.filter((t) => !t.done).length, 0);
     badge.setText(n ? String(n) : "");
     badge.toggleClass("is-empty", !n);
+    if (this.els.mnavBadge) { this.els.mnavBadge.setText(n ? String(n) : ""); this.els.mnavBadge.toggleClass("is-empty", !n); }
   }
 
   async renderTodoTab(body) {

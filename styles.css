@@ -4439,3 +4439,34 @@ tr:hover .rw-att-chip.is-empty, .rw-pgc .rw-att-chip.is-empty { opacity: .7; }
   .dh-is-mobile .dh-view .dh-hero-title, .dh-is-mobile .dh-hero-title { font-size: 1.4em; }
   .dh-launch { min-height: 46px; }
 }
+
+/* ======== v0.23.7 手机：顶部切换按钮 ======== */
+.dh-mnav { display: none; }
+@container dh (max-width: 860px) {
+  .dh-is-mobile .dh-mnav { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; position: sticky; top: 0; z-index: 15; margin: -4px -4px 0; padding: 6px 4px; background: color-mix(in srgb, var(--background-primary) 88%, transparent); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border-radius: 0 0 16px 16px; }
+  .dh-is-mobile .dh-mnav-btn { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; height: 58px !important; padding: 4px 2px !important; border-radius: 14px !important; border: 1.5px solid var(--dh-accent-line) !important; background: var(--background-primary) !important; color: var(--dh-accent) !important; font-weight: 650; font-size: var(--font-ui-small); box-shadow: 0 1px 3px rgba(0,0,0,.08) !important; }
+  .dh-is-mobile .dh-mnav-btn.is-active { background: var(--dh-accent) !important; border-color: var(--dh-accent) !important; color: var(--text-on-accent) !important; box-shadow: 0 3px 10px var(--dh-accent-line) !important; }
+  .dh-is-mobile .dh-mnav-btn:active { transform: scale(.95); }
+  .dh-mnav-icon { display: inline-flex; }
+  .dh-mnav-icon svg { width: 20px; height: 20px; }
+  .dh-mnav-badge { position: absolute; top: 4px; right: 8px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--color-red, #e5484d); color: #fff; font-size: 11px; line-height: 18px; font-weight: 700; }
+  .dh-mnav-badge.is-empty { display: none; }
+  /* 一次只显示一块 */
+  .dh-is-mobile[data-mpage="today"] .dh-calendar-card,
+  .dh-is-mobile[data-mpage="today"] .dh-memo-card { display: none !important; }
+  .dh-is-mobile[data-mpage="cal"] .dh-quick,
+  .dh-is-mobile[data-mpage="cal"] .dh-hero,
+  .dh-is-mobile[data-mpage="cal"] .dh-launcher,
+  .dh-is-mobile[data-mpage="cal"] .dh-memo-card { display: none !important; }
+  .dh-is-mobile[data-mpage="cal"] .dh-calendar-card { order: 0; }
+  .dh-is-mobile[data-mpage="todo"] .dh-side > *:not(.dh-memo-card),
+  .dh-is-mobile[data-mpage="todo"] .dh-main > *,
+  .dh-is-mobile[data-mpage="todo"] .dh-quick,
+  .dh-is-mobile[data-mpage="todo"] .dh-hero,
+  .dh-is-mobile[data-mpage="memo"] .dh-side > *:not(.dh-memo-card),
+  .dh-is-mobile[data-mpage="memo"] .dh-main > *,
+  .dh-is-mobile[data-mpage="memo"] .dh-quick,
+  .dh-is-mobile[data-mpage="memo"] .dh-hero { display: none !important; }
+  .dh-is-mobile[data-mpage="todo"] .dh-memo-card,
+  .dh-is-mobile[data-mpage="memo"] .dh-memo-card { display: block !important; order: 0; }
+}
