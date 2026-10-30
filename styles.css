@@ -4470,3 +4470,13 @@ tr:hover .rw-att-chip.is-empty, .rw-pgc .rw-att-chip.is-empty { opacity: .7; }
   .dh-is-mobile[data-mpage="todo"] .dh-memo-card,
   .dh-is-mobile[data-mpage="memo"] .dh-memo-card { display: block !important; order: 0; }
 }
+
+/* v0.23.8 手机：去掉生活面板顶部的留白 */
+.rw-lifehost, .rw-lifehost > .rw-dh-embed, .rw-lifehost .dh-view, .rw-lifehost .dh-scroll { margin-top: 0 !important; padding-top: 0 !important; border-top: 0 !important; }
+.rw-lifehost > .rw-dh-embed { position: relative; display: flex; flex-direction: column; }
+.rw-lifehost > .rw-dh-embed > .dh-scroll { flex: 1 1 auto; min-height: 0; }
+.rw-lifehost > .rw-dh-embed::before, .rw-lifehost > .rw-dh-embed::after { content: none !important; display: none !important; }
+@container dh (max-width: 860px) {
+  .dh-is-mobile .dh-page { padding-top: 0; }
+  .dh-is-mobile .dh-mnav { margin: 0 -4px; padding: 8px 4px 6px; }
+}

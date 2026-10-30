@@ -939,7 +939,7 @@ class WorkbenchView extends ItemView {
         const pin = (el) => el && el.addEventListener('scroll', () => { if (el.scrollTop && (el !== this.contentEl || this.contentEl.classList.contains('rw-mfmode'))) el.scrollTop = 0; });
         pin(this.contentEl); pin(this.lifeHost);
       }
-      v.contentEl = h(this.lifeHost, 'div', { cls: 'view-content rw-dh-embed' });
+      v.contentEl = h(this.lifeHost, 'div', { cls: 'rw-dh-embed' }); // 不用 view-content：手机版 Obsidian 会给 view-content 加顶部留白
       v.contentEl.addEventListener('scroll', () => { if (v.contentEl.scrollTop) v.contentEl.scrollTop = 0; });
       v.load();
       await v.onOpen();
