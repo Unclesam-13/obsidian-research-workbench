@@ -245,12 +245,14 @@ const TABS = [
   { id: 'files', label: '文件', icon: 'paperclip' },
   { id: 'kb', label: '知识库', icon: 'library-big' },
   { id: 'plan', label: '计划', icon: 'calendar-check' },
+  { id: 'tempwork', label: '暂时工作', icon: 'monitor' },
   { id: 'activity', label: '全局记录', icon: 'activity' },
   { id: 'assistant', label: 'AI 助手', icon: 'bot' },
   { id: 'mindflow', label: 'Mindflow', icon: 'git-fork' },
 ];
 
 /* 生活面板的标签（科研 / 生活两个面板，顶部切换） */
+const WORK_STATUS = ['运行中', '已完成', '出错', '暂停'];
 const LIFE_TABS = [
   { id: 'life', label: '生活主页', icon: 'sun' },
   { id: 'kb', label: '知识库', icon: 'library-big' },
@@ -842,6 +844,17 @@ class WorkbenchView extends ItemView {
     this.registerEvent(this.app.vault.on('create', refresh));
     this.registerEvent(this.app.vault.on('delete', refresh));
     this.registerEvent(this.app.vault.on('rename', refresh));
+    // 暂时工作：在这个页面里 Ctrl+V 直接贴截图
+    this.registerDomEvent(this.contentEl.ownerDocument, 'paste', (e) => {
+      if (this.tab !== 'tempwork' || !this._twAddImgs || !this.contentEl.isConnected || !this.contentEl.offsetParent) return;
+      const t = e.target;
+      if (t && t.closest && t.closest('.modal-container')) return;
+      if (t && t.closest && !this.contentEl.contains(t) && t !== this.contentEl.ownerDocument.body) return;
+      const imgs = [...((e.clipboardData && e.clipboardData.files) || [])].filter((f) => /^image\//.test(f.type));
+      if (!imgs.length) return;
+      e.preventDefault();
+      this._twAddImgs(imgs);
+    });
     this.registerDomEvent(this.contentEl.ownerDocument, 'click', (e) => {
       if (this.searchWrap && !this.searchWrap.contains(e.target)) this.hideSearch();
     });
@@ -1182,6 +1195,7 @@ class WorkbenchView extends ItemView {
       else if (this.tab === 'kb') this.renderKb(el);
       else if (this.tab === 'detail' && this.detailProject && this.index.byName.has(this.detailProject)) this.renderDetail(el, this.index.byName.get(this.detailProject));
       else if (this.tab === 'plan') this.renderPlan(el);
+      else if (this.tab === 'tempwork') this.renderTempWork(el);
       else if (this.tab === 'assistant') this.renderAssistant(el);
       else if (this.tab === 'activity') this.renderActivityPage(el);
       else this.renderHome(el);
@@ -3696,6 +3710,200 @@ class WorkbenchView extends ItemView {
     });
   }
 
+  /* ---- 暂时工作：按时间线记下每台电脑上在跑的任务，配截图 ---- */
+  renderTempWork(el) {
+    const pl = this.plugin, st = pl.settings;
+    const devices = st.workDevices || (st.workDevices = []);
+    const right = this.header(el, '暂时工作', '各台电脑上正在跑的任务：贴一张截图、写一句话，按时间排成时间线。数据存在「' + pl.workDir() + '」，按月一个 md 文件', 'monitor');
+    this.btn(right, '打开本月文件', 'file-text', async () => { const f = this.app.vault.getAbstractFileByPath(pl.workFilePath(today().slice(0, 7))); if (f) pl.openFile(f); else new Notice('本月还没有记录'); }, 'rw-btn-sm');
+
+    // ① 新记录
+    const draft = this.twDraft || (this.twDraft = { text: '', device: st.workLastDevice || devices[0] || '', status: '运行中', time: '', date: '', imgs: [] });
+    if ((!draft.device || !devices.includes(draft.device)) && devices.length) draft.device = devices.includes(st.workLastDevice) ? st.workLastDevice : devices[0];
+    const sec = this.section(el, '记一条', 'plus-circle');
+    const form = h(sec.body, 'div', { cls: 'rw-tw-form' });
+    const r1 = h(form, 'div', { cls: 'rw-tw-row' });
+    const devWrap = h(r1, 'div', { cls: 'rw-tw-devs' });
+    h(devWrap, 'span', { cls: 'rw-tw-lab', text: '电脑' });
+    const drawDevs = () => {
+      [...devWrap.querySelectorAll('.rw-tw-devchip, .rw-tw-adddev')].forEach((x) => x.remove());
+      for (const d of devices) {
+        const c = h(devWrap, 'button', { cls: 'rw-catchip rw-tw-devchip' + (draft.device === d ? ' is-active' : ''), text: d });
+        c.style.setProperty('--tw-c', pl.workColor(d));
+        c.addEventListener('click', () => { draft.device = d; drawDevs(); });
+        c.addEventListener('contextmenu', (e) => {
+          e.preventDefault();
+          const m = new Menu();
+          m.addItem((i) => i.setTitle('改名…').setIcon('pencil').onClick(() => pl.promptText('电脑名称', d, async (v) => { if (v && v !== d) { await pl.renameWorkDevice(d, v); if (draft.device === d) draft.device = v; } })));
+          m.addItem((i) => i.setTitle('从列表移除（不删记录）').setIcon('x').onClick(async () => { st.workDevices = devices.filter((x) => x !== d); await pl.saveSettings(); this.render(); }));
+          m.showAtMouseEvent(e);
+        });
+      }
+      const add = h(devWrap, 'button', { cls: 'rw-btn rw-btn-sm rw-tw-adddev', title: '添加一台电脑（例如：实验室台式机 / 服务器 A / 笔记本）' });
+      ic(add, 'plus'); h(add, 'span', { text: devices.length ? '' : '添加电脑' });
+      add.addEventListener('click', () => pl.promptText('电脑名称（例如：实验室台式机、服务器 A、笔记本）', '', async (v) => { v = String(v || '').replace(/\*/g, '').trim(); if (!v) return; if (!devices.includes(v)) devices.push(v); draft.device = v; await pl.saveSettings(); drawDevs(); }));
+    };
+    drawDevs();
+    h(r1, 'div', { cls: 'rw-spacer' });
+    const ss = h(r1, 'select', { cls: 'dropdown rw-select rw-select-sm', title: '任务状态' });
+    for (const x of WORK_STATUS) { const o = h(ss, 'option', { text: x }); o.value = x; }
+    ss.value = draft.status; ss.addEventListener('change', () => (draft.status = ss.value));
+    const dIn = h(r1, 'input', { cls: 'rw-log-time', attr: { type: 'date', title: '留空 = 今天' } });
+    dIn.value = draft.date; dIn.addEventListener('change', () => (draft.date = dIn.value));
+    const tIn = h(r1, 'input', { cls: 'rw-log-time', attr: { type: 'time', title: '留空 = 现在；也可以补记之前的时间' } });
+    tIn.value = draft.time; tIn.addEventListener('change', () => (draft.time = tIn.value));
+
+    const ta = h(form, 'textarea', { cls: 'rw-log-input rw-tw-input', attr: { rows: '2', placeholder: '这台电脑在跑什么？例如：DOA 仿真第 3 组参数，预计 2 小时' + (IS_MOBILE ? '' : '（Ctrl+Enter 记录，Ctrl+V 贴截图）') } });
+    ta.value = draft.text; ta.addEventListener('input', () => (draft.text = ta.value));
+    const drop = h(form, 'div', { cls: 'rw-tw-drop' });
+    const thumbs = h(drop, 'div', { cls: 'rw-tw-pend' });
+    const hint = h(drop, 'div', { cls: 'rw-tw-hint' });
+    ic(hint, 'image-plus');
+    h(hint, 'span', { text: IS_MOBILE ? '点这里选截图（可多张）' : '把截图拖到这里、Ctrl+V 粘贴，或点这里选择（可多张）' });
+    const fin = h(drop, 'input', { attr: { type: 'file', accept: 'image/*', multiple: '' } }); fin.style.display = 'none';
+    hint.addEventListener('click', () => fin.click());
+    const drawPend = () => {
+      clear(thumbs);
+      drop.classList.toggle('has-imgs', draft.imgs.length > 0);
+      draft.imgs.forEach((f, i) => {
+        const t = h(thumbs, 'div', { cls: 'rw-tw-pthumb' });
+        const im = h(t, 'img'); const u = URL.createObjectURL(f); im.src = u; im.onload = () => setTimeout(() => URL.revokeObjectURL(u), 1000);
+        const x = h(t, 'button', { cls: 'rw-tw-px', title: '去掉这张' }); ic(x, 'x');
+        x.addEventListener('click', (e) => { e.stopPropagation(); draft.imgs.splice(i, 1); drawPend(); });
+      });
+      if (draft.imgs.length) { const more = h(thumbs, 'button', { cls: 'rw-tw-pmore', title: '再加截图' }); ic(more, 'plus'); more.addEventListener('click', () => fin.click()); }
+    };
+    this._twAddImgs = (files) => { draft.imgs.push(...files.filter((f) => /^image\//.test(f.type || 'image/png'))); drawPend(); };
+    fin.addEventListener('change', () => { if (fin.files) this._twAddImgs([...fin.files]); fin.value = ''; });
+    drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('is-over'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('is-over'));
+    drop.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); e.rwContext = { handled: true }; drop.classList.remove('is-over'); const fs = [...((e.dataTransfer && e.dataTransfer.files) || [])]; if (fs.length) this._twAddImgs(fs); });
+    drawPend();
+    const r3 = h(form, 'div', { cls: 'rw-tw-row rw-tw-actions' });
+    h(r3, 'div', { cls: 'rw-spacer' });
+    const ok = h(r3, 'button', { cls: 'rw-btn mod-cta rw-tw-submit' }); ic(ok, 'stamp'); h(ok, 'span', { text: '记录' });
+    const submit = async () => {
+      const text = ta.value.trim();
+      if (!text && !draft.imgs.length) { ta.focus(); return; }
+      if (!draft.device) { new Notice('先选一台电脑（没有就点「＋」添加）'); return; }
+      const when = draft.date ? parseDate(draft.date) : new Date();
+      if (draft.time) { const [hh, mm] = draft.time.split(':').map(Number); when.setHours(hh, mm, 0, 0); }
+      ok.disabled = true;
+      try {
+        const imgs = [];
+        for (const f of draft.imgs) imgs.push(await pl.saveWorkShot(f, draft.device, when));
+        await pl.addWork({ when, device: draft.device, status: draft.status, text, images: imgs });
+        st.workLastDevice = draft.device; pl.saveSettingsSoon();
+        this.twDraft = { text: '', device: draft.device, status: '运行中', time: '', date: '', imgs: [] };
+        new Notice('🖥 已记录 ' + draft.device + ' ' + pad(when.getHours()) + ':' + pad(when.getMinutes()));
+        this.render();
+      } catch (e) { console.error(e); new Notice('记录失败：' + (e.message || e)); } finally { ok.disabled = false; }
+    };
+    ok.addEventListener('click', submit);
+    ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); submit(); } });
+
+    // ② 各电脑现在 + ③ 时间线
+    const nowSec = this.section(el, '各电脑现在', 'monitor-dot');
+    const nowBox = h(nowSec.body, 'div', { cls: 'rw-tw-now' });
+    const tlSec = this.section(el, '时间线', 'git-commit-vertical');
+    const tl = h(tlSec.body, 'div', { cls: 'rw-tl rw-tw-tl' });
+    h(tl, 'div', { cls: 'rw-empty-sm', text: '加载中…' });
+    const days = this.twDays || 7;
+    const fdev = this.twDev || '';
+    pl.readWork(days - 1).then((all) => {
+      // 各电脑最新一条
+      clear(nowBox);
+      const latest = new Map();
+      for (const e of all) if (!latest.has(e.device)) latest.set(e.device, e);
+      for (const d of devices) if (!latest.has(d)) latest.set(d, null);
+      if (!latest.size) h(nowBox, 'div', { cls: 'rw-empty-sm', text: '还没有电脑。在上面点「添加电脑」，再贴一张截图记一条。' });
+      for (const [d, e] of latest) {
+        const c = h(nowBox, 'div', { cls: 'rw-tw-card' + (fdev === d ? ' is-active' : '') });
+        c.style.setProperty('--tw-c', pl.workColor(d));
+        const top = h(c, 'div', { cls: 'rw-tw-card-top' });
+        h(top, 'span', { cls: 'rw-tw-cdot' });
+        h(top, 'b', { text: d });
+        if (e) h(top, 'span', { cls: 'rw-tw-st is-' + WORK_STATUS.indexOf(e.status), text: e.status });
+        if (e && e.images.length) {
+          const im = h(c, 'img', { cls: 'rw-tw-cimg' }); const src = pl.workImgSrc(e.images[e.images.length - 1]); if (src) im.src = src;
+          im.addEventListener('click', (ev) => { ev.stopPropagation(); new WorkShotModal(this.app, pl, e.images, e.images.length - 1, e).open(); });
+        }
+        h(c, 'div', { cls: 'rw-tw-ctext', text: e ? (e.text || '（只有截图）') : '近 ' + days + ' 天没有记录' });
+        if (e) h(c, 'div', { cls: 'rw-muted rw-tw-cwhen', text: (e.date === today() ? '今天 ' : e.date.slice(5) + ' ') + e.time + ' · ' + relTime(e.ts) });
+        c.title = fdev === d ? '点一下显示全部电脑' : '只看这台电脑的时间线';
+        c.addEventListener('click', () => { this.twDev = fdev === d ? '' : d; this.render(); });
+      }
+      // 时间线
+      clear(tl); clear(tlSec.right);
+      const list = fdev ? all.filter((e) => e.device === fdev) : all;
+      h(tlSec.right, 'span', { cls: 'rw-muted', text: (fdev ? fdev + ' · ' : '') + '近 ' + days + ' 天 ' + list.length + ' 条' });
+      if (fdev) { const cb = h(tlSec.right, 'button', { cls: 'rw-linkbtn', text: '显示全部电脑' }); cb.addEventListener('click', () => { this.twDev = ''; this.render(); }); }
+      if (!list.length) h(tl, 'div', { cls: 'rw-empty-sm', text: '这段时间没有记录。电脑上开始跑一个任务时，截个图贴到上面，写一句话点「记录」。' });
+      let cur = '', dayList = null;
+      for (const e of list) {
+        if (e.date !== cur) {
+          cur = e.date;
+          const d = parseDate(e.date), dd = daysUntil(e.date);
+          const hd = h(tl, 'div', { cls: 'rw-tl-day' });
+          h(hd, 'b', { text: dd === 0 ? '今天' : dd === -1 ? '昨天' : (d.getMonth() + 1) + '月' + d.getDate() + '日' });
+          h(hd, 'span', { cls: 'rw-muted', text: '星期' + '日一二三四五六'[d.getDay()] + ' · ' + list.filter((x) => x.date === e.date).length + ' 条' });
+          dayList = h(tl, 'div', { cls: 'rw-tl-list' });
+        }
+        const it = h(dayList, 'div', { cls: 'rw-tl-item rw-tw-item' });
+        it.style.setProperty('--tw-c', pl.workColor(e.device));
+        h(it, 'div', { cls: 'rw-tl-time', text: e.time });
+        h(it, 'div', { cls: 'rw-tl-dot rw-tw-dot' });
+        const body = h(it, 'div', { cls: 'rw-tl-body rw-tw-body' });
+        const line = h(body, 'div', { cls: 'rw-tw-line' });
+        const dv = h(line, 'span', { cls: 'rw-tw-dev', text: e.device, title: '只看这台电脑' });
+        dv.addEventListener('click', () => { this.twDev = e.device; this.render(); });
+        const sc = h(line, 'button', { cls: 'rw-tw-st is-' + WORK_STATUS.indexOf(e.status), text: e.status, title: '点一下切换状态' });
+        sc.addEventListener('click', async () => { const i = WORK_STATUS.indexOf(e.status); await pl.updateWork(e, { status: WORK_STATUS[(i + 1) % WORK_STATUS.length] }); this.render(); });
+        if (e.text) h(body, 'div', { cls: 'rw-tl-text rw-tw-text', text: e.text });
+        if (e.images.length) {
+          const g = h(body, 'div', { cls: 'rw-tw-shots' + (e.images.length === 1 ? ' is-one' : '') });
+          e.images.forEach((p, i) => {
+            const im = h(g, 'img', { cls: 'rw-tw-shot', attr: { loading: 'lazy', title: p } });
+            const src = pl.workImgSrc(p); if (src) im.src = src; else { im.alt = '找不到图片：' + p; im.classList.add('is-missing'); }
+            im.addEventListener('click', () => new WorkShotModal(this.app, pl, e.images, i, e).open());
+          });
+        }
+        // 拖截图到这一条 = 追加
+        it.addEventListener('dragover', (ev) => { if (ev.dataTransfer && [...ev.dataTransfer.types].includes('Files')) { ev.preventDefault(); it.classList.add('is-over'); } });
+        it.addEventListener('dragleave', () => it.classList.remove('is-over'));
+        it.addEventListener('drop', async (ev) => { it.classList.remove('is-over'); const fs = [...((ev.dataTransfer && ev.dataTransfer.files) || [])].filter((f) => /^image\//.test(f.type)); if (!fs.length) return; ev.preventDefault(); ev.stopPropagation(); ev.rwContext = { handled: true }; await this.twAppend(e, fs); });
+        const acts = h(it, 'div', { cls: 'rw-tl-acts' });
+        const ab = h(acts, 'button', { cls: 'rw-iconbtn', title: '给这条追加截图' }); ic(ab, 'image-plus');
+        ab.addEventListener('click', () => { const fi = h(document.body, 'input', { attr: { type: 'file', accept: 'image/*', multiple: '' } }); fi.style.display = 'none'; fi.addEventListener('change', async () => { const fs = [...(fi.files || [])]; fi.remove(); if (fs.length) await this.twAppend(e, fs); }); fi.click(); });
+        const ub = h(acts, 'button', { cls: 'rw-iconbtn', title: '同一台电脑再记一条进展（填好电脑和文字）' }); ic(ub, 'refresh-cw');
+        ub.addEventListener('click', () => { this.twDraft = { text: e.text, device: e.device, status: e.status, time: '', date: '', imgs: [] }; this.render(); this.contentEl.scrollTop = 0; setTimeout(() => { const t = this.contentEl.querySelector('.rw-tw-input'); if (t) t.focus(); }, 60); });
+        const eb = h(acts, 'button', { cls: 'rw-iconbtn', title: '修改文字' }); ic(eb, 'pencil');
+        eb.addEventListener('click', () => pl.promptText('修改（' + e.date + ' ' + e.time + ' · ' + e.device + '）', e.text, async (v) => { await pl.updateWork(e, { text: v }); }));
+        this.trashBtn(acts, '删除这条记录', async () => {
+          const lines = [e.date + ' ' + e.time + ' · ' + e.device + '　' + (e.text || '')];
+          if (e.images.length) lines.push('它的 ' + e.images.length + ' 张截图也会移到回收站');
+          const okd = await pl.confirmDelete({ title: '删除记录', lines, noTrashNote: !e.images.length });
+          if (!okd) return;
+          await pl.updateWork(e, null);
+          for (const p of e.images) { const f = this.app.vault.getAbstractFileByPath(p); if (f) await pl.trash(f); }
+          this.render();
+        });
+      }
+      const more = h(tl, 'div', { cls: 'rw-more' });
+      const mb = h(more, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(mb, 'chevrons-down'); h(mb, 'span', { text: '查看更早（再往前 7 天）' });
+      mb.addEventListener('click', () => { this.twDays = days + 7; this.render(); });
+      if (days > 7) { const lb = h(more, 'button', { cls: 'rw-linkbtn', text: '收起' }); lb.addEventListener('click', () => { this.twDays = 7; this.render(); }); }
+    });
+  }
+  async twAppend(e, files) {
+    const pl = this.plugin;
+    const imgs = [];
+    for (const f of files) imgs.push(await pl.saveWorkShot(f, e.device, new Date()));
+    await pl.updateWork(e, { images: e.images.concat(imgs) });
+    new Notice('已追加 ' + imgs.length + ' 张截图');
+    this.render();
+  }
+
   /* ---- 灵感页：常用链接按钮 ---- */
   renderInspireBar(el) {
     const st = this.plugin.settings;
@@ -4888,6 +5096,35 @@ class ConfirmDeleteModal extends Modal {
       .addButton((b) => { b.setButtonText(this.o.confirmText || '删除'); if (this.o.noTrashNote) b.setCta(); else if (b.setWarning) b.setWarning(); b.onClick(() => { this.done = true; this.close(); this.resolve(this.choice); }); });
   }
   onClose() { clear(this.contentEl); if (!this.done) this.resolve(null); }
+}
+
+/* 暂时工作：看大图（左右切换） */
+class WorkShotModal extends Modal {
+  constructor(app, plugin, imgs, i, e) { super(app); this.plugin = plugin; this.imgs = imgs; this.i = i || 0; this.e = e; }
+  onOpen() {
+    this.modalEl.classList.add('rw-tw-modal');
+    const draw = () => {
+      const c = this.contentEl; clear(c);
+      const p = this.imgs[this.i];
+      this.titleEl.setText((this.e ? this.e.date + ' ' + this.e.time + ' · ' + this.e.device : '截图') + (this.imgs.length > 1 ? '（' + (this.i + 1) + '/' + this.imgs.length + '）' : ''));
+      if (this.e && this.e.text) h(c, 'div', { cls: 'rw-tw-mtext', text: this.e.text });
+      const wrap = h(c, 'div', { cls: 'rw-tw-mimg' });
+      const im = h(wrap, 'img'); const src = this.plugin.workImgSrc(p); if (src) im.src = src; else h(wrap, 'div', { cls: 'rw-empty-sm', text: '找不到图片：' + p });
+      im.addEventListener('click', () => wrap.classList.toggle('is-zoom'));
+      const bar = h(c, 'div', { cls: 'rw-tw-mbar' });
+      if (this.imgs.length > 1) {
+        const pv = h(bar, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(pv, 'chevron-left'); h(pv, 'span', { text: '上一张' }); pv.addEventListener('click', () => { this.i = (this.i - 1 + this.imgs.length) % this.imgs.length; draw(); });
+        const nx = h(bar, 'button', { cls: 'rw-btn rw-btn-sm' }); h(nx, 'span', { text: '下一张' }); ic(nx, 'chevron-right'); nx.addEventListener('click', () => { this.i = (this.i + 1) % this.imgs.length; draw(); });
+      }
+      h(bar, 'div', { cls: 'rw-spacer' });
+      const ob = h(bar, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(ob, 'external-link'); h(ob, 'span', { text: '在 Obsidian 里打开' });
+      ob.addEventListener('click', () => { const f = this.app.vault.getAbstractFileByPath(p); if (f) { this.close(); this.app.workspace.getLeaf('tab').openFile(f); } });
+    };
+    draw();
+    this.scope.register([], 'ArrowLeft', () => { if (this.imgs.length > 1) { this.i = (this.i - 1 + this.imgs.length) % this.imgs.length; draw(); } return false; });
+    this.scope.register([], 'ArrowRight', () => { if (this.imgs.length > 1) { this.i = (this.i + 1) % this.imgs.length; draw(); } return false; });
+  }
+  onClose() { this.contentEl.empty(); }
 }
 
 class TextPromptModal extends Modal {
@@ -18298,6 +18535,120 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       return lines.filter((l) => l !== null).join('\n');
     });
     this.refreshViews();
+  }
+
+  /* ---------- 暂时工作（各电脑上在跑的任务 + 截图） ---------- */
+  workDir() { return normalizePath((this.settings.rootFolder || '科研') + '/暂时工作'); }
+  workFilePath(month) { return normalizePath(this.workDir() + '/' + month + '.md'); }
+  workColor(d) { let x = 0; for (const ch of String(d)) x = (x * 31 + ch.charCodeAt(0)) >>> 0; return 'hsl(' + (x % 360) + ', 62%, 52%)'; }
+  workImgSrc(p) { const f = this.app.vault.getAbstractFileByPath(p); return f instanceof TFile ? this.app.vault.getResourcePath(f) : ''; }
+  async saveWorkShot(blob, device, when) {
+    let type = blob.type || 'image/png';
+    let data = await blob.arrayBuffer();
+    try {
+      if (typeof createImageBitmap === 'function' && data.byteLength > 2.5 * 1024 * 1024) {
+        const bmp = await createImageBitmap(blob);
+        const k = Math.min(1, 2400 / Math.max(bmp.width, bmp.height));
+        const cv = document.createElement('canvas');
+        cv.width = Math.round(bmp.width * k); cv.height = Math.round(bmp.height * k);
+        cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
+        const out = await new Promise((r) => cv.toBlob(r, 'image/jpeg', 0.9));
+        if (out) { data = await out.arrayBuffer(); type = 'image/jpeg'; }
+        if (bmp.close) bmp.close();
+      }
+    } catch (e) { /* 压缩失败就存原图 */ }
+    const ext = /jpe?g/.test(type) ? 'jpg' : type.includes('gif') ? 'gif' : type.includes('webp') ? 'webp' : 'png';
+    const d = when || new Date();
+    const dir = normalizePath(this.workDir() + '/截图/' + fmtDate(d).slice(0, 7));
+    await this.ensureFolder(dir);
+    const base = fmtDate(d) + ' ' + pad(d.getHours()) + pad(d.getMinutes()) + ' ' + (sanitize(device || '').slice(0, 20) || '截图');
+    let path = normalizePath(dir + '/' + base + '.' + ext);
+    for (let i = 2; this.app.vault.getAbstractFileByPath(path); i++) path = normalizePath(dir + '/' + base + ' ' + i + '.' + ext);
+    await this.app.vault.createBinary(path, data);
+    return path;
+  }
+  parseWork(text, file) {
+    const out = [];
+    let day = '', cur = null;
+    for (const l of String(text).split('\n')) {
+      const hm = l.match(/^## (\d{4}-\d{2}-\d{2})/);
+      if (hm) { day = hm[1]; cur = null; continue; }
+      const m = l.match(/^- (\d{1,2}):(\d{2}) \*\*(.+?)\*\*(?: · (\S+?))?(?: · (.*?))?\s*(?:\^(w[0-9a-z]+))?\s*$/);
+      if (m && day) {
+        const st = WORK_STATUS.includes(m[4]) ? m[4] : '';
+        const text0 = st ? (m[5] || '') : [m[4], m[5]].filter(Boolean).join(' · ');
+        const time = pad(Number(m[1])) + ':' + m[2];
+        cur = { id: m[6] || ('w' + day.replace(/-/g, '') + time.replace(':', '') + out.length), date: day, time, device: m[3], status: st || '运行中', text: text0.trim(), images: [], file, ts: parseDate(day).getTime() + (Number(m[1]) * 60 + Number(m[2])) * 60000 };
+        out.push(cur);
+        continue;
+      }
+      if (!cur) continue;
+      if (/^\s+\S/.test(l)) {
+        const im = l.match(/^\s+!\[\[([^\]|]+)(?:\|[^\]]*)?\]\]\s*$/) || l.match(/^\s+!\[[^\]]*\]\(([^)]+)\)\s*$/);
+        if (im) cur.images.push(decodeURIComponent(im[1]).trim());
+        else cur.text = (cur.text ? cur.text + '\n' : '') + l.trim();
+      } else if (!l.trim()) { /* 空行 */ } else cur = null;
+    }
+    return out;
+  }
+  serializeWork(month, list) {
+    const head = '---\ntype: tempwork\nmonth: ' + month + '\n---\n# 暂时工作 ' + month + '\n\n在工作台「暂时工作」里记录。格式：`- 14:30 **电脑** · 状态 · 在跑什么`，下一行缩进放截图 `![[...]]`\n';
+    const byDay = new Map();
+    for (const e of list.slice().sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time))) { if (!byDay.has(e.date)) byDay.set(e.date, []); byDay.get(e.date).push(e); }
+    let s = head;
+    for (const [d, es] of [...byDay].sort((a, b) => a[0].localeCompare(b[0]))) {
+      s += '\n## ' + d + ' 星期' + '日一二三四五六'[parseDate(d).getDay()] + '\n';
+      for (const e of es) {
+        const lines = String(e.text || '').split('\n');
+        s += '- ' + e.time + ' **' + String(e.device).replace(/\*/g, '') + '** · ' + (e.status || '运行中') + (lines[0] ? ' · ' + lines[0] : '') + ' ^' + e.id + '\n';
+        for (const x of lines.slice(1)) if (x.trim()) s += '  ' + x.trim() + '\n';
+        for (const p of e.images || []) s += '  ![[' + p + ']]\n';
+      }
+    }
+    return s;
+  }
+  async mutateWork(month, fn) {
+    const path = this.workFilePath(month);
+    let file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) { await this.ensureFolder(this.workDir()); file = await this.app.vault.create(path, this.serializeWork(month, [])); }
+    await this.app.vault.process(file, (data) => { const list = this.parseWork(data, file); fn(list); return this.serializeWork(month, list); });
+    this.refreshViews();
+  }
+  async addWork(o) {
+    const when = o.when || new Date();
+    const e = { id: 'w' + Date.now().toString(36), date: fmtDate(when), time: pad(when.getHours()) + ':' + pad(when.getMinutes()), device: o.device, status: o.status || '运行中', text: String(o.text || '').trim(), images: o.images || [] };
+    await this.mutateWork(e.date.slice(0, 7), (list) => list.push(e));
+    return e;
+  }
+  async updateWork(e, patch) {
+    await this.mutateWork(e.date.slice(0, 7), (list) => {
+      const i = list.findIndex((x) => x.id === e.id);
+      if (i < 0) return;
+      if (patch == null) list.splice(i, 1); else Object.assign(list[i], patch);
+    });
+  }
+  async renameWorkDevice(from, to) {
+    to = String(to || '').replace(/\*/g, '').trim();
+    if (!to) return;
+    const st = this.settings;
+    st.workDevices = (st.workDevices || []).map((x) => (x === from ? to : x)).filter((x, i, a) => a.indexOf(x) === i);
+    if (st.workLastDevice === from) st.workLastDevice = to;
+    await this.saveSettings();
+    const dir = this.workDir() + '/';
+    for (const f of this.app.vault.getMarkdownFiles().filter((x) => x.path.startsWith(dir) && /^\d{4}-\d{2}$/.test(x.basename))) {
+      const txt = await this.app.vault.cachedRead(f);
+      if (!txt.includes('**' + from + '**')) continue;
+      await this.mutateWork(f.basename, (list) => list.forEach((x) => { if (x.device === from) x.device = to; }));
+    }
+    this.refreshViews();
+  }
+  async readWork(days) {
+    const since = fmtDate(addDays(new Date(), -(days || 3650)));
+    const dir = this.workDir() + '/';
+    const files = this.app.vault.getMarkdownFiles().filter((f) => f.path.startsWith(dir) && /^\d{4}-\d{2}$/.test(f.basename) && f.basename >= since.slice(0, 7));
+    const out = [];
+    for (const f of files) for (const e of this.parseWork(await this.app.vault.cachedRead(f), f)) if (e.date >= since) out.push(e);
+    return out.sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time) || b.id.localeCompare(a.id));
   }
 
   /* ---------- 灵感链接 ---------- */
