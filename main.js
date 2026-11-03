@@ -3824,9 +3824,17 @@ class WorkbenchView extends ItemView {
         h(top, 'span', { cls: 'rw-tw-cdot' });
         h(top, 'b', { text: d });
         if (e) h(top, 'span', { cls: 'rw-tw-st is-' + WORK_STATUS.indexOf(e.status), text: e.status });
+        const cd = h(top, 'button', { cls: 'rw-iconbtn rw-del rw-tw-carddel', title: '删除这台电脑…' }); ic(cd, 'trash-2');
+        cd.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          const m = new Menu();
+          m.addItem((i) => i.setTitle('只从电脑列表移除（记录保留）').setIcon('x').onClick(async () => { st.workDevices = devices.filter((x) => x !== d); await pl.saveSettings(); if (this.twDev === d) this.twDev = ''; this.render(); }));
+          m.addItem((i) => i.setTitle('删除这台电脑和它的全部记录…').setIcon('trash-2').onClick(async () => { if (await pl.deleteWorkDevice(d)) { if (this.twDev === d) this.twDev = ''; this.render(); } }));
+          m.showAtMouseEvent(ev);
+        });
         if (e && e.images.length) {
           const im = h(c, 'img', { cls: 'rw-tw-cimg' }); const src = pl.workImgSrc(e.images[e.images.length - 1]); if (src) im.src = src;
-          im.addEventListener('click', (ev) => { ev.stopPropagation(); new WorkShotModal(this.app, pl, e.images, e.images.length - 1, e).open(); });
+          im.addEventListener('click', (ev) => { ev.stopPropagation(); new WorkShotModal(this.app, pl, e.images, e.images.length - 1, e, () => this.render()).open(); });
         }
         h(c, 'div', { cls: 'rw-tw-ctext', text: e ? (e.text || '（只有截图）') : '近 ' + days + ' 天没有记录' });
         if (e) h(c, 'div', { cls: 'rw-muted rw-tw-cwhen', text: (e.date === today() ? '今天 ' : e.date.slice(5) + ' ') + e.time + ' · ' + relTime(e.ts) });
@@ -3863,9 +3871,12 @@ class WorkbenchView extends ItemView {
         if (e.images.length) {
           const g = h(body, 'div', { cls: 'rw-tw-shots' + (e.images.length === 1 ? ' is-one' : '') });
           e.images.forEach((p, i) => {
-            const im = h(g, 'img', { cls: 'rw-tw-shot', attr: { loading: 'lazy', title: p } });
+            const cell = h(g, 'div', { cls: 'rw-tw-shotcell' });
+            const im = h(cell, 'img', { cls: 'rw-tw-shot', attr: { loading: 'lazy', title: p } });
             const src = pl.workImgSrc(p); if (src) im.src = src; else { im.alt = '找不到图片：' + p; im.classList.add('is-missing'); }
-            im.addEventListener('click', () => new WorkShotModal(this.app, pl, e.images, i, e).open());
+            im.addEventListener('click', () => new WorkShotModal(this.app, pl, e.images, i, e, () => this.render()).open());
+            const xd = h(cell, 'button', { cls: 'rw-tw-shotdel', title: '删除这张截图' }); ic(xd, 'trash-2');
+            xd.addEventListener('click', async (ev) => { ev.stopPropagation(); if (await pl.deleteWorkShot(e, p)) this.render(); });
           });
         }
         // 拖截图到这一条 = 追加
@@ -3879,7 +3890,7 @@ class WorkbenchView extends ItemView {
         ub.addEventListener('click', () => { this.twDraft = { text: e.text, device: e.device, status: e.status, time: '', date: '', imgs: [] }; this.render(); this.contentEl.scrollTop = 0; setTimeout(() => { const t = this.contentEl.querySelector('.rw-tw-input'); if (t) t.focus(); }, 60); });
         const eb = h(acts, 'button', { cls: 'rw-iconbtn', title: '修改文字' }); ic(eb, 'pencil');
         eb.addEventListener('click', () => pl.promptText('修改（' + e.date + ' ' + e.time + ' · ' + e.device + '）', e.text, async (v) => { await pl.updateWork(e, { text: v }); }));
-        this.trashBtn(acts, '删除这条记录', async () => {
+        const delBtn = this.trashBtn(acts, '删除这条记录', async () => {
           const lines = [e.date + ' ' + e.time + ' · ' + e.device + '　' + (e.text || '')];
           if (e.images.length) lines.push('它的 ' + e.images.length + ' 张截图也会移到回收站');
           const okd = await pl.confirmDelete({ title: '删除记录', lines, noTrashNote: !e.images.length });
@@ -3888,6 +3899,7 @@ class WorkbenchView extends ItemView {
           for (const p of e.images) { const f = this.app.vault.getAbstractFileByPath(p); if (f) await pl.trash(f); }
           this.render();
         });
+        h(delBtn, 'span', { text: '删除' });
       }
       const more = h(tl, 'div', { cls: 'rw-more' });
       const mb = h(more, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(mb, 'chevrons-down'); h(mb, 'span', { text: '查看更早（再往前 7 天）' });
@@ -5100,7 +5112,7 @@ class ConfirmDeleteModal extends Modal {
 
 /* 暂时工作：看大图（左右切换） */
 class WorkShotModal extends Modal {
-  constructor(app, plugin, imgs, i, e) { super(app); this.plugin = plugin; this.imgs = imgs; this.i = i || 0; this.e = e; }
+  constructor(app, plugin, imgs, i, e, onChange) { super(app); this.plugin = plugin; this.imgs = imgs.slice(); this.i = i || 0; this.e = e; this.onChange = onChange; }
   onOpen() {
     this.modalEl.classList.add('rw-tw-modal');
     const draw = () => {
@@ -5117,6 +5129,17 @@ class WorkShotModal extends Modal {
         const nx = h(bar, 'button', { cls: 'rw-btn rw-btn-sm' }); h(nx, 'span', { text: '下一张' }); ic(nx, 'chevron-right'); nx.addEventListener('click', () => { this.i = (this.i + 1) % this.imgs.length; draw(); });
       }
       h(bar, 'div', { cls: 'rw-spacer' });
+      if (this.e) {
+        const db = h(bar, 'button', { cls: 'rw-btn rw-btn-sm rw-tw-mdel' }); ic(db, 'trash-2'); h(db, 'span', { text: '删除这张' });
+        db.addEventListener('click', async () => {
+          if (!(await this.plugin.deleteWorkShot(this.e, p))) return;
+          this.e.images = this.e.images.filter((x) => x !== p);
+          this.imgs.splice(this.i, 1);
+          if (this.onChange) this.onChange();
+          if (!this.imgs.length) { this.close(); return; }
+          this.i = Math.min(this.i, this.imgs.length - 1); draw();
+        });
+      }
       const ob = h(bar, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(ob, 'external-link'); h(ob, 'span', { text: '在 Obsidian 里打开' });
       ob.addEventListener('click', () => { const f = this.app.vault.getAbstractFileByPath(p); if (f) { this.close(); this.app.workspace.getLeaf('tab').openFile(f); } });
     };
@@ -18626,6 +18649,28 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       if (i < 0) return;
       if (patch == null) list.splice(i, 1); else Object.assign(list[i], patch);
     });
+  }
+  async deleteWorkShot(e, p) {
+    const ok = await this.confirmDelete({ title: '删除截图', lines: [e.date + ' ' + e.time + ' · ' + e.device, '截图：' + p.split('/').pop()] });
+    if (!ok) return false;
+    await this.updateWork(e, { images: (e.images || []).filter((x) => x !== p) });
+    const f = this.app.vault.getAbstractFileByPath(p); if (f) await this.trash(f);
+    return true;
+  }
+  async deleteWorkDevice(d) {
+    const all = (await this.readWork()).filter((x) => x.device === d);
+    const shots = all.reduce((n, x) => n + x.images.length, 0);
+    const ok = await this.confirmDelete({ title: '删除电脑「' + d + '」', lines: ['会删除这台电脑的全部 ' + all.length + ' 条记录' + (shots ? '，' + shots + ' 张截图移到回收站' : ''), '其他电脑的记录不受影响'] });
+    if (!ok) return false;
+    const months = [...new Set(all.map((x) => x.date.slice(0, 7)))];
+    for (const mo of months) await this.mutateWork(mo, (list) => { for (let i = list.length - 1; i >= 0; i--) if (list[i].device === d) list.splice(i, 1); });
+    for (const x of all) for (const p of x.images) { const f = this.app.vault.getAbstractFileByPath(p); if (f) await this.trash(f); }
+    const st = this.settings;
+    st.workDevices = (st.workDevices || []).filter((x) => x !== d);
+    if (st.workLastDevice === d) st.workLastDevice = '';
+    await this.saveSettings();
+    new Notice('已删除「' + d + '」的 ' + all.length + ' 条记录');
+    return true;
   }
   async renameWorkDevice(from, to) {
     to = String(to || '').replace(/\*/g, '').trim();

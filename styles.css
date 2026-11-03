@@ -4551,3 +4551,17 @@ button.rw-tw-st { cursor: pointer; }
 .is-mobile .modal.rw-tw-modal { width: 100vw; max-width: 100vw; }
 .rw-narrow .rw-tw-shots.is-one { grid-template-columns: minmax(0, 1fr); }
 .rw-root button.rw-tw-devchip { border-left-width: 1px !important; box-shadow: inset 3px 0 0 var(--tw-c) !important; }
+/* v0.24.1 暂时工作：删除按钮常显 */
+.rw-tw-item .rw-tl-acts { opacity: 1; align-items: center; }
+.rw-tw-item .rw-tl-acts .rw-del { width: auto !important; padding: 0 8px !important; gap: 4px; display: inline-flex; align-items: center; color: var(--text-error); font-size: 12px; }
+.rw-tw-shotcell { position: relative; }
+.rw-root button.rw-tw-shotdel { position: absolute; top: 6px; right: 6px; width: 28px !important; height: 28px !important; padding: 0 !important; border-radius: 8px !important; background: rgba(0,0,0,.62) !important; color: #fff !important; box-shadow: none !important; opacity: 0; transition: opacity .15s; }
+.rw-tw-shotdel svg { width: 15px; height: 15px; }
+.rw-tw-shotcell:hover .rw-tw-shotdel, .rw-touch .rw-tw-shotdel { opacity: 1; }
+.rw-root button.rw-tw-shotdel:hover { background: #e03131 !important; }
+.rw-tw-carddel { margin-left: 2px; }
+.rw-tw-mdel { color: var(--text-error) !important; }
+.rw-root .rw-tl-acts button.rw-del { opacity: .8; }
+.rw-root .rw-tw-item button.rw-del, .rw-root .rw-tw-card button.rw-del { opacity: 1; }
+.rw-root .rw-tw-card button.rw-tw-carddel { color: var(--text-muted); }
+.rw-root .rw-tw-card button.rw-tw-carddel:hover { color: #ef4444; }
