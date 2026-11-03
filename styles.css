@@ -4480,3 +4480,8 @@ tr:hover .rw-att-chip.is-empty, .rw-pgc .rw-att-chip.is-empty { opacity: .7; }
   .dh-is-mobile .dh-page { padding-top: 0; }
   .dh-is-mobile .dh-mnav { margin: 0 -4px; padding: 8px 4px 6px; }
 }
+
+/* v0.23.9 手机：打字时不让顶部按钮/悬浮按钮挡住输入框 */
+.dh-typing .dh-mnav { display: none !important; }
+.dh-typing .dh-fab { display: none !important; }
+.dh-typing .dh-page { padding-bottom: 50vh !important; }

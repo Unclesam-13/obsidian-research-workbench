@@ -2219,6 +2219,11 @@ class WorkbenchView extends ItemView {
       const nn = h(acts, 'button', { cls: 'rw-btn rw-btn-sm', title: '在当前文件夹里新建笔记' });
       ic(nn, 'file-plus'); h(nn, 'span', { text: '新建笔记' });
       nn.addEventListener('click', () => pl.newNoteModal({ project: p.name, folder: cur }));
+    } else {
+      // 知识库 / 生活：直接新建一个文件并打开
+      const nf = h(acts, 'button', { cls: 'rw-btn rw-btn-sm mod-cta', title: '在当前文件夹里新建文件，建好直接打开' });
+      ic(nf, 'file-plus'); h(nf, 'span', { text: '新建文件' });
+      nf.addEventListener('click', () => pl.promptText('新文件名称（建在「' + (rel || p.title) + '」里，不写扩展名就是 .md 笔记）', '', async (v) => { await pl.createFileIn(cur, v); }));
     }
     const ub = h(acts, 'button', { cls: 'rw-iconbtn', title: '导入文件到这个文件夹' });
     ic(ub, 'upload');
@@ -2311,6 +2316,7 @@ class WorkbenchView extends ItemView {
     m.addItem((i) => i.setTitle('打开文件夹').setIcon('folder-open').onClick(() => { this.filters.dir[p.name] = r2; this.render(); }));
     m.addItem((i) => i.setTitle('导入文件到这里…').setIcon('upload').onClick(() => pl.pickFiles({ project: p.name, folder: f.path })));
     if (!String(p.name).startsWith('__')) m.addItem((i) => i.setTitle('在这里新建笔记…').setIcon('file-plus').onClick(() => pl.newNoteModal({ project: p.name, folder: f.path })));
+    else m.addItem((i) => i.setTitle('在这里新建文件…').setIcon('file-plus').onClick(() => pl.promptText('新文件名称（建在「' + f.name + '」里）', '', async (v) => { await pl.createFileIn(f.path, v); })));
     m.addItem((i) => i.setTitle('在里面新建子文件夹…').setIcon('folder-plus').onClick(() => pl.promptText('子文件夹名称', '', (v) => pl.createFolderIn(f.path, v))));
     m.addItem((i) => i.setTitle('重命名…').setIcon('pencil').onClick(() => pl.promptText('重命名文件夹', f.name, (v) => pl.renameFolder(f, v))));
     m.addItem((i) => i.setTitle('移动文件夹到…（可跨项目）').setIcon('folder-input').onClick(() => pl.pickFolder(p.name, { title: '把文件夹「' + f.name + '」移动到…', exclude: f.path }, (dest) => pl.moveFolderTo(f, dest))));
@@ -14796,6 +14802,30 @@ class DailyHubView extends ItemView {
     ta.value = this._quickDraft || "";
     ta.addEventListener("input", () => { this._quickDraft = ta.value; });
     this.els.quickInput = ta;
+    // 手机：打字时收起顶部切换按钮和悬浮按钮，键盘弹出后把输入卡片滚到可见处
+    if (Platform.isMobile) {
+      const root = this.contentEl;
+      const keep = () => {
+        const sc = this.els.scroll;
+        if (!sc || document.activeElement !== ta) return;
+        const top = el.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop - 6;
+        const vv = window.visualViewport;
+        const visBottom = vv ? vv.height + vv.offsetTop : window.innerHeight;
+        const r = ta.getBoundingClientRect();
+        if (r.top < sc.getBoundingClientRect().top || r.bottom > visBottom - 8) sc.scrollTop = Math.max(0, top);
+      };
+      const onVv = () => setTimeout(keep, 60);
+      ta.addEventListener("focus", () => {
+        clearTimeout(this._typingT);
+        root.addClass("dh-typing");
+        setTimeout(keep, 120); setTimeout(keep, 450);
+        window.visualViewport?.addEventListener("resize", onVv);
+      });
+      ta.addEventListener("blur", () => {
+        window.visualViewport?.removeEventListener("resize", onVv);
+        this._typingT = setTimeout(() => root.removeClass("dh-typing"), 250);
+      });
+    }
     const take = () => {
       const t = ta.value.replace(/\s+$/, "");
       if (!t.trim()) { ta.focus(); return null; }
@@ -20270,6 +20300,23 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     };
     walk(base, '', 0);
     return out;
+  }
+  /* 在某个文件夹里新建一个文件（默认 .md）并立刻打开 */
+  async createFileIn(parent, name) {
+    let nm = String(name || '').trim().replace(/[\\/:*?"<>|#^[\]]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!nm) nm = '未命名 ' + window.moment().format('YYYY-MM-DD HHmm');
+    if (!/\.[A-Za-z0-9]{1,6}$/.test(nm)) nm += '.md';
+    const dot = nm.lastIndexOf('.'); const stem = nm.slice(0, dot), ext = nm.slice(dot);
+    await this.ensureFolder(parent);
+    let path = normalizePath((parent ? parent + '/' : '') + nm);
+    for (let i = 2; this.app.vault.getAbstractFileByPath(path); i++) path = normalizePath((parent ? parent + '/' : '') + stem + ' ' + i + ext);
+    let file;
+    try { file = await this.app.vault.create(path, ''); } catch (e) { new Notice('新建文件失败：' + (e.message || e)); return null; }
+    new Notice('📄 已新建：' + path);
+    const leaf = this.app.workspace.getLeaf(IS_MOBILE ? false : 'tab');
+    await leaf.openFile(file, { active: true, state: { mode: 'source' } });
+    this.app.workspace.setActiveLeaf(leaf, { focus: true });
+    return file;
   }
   async createFolderIn(parent, name) {
     name = sanitize(String(name || '').trim()).replace(/[\\/]/g, '-');
