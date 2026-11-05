@@ -4579,36 +4579,121 @@ class AttachModal extends Modal {
     drop.addEventListener('dragleave', () => drop.classList.remove('is-over'));
     drop.addEventListener('drop', async (e) => { e.preventDefault(); e.stopPropagation(); drop.classList.remove('is-over'); const fs = e.dataTransfer && e.dataTransfer.files; if (fs && fs.length) { await pl.addAttachments(this.noteFile, [...fs]); this.refresh(); } });
     h(c, 'div', { cls: 'rw-muted rw-att-hint', text: '电脑上的文件会复制到「' + dir + '」。' });
-    // 从库里选
-    const bar = h(c, 'div', { cls: 'rw-att-bar' });
-    const qi = h(bar, 'input', { cls: 'rw-att-q', attr: { type: 'search', placeholder: '从库里找文件：输入文件名…' } });
-    qi.value = this.q;
-    const mvl = h(bar, 'label', { cls: 'rw-check', title: '添加库里的文件时，顺便移进这篇的附件文件夹' });
+    // 从库里选：搜索 / 按文件夹浏览，勾选后一起添加
+    const sel = this.sel || (this.sel = new Set());
+    const have = new Set(atts.map((a) => a.file.path));
+    for (const x of [...sel]) if (have.has(x)) sel.delete(x);
+    const mode = this.mode || (this.mode = 'folder');
+    const tabs = h(c, 'div', { cls: 'rw-att-tabs' });
+    const tb = (id, icon, label) => { const b = h(tabs, 'button', { cls: 'rw-att-tab' + (mode === id ? ' is-active' : '') }); ic(b, icon); h(b, 'span', { text: label }); b.addEventListener('click', () => { if (this.mode !== id) { this.mode = id; this.draw(); } }); };
+    tb('folder', 'folder-tree', '按文件夹找');
+    tb('search', 'search', '搜索文件名');
+    h(tabs, 'div', { cls: 'rw-spacer' });
+    const mvl = h(tabs, 'label', { cls: 'rw-check', title: '添加库里的文件时，顺便移进这篇的附件文件夹' });
     const mvc = h(mvl, 'input', { attr: { type: 'checkbox' } }); mvc.checked = !!pl.settings.attachMove;
     h(mvl, 'span', { text: '移进附件文件夹' });
     mvc.addEventListener('change', () => { pl.settings.attachMove = mvc.checked; pl.saveSettingsSoon(); });
-    const res = h(c, 'div', { cls: 'rw-att-res' });
-    const have = new Set(atts.map((a) => a.file.path));
-    const drawRes = () => {
-      clear(res);
-      const q = this.q.trim().toLowerCase();
-      const projDir = this.noteFile.path.split('/').slice(0, 3).join('/');
-      let files = this.app.vault.getFiles().filter((f) => f.path !== this.noteFile.path && !have.has(f.path) && !f.path.startsWith(pl.dataDir() + '/') && !f.path.startsWith('.'));
-      if (q) files = files.filter((f) => f.path.toLowerCase().includes(q));
-      else files = files.filter((f) => f.path.startsWith(projDir + '/') && f.extension !== 'md' || f.path.startsWith(this.noteFile.parent ? this.noteFile.parent.path + '/' : '\u0000'));
-      files.sort((a, b) => b.stat.mtime - a.stat.mtime);
-      if (!files.length) h(res, 'div', { cls: 'rw-muted rw-att-empty', text: q ? '没找到' : '输入文件名搜索库里的文件' });
-      for (const f of files.slice(0, 30)) {
-        const row = h(res, 'div', { cls: 'rw-att-row is-cand' });
-        ic(row, FILE_CATS[EXT_CAT[(f.extension || '').toLowerCase()] || 'other'].icon);
-        h(row, 'div', { cls: 'rw-att-name', text: f.name, title: f.path });
-        h(row, 'span', { cls: 'rw-muted rw-att-where', text: f.parent ? f.parent.path : '' });
-        const add = h(row, 'button', { cls: 'rw-btn rw-btn-sm', text: '添加' });
-        add.addEventListener('click', async () => { await pl.addAttachments(this.noteFile, [f], { move: !!pl.settings.attachMove }); this.refresh(); });
-      }
+
+    const skip = (path) => path === this.noteFile.path || path.startsWith('.') || path.startsWith(pl.dataDir() + '/') || path === pl.dataDir();
+    let footBtn = null, footInfo = null;
+    const updFoot = () => {
+      if (!footBtn) return;
+      footBtn.disabled = !sel.size;
+      footBtn.querySelector('span').textContent = sel.size ? '添加所选 ' + sel.size + ' 个' : '添加所选';
+      footInfo.textContent = sel.size ? [...sel].map((x) => x.split('/').pop()).slice(0, 3).join('、') + (sel.size > 3 ? ' 等' : '') : '勾选文件（可以跨文件夹勾选），再点「添加所选」';
     };
-    qi.addEventListener('input', () => { this.q = qi.value; drawRes(); });
-    drawRes();
+    const fileRow = (parent, f) => {
+      const row = h(parent, 'label', { cls: 'rw-att-row is-cand' + (have.has(f.path) ? ' is-have' : '') + (sel.has(f.path) ? ' is-sel' : '') });
+      const cb = h(row, 'input', { cls: 'rw-att-cb', attr: { type: 'checkbox' } });
+      cb.checked = sel.has(f.path) || have.has(f.path); cb.disabled = have.has(f.path);
+      ic(row, FILE_CATS[EXT_CAT[(f.extension || '').toLowerCase()] || 'other'].icon);
+      h(row, 'div', { cls: 'rw-att-name', text: f.name, title: f.path });
+      if (this.mode === 'search') h(row, 'span', { cls: 'rw-muted rw-att-where', text: f.parent ? f.parent.path : '' });
+      if (have.has(f.path)) h(row, 'span', { cls: 'rw-muted rw-att-where', text: '已是附件' });
+      cb.addEventListener('change', () => { if (cb.checked) sel.add(f.path); else sel.delete(f.path); row.classList.toggle('is-sel', cb.checked); updFoot(); if (this._updAll) this._updAll(); });
+      return cb;
+    };
+
+    if (mode === 'search') {
+      const bar = h(c, 'div', { cls: 'rw-att-bar' });
+      const qi = h(bar, 'input', { cls: 'rw-att-q', attr: { type: 'search', placeholder: '从库里找文件：输入文件名…' } });
+      qi.value = this.q;
+      const res = h(c, 'div', { cls: 'rw-att-res' });
+      this._updAll = null;
+      const drawRes = () => {
+        clear(res);
+        const q = this.q.trim().toLowerCase();
+        const projDir = this.noteFile.path.split('/').slice(0, 3).join('/');
+        let files = this.app.vault.getFiles().filter((f) => !skip(f.path) && !have.has(f.path));
+        if (q) files = files.filter((f) => f.path.toLowerCase().includes(q));
+        else files = files.filter((f) => f.path.startsWith(projDir + '/') && f.extension !== 'md' || f.path.startsWith(this.noteFile.parent ? this.noteFile.parent.path + '/' : '\u0000'));
+        files.sort((a, b) => b.stat.mtime - a.stat.mtime);
+        if (!files.length) h(res, 'div', { cls: 'rw-muted rw-att-empty', text: q ? '没找到' : '输入文件名搜索库里的文件' });
+        for (const f of files.slice(0, 60)) fileRow(res, f);
+      };
+      qi.addEventListener('input', () => { this.q = qi.value; drawRes(); });
+      drawRes();
+      setTimeout(() => qi.focus(), 30);
+    } else {
+      // 按文件夹浏览：默认从这篇文献所在的项目文件夹开始
+      if (this.cur === undefined) {
+        const parts = this.noteFile.path.split('/');
+        const proj = parts.slice(0, Math.min(3, parts.length - 1)).join('/');
+        this.cur = this.app.vault.getAbstractFileByPath(proj) ? proj : (this.noteFile.parent ? this.noteFile.parent.path : '');
+      }
+      let folder = this.cur ? this.app.vault.getAbstractFileByPath(this.cur) : this.app.vault.getRoot();
+      if (!folder || !folder.children) { this.cur = ''; folder = this.app.vault.getRoot(); }
+      const nav = h(c, 'div', { cls: 'rw-att-nav' });
+      const up = h(nav, 'button', { cls: 'rw-iconbtn', title: '上一级' }); ic(up, 'arrow-up');
+      up.disabled = !this.cur;
+      up.addEventListener('click', () => { const p = this.cur.split('/'); p.pop(); this.cur = p.join('/'); this.draw(); });
+      const crumbs = h(nav, 'div', { cls: 'rw-att-crumbs' });
+      const crumb = (label, path) => { const b = h(crumbs, 'button', { cls: 'rw-att-crumb' + (path === this.cur ? ' is-cur' : ''), text: label }); b.addEventListener('click', () => { this.cur = path; this.draw(); }); };
+      crumb('库', '');
+      const ps = this.cur ? this.cur.split('/') : [];
+      ps.forEach((x, i) => { h(crumbs, 'span', { cls: 'rw-att-sep', text: '›' }); crumb(x, ps.slice(0, i + 1).join('/')); });
+      const here = h(nav, 'button', { cls: 'rw-btn rw-btn-sm', title: '回到这篇文献所在的文件夹' }); ic(here, 'locate-fixed'); h(here, 'span', { text: '文献所在' });
+      here.addEventListener('click', () => { this.cur = this.noteFile.parent ? this.noteFile.parent.path : ''; this.draw(); });
+      const ch = folder.children.filter((x) => !skip(x.path) && !x.name.startsWith('.'));
+      const subs = ch.filter((x) => x.children).sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+      const files = ch.filter((x) => !x.children).sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+      const res = h(c, 'div', { cls: 'rw-att-res rw-att-browse' });
+      if (files.length) {
+        const allRow = h(res, 'label', { cls: 'rw-att-allrow' });
+        const all = h(allRow, 'input', { cls: 'rw-att-cb', attr: { type: 'checkbox' } });
+        const allTxt = h(allRow, 'span');
+        const cand = files.filter((f) => !have.has(f.path));
+        this._updAll = () => { const n = cand.filter((f) => sel.has(f.path)).length; all.checked = cand.length > 0 && n === cand.length; all.indeterminate = n > 0 && n < cand.length; all.disabled = !cand.length; allTxt.textContent = '全选这个文件夹里的 ' + cand.length + ' 个文件' + (n ? '（已勾 ' + n + '）' : ''); };
+        all.addEventListener('change', () => { for (const f of cand) { if (all.checked) sel.add(f.path); else sel.delete(f.path); } this.draw(); });
+      } else this._updAll = null;
+      for (const d of subs) {
+        const row = h(res, 'div', { cls: 'rw-att-row is-folder' });
+        ic(row, 'folder');
+        h(row, 'div', { cls: 'rw-att-name', text: d.name, title: d.path });
+        const cnt = d.children.filter((x) => !x.name.startsWith('.')).length;
+        h(row, 'span', { cls: 'rw-muted rw-att-where', text: cnt + ' 项' });
+        ic(row, 'chevron-right', 'rw-att-go');
+        row.addEventListener('click', () => { this.cur = d.path; this.draw(); });
+      }
+      for (const f of files) fileRow(res, f);
+      if (!subs.length && !files.length) h(res, 'div', { cls: 'rw-muted rw-att-empty', text: '空文件夹' });
+      if (this._updAll) this._updAll();
+    }
+    // 底部：添加所选
+    const foot = h(c, 'div', { cls: 'rw-att-foot' });
+    footInfo = h(foot, 'div', { cls: 'rw-muted rw-att-selinfo' });
+    if (sel.size) { const cl = h(foot, 'button', { cls: 'rw-linkbtn', text: '清空勾选' }); cl.addEventListener('click', () => { sel.clear(); this.draw(); }); }
+    footBtn = h(foot, 'button', { cls: 'rw-btn mod-cta' }); ic(footBtn, 'paperclip'); h(footBtn, 'span');
+    footBtn.addEventListener('click', async () => {
+      const fs = [...sel].map((x) => this.app.vault.getAbstractFileByPath(x)).filter((f) => f && !f.children);
+      if (!fs.length) return;
+      footBtn.disabled = true;
+      await pl.addAttachments(this.noteFile, fs, { move: !!pl.settings.attachMove });
+      new Notice('📎 已添加 ' + fs.length + ' 个附件');
+      sel.clear();
+      this.refresh();
+    });
+    updFoot();
   }
   onClose() { clear(this.contentEl); }
 }

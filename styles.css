@@ -4565,3 +4565,29 @@ button.rw-tw-st { cursor: pointer; }
 .rw-root .rw-tw-item button.rw-del, .rw-root .rw-tw-card button.rw-del { opacity: 1; }
 .rw-root .rw-tw-card button.rw-tw-carddel { color: var(--text-muted); }
 .rw-root .rw-tw-card button.rw-tw-carddel:hover { color: #ef4444; }
+
+/* v0.24.2 附件：按文件夹找 + 勾选 */
+.rw-att-tabs { display: flex; align-items: center; gap: 6px; margin: 12px 0 8px; flex-wrap: wrap; }
+.rw-root button.rw-att-tab, .rw-attach-modal button.rw-att-tab { display: inline-flex; align-items: center; gap: 5px; height: 30px; padding: 0 12px; border-radius: 15px; font-size: 13px; background: var(--background-secondary); border: 1px solid var(--background-modifier-border); box-shadow: none; color: var(--text-muted); }
+.rw-attach-modal button.rw-att-tab.is-active { background: var(--interactive-accent); border-color: var(--interactive-accent); color: var(--text-on-accent); font-weight: 600; }
+.rw-att-tab svg { width: 15px; height: 15px; }
+.rw-att-nav { display: flex; align-items: center; gap: 6px; padding: 6px 8px; margin-bottom: 6px; border-radius: 8px; background: var(--background-secondary); }
+.rw-att-crumbs { flex: 1; min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 2px; font-size: 13px; }
+.rw-attach-modal button.rw-att-crumb { height: 24px; padding: 0 6px; background: transparent; box-shadow: none; border: none; color: var(--text-muted); font-size: 13px; }
+.rw-attach-modal button.rw-att-crumb:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.rw-attach-modal button.rw-att-crumb.is-cur { color: var(--text-normal); font-weight: 600; }
+.rw-att-sep { color: var(--text-faint); }
+.rw-att-browse, .rw-attach-modal .rw-att-res { max-height: 46vh; overflow-y: auto; }
+.rw-att-allrow { display: flex; align-items: center; gap: 8px; padding: 6px 8px; font-size: 13px; color: var(--text-muted); border-bottom: 1px solid var(--background-modifier-border); margin-bottom: 4px; cursor: pointer; }
+.rw-att-row.is-folder { cursor: pointer; }
+.rw-att-row.is-folder:hover { background: var(--background-modifier-hover); }
+.rw-att-row.is-folder > .rw-icon svg { color: var(--color-yellow, #e0a800); }
+.rw-att-go { margin-left: 4px; color: var(--text-faint); display: inline-flex; }
+.rw-att-go svg { width: 15px; height: 15px; }
+label.rw-att-row { cursor: pointer; }
+.rw-att-row.is-sel { background: color-mix(in srgb, var(--interactive-accent) 12%, transparent); }
+.rw-att-row.is-have { opacity: .55; cursor: default; }
+.rw-att-cb { margin: 0 2px 0 0; flex: none; width: 16px; height: 16px; cursor: pointer; }
+.rw-att-foot { display: flex; align-items: center; gap: 10px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--background-modifier-border); position: sticky; bottom: 0; background: var(--background-primary); }
+.rw-att-selinfo { flex: 1; min-width: 0; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rw-att-foot .rw-btn:disabled { opacity: .5; cursor: default; }
