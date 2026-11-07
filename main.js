@@ -1795,7 +1795,8 @@ class WorkbenchView extends ItemView {
     const ofType = (n) => n.type === type || (type === 'experiment' && n.type === 'data');
     const f = (this.filters[type] = this.filters[type] || {});
     const st = this.plugin.settings;
-    const view = st.noteViews[type] || (type === 'meeting' ? 'list' : 'board');
+    if (type === 'meeting' && !st.meetViewV2) { st.noteViews.meeting = 'meet'; st.meetViewV2 = true; this.plugin.saveSettingsSoon(); }
+    const view = st.noteViews[type] || (type === 'meeting' ? 'meet' : 'board');
 
     const right = this.header(el, def.label, def.desc, def.icon);
     const curProject = f.project && f.project !== '__none' ? f.project : '';
@@ -1867,7 +1868,7 @@ class WorkbenchView extends ItemView {
       h(lg, 'span', { cls: 'rw-pdfchip is-zotero', text: 'PDF · Zotero' });
       h(lg, 'span', { text: '在 Zotero 里' });
     }
-    this.segmented(bar, [['board', '看板'], ['list', '列表']], view, (v) => { st.noteViews[type] = v; this.plugin.saveSettingsSoon(); this.render(); });
+    this.segmented(bar, (type === 'meeting' ? [['meet', '按会议']] : []).concat([['board', '看板'], ['list', '列表']]), view, (v) => { st.noteViews[type] = v; this.plugin.saveSettingsSoon(); this.render(); });
 
     if (type === 'literature') { this.litList(Object.assign({}, f, { cat: '' })); this.litCatChips(el, f); }
     const content = h(el, 'div', { cls: 'rw-notes-content' });
@@ -1880,6 +1881,26 @@ class WorkbenchView extends ItemView {
       else if (f.project) list = list.filter((n) => n.projectName === f.project);
       if (f.text) { const s = f.text.toLowerCase(); list = list.filter((n) => n.title.toLowerCase().includes(s) || n.file.path.toLowerCase().includes(s)); }
       list.sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.file.stat.mtime - a.file.stat.mtime);
+      let attSet = null;
+      if (type === 'meeting') {
+        // 会议附件文件夹里的笔记（比如导出的「智能纪要」）是某次会议的材料，不单独算一次会议
+        attSet = new Set();
+        for (const m of this.index.notes.filter(ofType)) for (const a of this.plugin.attachmentsOf(m)) if (a.file.path !== m.file.path) attSet.add(a.file.path);
+        list = list.filter((n) => !attSet.has(n.file.path));
+      }
+      if (type === 'meeting' && view === 'meet') {
+        this.renderMeetings(content, list, f);
+        let loose = this.index.files.filter((x) => x.cat === 'meeting' && !attSet.has(x.file.path));
+        if (f.project === '__none') loose = loose.filter((x) => !x.projectName);
+        else if (f.project) loose = loose.filter((x) => x.projectName === f.project);
+        if (loose.length) {
+          const sec = this.section(content, '还没归到会议里的资料（' + loose.length + '）', 'mic');
+          sec.el.classList.add('rw-notes-files');
+          h(sec.right, 'span', { cls: 'rw-muted', text: '在会议详情里点「管理材料」可以把它们挂到对应会议' });
+          this.renderFileTable(sec.body, loose, { compact: true, limit: 5, moreLink: () => this.switchTab('files', { project: f.project && f.project !== '__none' ? f.project : '', cat: 'meeting' }) });
+        }
+        return;
+      }
       if (view === 'list') this.renderNoteList(content, list, def);
       else this.renderNoteBoard(content, list, def);
       const cat = TAB_TO_CAT[type];
@@ -1895,6 +1916,162 @@ class WorkbenchView extends ItemView {
       }
     };
     drawContent();
+  }
+
+  /* ---- 会议：左边会议列表，右边一次只看一个会议（简介 / 录音 / 材料 / 行动项 / 纪要正文） ---- */
+  renderMeetings(parent, list, f) {
+    const pl = this.plugin;
+    if (!list.length) { h(parent, 'div', { cls: 'rw-empty', text: '还没有会议纪要。点右上角「新建会议纪要」，可以同时放进录音和 PPT。' }); return; }
+    if (!this.meetSel || !list.some((n) => n.file.path === this.meetSel)) this.meetSel = list[0].file.path;
+    const narrow = this.contentEl.classList.contains('rw-narrow');
+    const wrap = h(parent, 'div', { cls: 'rw-meet' + (narrow && this.meetDetailOpen ? ' is-detail' : '') });
+    const side = h(wrap, 'div', { cls: 'rw-meet-side' });
+    const main = h(wrap, 'div', { cls: 'rw-meet-main' });
+    let curMonth = '';
+    for (const n of list) {
+      const mo = (n.date || '').slice(0, 7);
+      if (mo !== curMonth) { curMonth = mo; h(side, 'div', { cls: 'rw-meet-month', text: mo ? mo.replace('-', ' 年 ') + ' 月' : '没有日期' }); }
+      const it = h(side, 'div', { cls: 'rw-meet-item' + (n.file.path === this.meetSel ? ' is-active' : '') });
+      const d = h(it, 'div', { cls: 'rw-meet-date' });
+      h(d, 'b', { text: n.date ? String(Number(n.date.slice(8, 10))) : '?' });
+      h(d, 'span', { text: n.date ? '周' + '日一二三四五六'[parseDate(n.date).getDay()] : '' });
+      const b = h(it, 'div', { cls: 'rw-meet-ibody' });
+      h(b, 'div', { cls: 'rw-meet-ititle', text: n.title.replace(/^\d{4}-\d{2}-\d{2}\s*/, '') || n.title });
+      const meta = h(b, 'div', { cls: 'rw-meet-imeta' });
+      if (n.projectName) this.projectChip(meta, (this.index.byName.get(n.projectName) || {}).title || n.projectName);
+      const atts = pl.attachmentsOf(n);
+      const nAudio = atts.filter((a) => FILE_CATS.meeting.exts.includes((a.file.extension || '').toLowerCase())).length;
+      if (nAudio) { const s = h(meta, 'span', { cls: 'rw-meet-badge', title: '录音 / 视频' }); ic(s, 'mic'); h(s, 'span', { text: String(nAudio) }); }
+      if (atts.length - nAudio) { const s = h(meta, 'span', { cls: 'rw-meet-badge', title: '其他材料' }); ic(s, 'paperclip'); h(s, 'span', { text: String(atts.length - nAudio) }); }
+      if (n.status === '待整理') h(meta, 'span', { cls: 'rw-meet-todo', text: '待整理' });
+      it.addEventListener('click', () => { this.meetSel = n.file.path; this.meetDetailOpen = true; this.render(); });
+      it.addEventListener('contextmenu', (e) => this.noteMenu(e, n));
+    }
+    const n = list.find((x) => x.file.path === this.meetSel);
+    if (n) this.renderMeetingDetail(main, n);
+  }
+
+  renderMeetingDetail(main, n) {
+    const pl = this.plugin, fm = n.fm || {};
+    if (this.contentEl.classList.contains('rw-narrow')) {
+      const back = h(main, 'button', { cls: 'rw-btn rw-btn-sm rw-meet-back' }); ic(back, 'arrow-left'); h(back, 'span', { text: '全部会议' });
+      back.addEventListener('click', () => { this.meetDetailOpen = false; this.render(); });
+    }
+    const head = h(main, 'div', { cls: 'rw-meet-head' });
+    const ht = h(head, 'div', { cls: 'rw-meet-htext' });
+    h(ht, 'div', { cls: 'rw-meet-title', text: n.title.replace(/^\d{4}-\d{2}-\d{2}\s*/, '') || n.title });
+    const sub = h(ht, 'div', { cls: 'rw-meet-sub' });
+    const when = h(sub, 'span'); ic(when, 'calendar'); h(when, 'span', { text: (n.date || '') + (fm.time ? ' ' + fm.time : '') });
+    if (str(fm.attendees)) { const at = h(sub, 'span'); ic(at, 'users'); h(at, 'span', { text: str(fm.attendees) }); }
+    if (n.projectName) this.projectChip(sub, (this.index.byName.get(n.projectName) || {}).title || n.projectName);
+    const acts = h(head, 'div', { cls: 'rw-meet-acts' });
+    const stSel = h(acts, 'select', { cls: 'dropdown rw-select rw-select-sm', title: '整理状态' });
+    for (const x of NOTE_TYPES.meeting.statuses) { const o = h(stSel, 'option', { text: x }); o.value = x; }
+    if (!NOTE_TYPES.meeting.statuses.includes(n.status)) { const o = h(stSel, 'option', { text: n.status || '未设置' }); o.value = n.status || ''; }
+    stSel.value = n.status || '';
+    stSel.addEventListener('change', async () => { await pl.setField(n.file, 'status', stSel.value); });
+    this.btn(acts, '打开纪要', 'file-text', () => pl.openFile(n.file), 'rw-btn-sm mod-cta');
+    this.btn(acts, '管理材料', 'paperclip', () => new AttachModal(this.app, pl, n.file, () => this.render()).open(), 'rw-btn-sm');
+    const more = h(acts, 'button', { cls: 'rw-iconbtn', title: '更多' }); ic(more, 'more-horizontal');
+    more.addEventListener('click', (e) => this.noteMenu(e, n));
+
+    if (str(fm.summary)) { const sm = h(main, 'div', { cls: 'rw-meet-summary-box' }); h(sm, 'div', { cls: 'rw-meet-lab', text: '简介' }); h(sm, 'div', { text: str(fm.summary) }); }
+
+    const atts = pl.attachmentsOf(n);
+    const MEDIA = FILE_CATS.meeting.exts, IMG = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'];
+    const media = atts.filter((a) => MEDIA.includes((a.file.extension || '').toLowerCase()));
+    const imgs = atts.filter((a) => IMG.includes((a.file.extension || '').toLowerCase()));
+    const docs = atts.filter((a) => !media.includes(a) && !imgs.includes(a));
+    // 录音 / 视频
+    if (media.length) {
+      const sec = h(main, 'div', { cls: 'rw-meet-sec' });
+      const sh = h(sec, 'div', { cls: 'rw-meet-sech' }); ic(sh, 'mic'); h(sh, 'span', { text: '录音 / 视频' });
+      for (const a of media) {
+        const box = h(sec, 'div', { cls: 'rw-meet-media' });
+        const nm = h(box, 'div', { cls: 'rw-meet-mname' });
+        h(nm, 'span', { text: a.file.name });
+        h(nm, 'span', { cls: 'rw-muted', text: fmtSize(a.file.stat.size) });
+        const ob = h(nm, 'button', { cls: 'rw-iconbtn', title: '在 Obsidian 里打开' }); ic(ob, 'external-link'); ob.addEventListener('click', () => pl.openFile(a.file));
+        const isVideo = ['mp4', 'mov', 'webm', 'mkv', 'avi'].includes((a.file.extension || '').toLowerCase());
+        const el = h(box, isVideo ? 'video' : 'audio', { attr: { controls: '', preload: 'metadata' } });
+        el.src = this.app.vault.getResourcePath(a.file);
+        // 记住播放位置
+        const key = 'meet|' + a.file.path;
+        const pos = pl.readPos && pl.readPos(key);
+        if (pos && pos.t) el.addEventListener('loadedmetadata', () => { try { el.currentTime = pos.t; } catch (e) { /* ignore */ } }, { once: true });
+        let lastSave = 0;
+        el.addEventListener('timeupdate', () => { const now = Date.now(); if (now - lastSave > 3000 && pl.setReadPos) { lastSave = now; pl.setReadPos(key, { t: el.currentTime }); } });
+      }
+    }
+    // 文档 / PPT / 纪要
+    if (docs.length) {
+      const sec = h(main, 'div', { cls: 'rw-meet-sec' });
+      const sh = h(sec, 'div', { cls: 'rw-meet-sech' }); ic(sh, 'paperclip'); h(sh, 'span', { text: '材料（' + docs.length + '）' });
+      const g = h(sec, 'div', { cls: 'rw-meet-docs' });
+      for (const a of docs) {
+        const ext = (a.file.extension || '').toLowerCase();
+        const c = h(g, 'div', { cls: 'rw-meet-doc', title: a.file.path });
+        ic(c, FILE_CATS[EXT_CAT[ext] || 'other'].icon);
+        const t = h(c, 'div', { cls: 'rw-meet-dtext' });
+        h(t, 'div', { cls: 'rw-meet-dname', text: ext === 'md' ? a.file.basename : a.file.name });
+        h(t, 'div', { cls: 'rw-muted rw-meet-dmeta', text: ext.toUpperCase() + ' · ' + fmtSize(a.file.stat.size) });
+        c.addEventListener('click', () => pl.openFile(a.file));
+        if (ext === 'md') {
+          const pv = h(c, 'button', { cls: 'rw-iconbtn', title: '在这里预览' }); ic(pv, 'eye');
+          pv.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const box = main.querySelector('.rw-meet-mdprev');
+            if (box && box.dataset.path === a.file.path) { box.remove(); return; }
+            if (box) box.remove();
+            const nb = h(sec, 'div', { cls: 'rw-meet-mdprev rw-md' }); nb.dataset.path = a.file.path;
+            const hd = h(nb, 'div', { cls: 'rw-meet-prevh' }); h(hd, 'b', { text: a.file.basename }); const x = h(hd, 'button', { cls: 'rw-iconbtn', title: '收起' }); ic(x, 'x'); x.addEventListener('click', () => nb.remove());
+            const body = h(nb, 'div');
+            const md = (await this.app.vault.cachedRead(a.file)).replace(/^---\n[\s\S]*?\n---\n?/, '');
+            renderAiMarkdown(this.app, md, body, this);
+          });
+        }
+      }
+    }
+    if (imgs.length) {
+      const sec = h(main, 'div', { cls: 'rw-meet-sec' });
+      const sh = h(sec, 'div', { cls: 'rw-meet-sech' }); ic(sh, 'image'); h(sh, 'span', { text: '图片（' + imgs.length + '）' });
+      const g = h(sec, 'div', { cls: 'rw-meet-imgs' });
+      for (const a of imgs) { const im = h(g, 'img', { attr: { loading: 'lazy', title: a.file.name } }); im.src = this.app.vault.getResourcePath(a.file); im.addEventListener('click', () => pl.openFile(a.file)); }
+    }
+    if (!atts.length) {
+      const e = h(main, 'div', { cls: 'rw-meet-sec rw-meet-nomat' });
+      h(e, 'span', { cls: 'rw-muted', text: '这次会议还没有材料。' });
+      const ab = h(e, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(ab, 'upload'); h(ab, 'span', { text: '添加录音 / PPT…' });
+      ab.addEventListener('click', () => new AttachModal(this.app, pl, n.file, () => this.render()).open());
+    }
+    // 行动项 + 纪要正文
+    const todoSec = h(main, 'div', { cls: 'rw-meet-sec' });
+    const bodySec = h(main, 'div', { cls: 'rw-meet-sec' });
+    this.app.vault.cachedRead(n.file).then((raw) => {
+      const lines = raw.split('\n');
+      const tasks = [];
+      lines.forEach((l, i) => { const m = l.match(/^(\s*[-*+] \[)([ xX])(\]\s*)(.*)$/); if (m && m[4].trim()) tasks.push({ i, done: m[2] !== ' ', text: m[4].trim() }); });
+      if (tasks.length) {
+        const sh = h(todoSec, 'div', { cls: 'rw-meet-sech' }); ic(sh, 'list-checks'); h(sh, 'span', { text: '行动项（' + tasks.filter((t) => !t.done).length + ' 未完成 / ' + tasks.length + '）' });
+        for (const t of tasks) {
+          const row = h(todoSec, 'label', { cls: 'rw-meet-task' + (t.done ? ' is-done' : '') });
+          const cb = h(row, 'input', { attr: { type: 'checkbox' } }); cb.checked = t.done;
+          h(row, 'span', { text: t.text });
+          cb.addEventListener('change', async () => {
+            await this.app.vault.process(n.file, (data) => { const ls = data.split('\n'); const l = ls[t.i]; if (l && l.includes(t.text)) ls[t.i] = l.replace(/\[[ xX]\]/, cb.checked ? '[x]' : '[ ]'); return ls.join('\n'); });
+            row.classList.toggle('is-done', cb.checked);
+          });
+        }
+      } else todoSec.remove();
+      // 正文：去掉 frontmatter、标题、简介框、材料区、空的模板标题
+      let body = raw.replace(/^---\n[\s\S]*?\n---\n?/, '').replace(/^# .*\n/, '').replace(/^> \[!abstract\][^\n]*\n(?:>.*\n?)*/m, '').replace(/\n?## 📎 材料\n[\s\S]*?(?=\n## |$)/, '');
+      body = body.replace(/^(\s*[-*+] \[[ xX]\]\s*)$/gm, '').replace(/^## [^\n]+\n(?=\s*(?:## |$))/gm, '').trim();
+      const sh = h(bodySec, 'div', { cls: 'rw-meet-sech' }); ic(sh, 'file-text'); h(sh, 'span', { text: '纪要正文' });
+      const eb = h(sh, 'button', { cls: 'rw-linkbtn', text: '去编辑' }); eb.addEventListener('click', () => pl.openFile(n.file));
+      const box = h(bodySec, 'div', { cls: 'rw-meet-body rw-md' });
+      if (body) renderAiMarkdown(this.app, body, box, this);
+      else h(box, 'div', { cls: 'rw-muted', text: '还没写内容。点「打开纪要」记录讨论和结论；也可以在材料里预览导出的智能纪要。' });
+    });
   }
 
   renderNoteBoard(parent, list, def) {
