@@ -1727,6 +1727,7 @@ class WorkbenchView extends ItemView {
     m.addItem((i) => i.setTitle('预览').setIcon('eye').onClick(() => this.plugin.previewNotes([n], n)));
     m.addItem((i) => i.setTitle('移动到文件夹…（可跨项目）').setIcon('folder-input').onClick(() => this.plugin.pickFolder(n.projectName || '', { title: '把「' + n.title + '」移动到…' }, (dest) => this.plugin.moveFileTo(n.file, dest))));
     m.addItem((i) => i.setTitle('附件（' + this.plugin.attachmentsOf(n).length + '）…').setIcon('paperclip').onClick(() => new AttachModal(this.app, this.plugin, n.file, () => this.render()).open()));
+    if (n.type === 'meeting' && this.plugin.attachmentsOf(n).length) m.addItem((i) => i.setTitle('重新生成材料区（录音 / 附件）').setIcon('refresh-cw').onClick(async () => { try { await this.plugin.writeMeetingMaterials(n.file); new Notice('已更新材料区'); } catch (e) { console.error(e); new Notice('更新失败：' + (e.message || e)); } }));
     if (n.type === 'idea') {
       m.addItem((i) => i.setTitle('转为科研项目').setIcon('rocket').onClick(() => this.plugin.ideaToProject(n)));
     }
@@ -4531,7 +4532,7 @@ class NewMeetingModal extends Modal {
     if (!String(this.v.title || '').trim()) return new Notice('请填写会议标题');
     this.busy = true;
     try { await this.plugin.createMeeting(this.v); this.close(); }
-    catch (e) { new Notice('创建失败：' + (e.message || e)); }
+    catch (e) { console.error('[research-workbench] 新建会议纪要失败', e); new Notice('创建失败：' + (e.message || e), 12000); }
     finally { this.busy = false; }
   }
   onClose() { clear(this.contentEl); }
@@ -19002,30 +19003,55 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     if (summary) fm.summary = summary.replace(/\s+/g, ' ').slice(0, 300);
     const prepend = summary ? '> [!abstract] 简介\n' + summary.split('\n').map((l) => '> ' + l).join('\n') : '';
     const file = await this.createNote({ type: 'meeting', title, project: v.project || '', folder: v.folder || '', fm, prepend, silent: true, status: v.items && v.items.length ? '待整理' : undefined });
+    const problems = [];
     if (v.items && v.items.length) {
-      await this.addAttachments(file, v.items, { move: !!v.move });
-      await new Promise((r) => setTimeout(r, 80));
-      const n = { file, fm: (this.app.metadataCache.getFileCache(file) || {}).frontmatter || {} };
-      const atts = this.attachmentsOf(n);
-      const MEDIA = FILE_CATS.meeting.exts;
-      const audio = atts.find((a) => MEDIA.includes((a.file.extension || '').toLowerCase()));
-      if (audio) await this.app.fileManager.processFrontMatter(file, (f) => { f.audio = '[[' + audio.file.path + ']]'; });
-      const lines = ['## 📎 材料'];
-      for (const a of atts) {
-        const ext = (a.file.extension || '').toLowerCase();
-        if (MEDIA.includes(ext) || ['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext)) lines.push('- ' + a.file.name, '', '![[' + a.file.path + ']]', '');
-        else lines.push('- [[' + a.file.path + '|' + a.file.name + ']]');
-      }
-      await this.app.vault.process(file, (data) => {
-        const i = data.indexOf('\n## 议题');
-        const block = lines.join('\n').replace(/\n+$/, '') + '\n';
-        return i >= 0 ? data.slice(0, i + 1) + block + '\n' + data.slice(i + 1) : data.replace(/\s*$/, '') + '\n\n' + block;
-      });
+      const got = [];
+      try { await this.addAttachments(file, v.items, { move: !!v.move, out: got, errors: problems }); }
+      catch (e) { console.error('[research-workbench] 会议材料添加失败', e); problems.push('添加材料：' + (e.message || e)); }
+      try { await this.writeMeetingMaterials(file, got); }
+      catch (e) { console.error('[research-workbench] 会议材料区写入失败', e); problems.push('写材料区：' + (e.message || e)); }
     }
+    if (problems.length) new Notice('会议纪要已创建，但有 ' + problems.length + ' 处出错：\n' + problems.join('\n') + '\n（可以在纪要上右键「重新生成材料区」）', 15000);
     new Notice('已创建会议纪要：' + title + (v.items && v.items.length ? '（含 ' + v.items.length + ' 个材料）' : ''));
     this.refreshViews();
     if (v.open !== false) await this.openFile(file);
     return file;
+  }
+  /* 会议纪要：把材料写进 frontmatter（audio）和正文「📎 材料」区。files 不传就用这篇现有的附件 */
+  async writeMeetingMaterials(file, files) {
+    const MEDIA = FILE_CATS.meeting.exts;
+    const IMG = ['png', 'jpg', 'jpeg', 'gif', 'webp'];
+    let list = (files || []).filter((f) => f instanceof TFile);
+    if (!list.length) {
+      const n = { file, fm: (this.app.metadataCache.getFileCache(file) || {}).frontmatter || {} };
+      list = this.attachmentsOf(n).map((a) => a.file);
+    }
+    if (!list.length) return false;
+    const audio = list.find((f) => MEDIA.includes((f.extension || '').toLowerCase()));
+    if (audio) await this.retryIO(() => this.app.fileManager.processFrontMatter(file, (f) => { if (!f.audio) f.audio = '[[' + audio.path + ']]'; }));
+    const lines = ['## 📎 材料'];
+    for (const f of list) {
+      const ext = (f.extension || '').toLowerCase();
+      if (MEDIA.includes(ext) || IMG.includes(ext)) lines.push('- ' + f.name, '', '![[' + f.path + ']]', '');
+      else lines.push('- [[' + f.path + '|' + f.basename + ']]');
+    }
+    const block = lines.join('\n').replace(/\n+$/, '') + '\n';
+    await this.retryIO(() => this.app.vault.process(file, (data) => {
+      // 已有材料区就整段替换，避免重复
+      const old = data.match(/\n## 📎 材料\n[\s\S]*?(?=\n## |$)/);
+      if (old) return data.slice(0, old.index + 1) + block + data.slice(old.index + old[0].length);
+      const i = data.indexOf('\n## 议题');
+      return i >= 0 ? data.slice(0, i + 1) + block + '\n' + data.slice(i + 1) : data.replace(/\s*$/, '') + '\n\n' + block;
+    }));
+    return true;
+  }
+  /* 手机上文件刚写完、同步插件正在动它时，偶尔会写失败：等一下再试 */
+  async retryIO(fn, times) {
+    let last;
+    for (let i = 0; i < (times || 4); i++) {
+      try { return await fn(); } catch (e) { last = e; await new Promise((r) => setTimeout(r, 300 * (i + 1))); }
+    }
+    throw last;
   }
   promptText(title, value, cb) { new TextPromptModal(this.app, title, value, async (v) => { await cb(v); this.refreshViews(); }).open(); }
   refreshViews() {
@@ -19402,16 +19428,17 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
         }
         if (f.path === noteFile.path) continue;
         links.push('[[' + f.path + ']]');
+        if (o.out) o.out.push(f);
         n++;
-      } catch (e) { new Notice('添加附件失败：' + (it.name || '') + ' ' + (e.message || e)); }
+      } catch (e) { console.error('[research-workbench] 添加附件失败', it && it.name, e); if (o.errors) o.errors.push((it.name || '') + '：' + (e.message || e)); new Notice('添加附件失败：' + (it.name || '') + ' ' + (e.message || e), 8000); }
     }
     if (links.length) {
-      await this.app.fileManager.processFrontMatter(noteFile, (fm) => {
+      await this.retryIO(() => this.app.fileManager.processFrontMatter(noteFile, (fm) => {
         const cur = Array.isArray(fm.attachments) ? fm.attachments.slice() : fm.attachments ? [fm.attachments] : [];
         const have = new Set(cur.map((v) => { const t = this.linkTarget(v, noteFile.path); return t ? t.path : String(v); }));
         for (const l of links) { const pth = l.slice(2, -2); if (!have.has(pth)) { cur.push(l); have.add(pth); } }
         fm.attachments = cur;
-      });
+      }));
       new Notice('📎 已添加 ' + n + ' 个附件');
     }
     this.refreshViews();
