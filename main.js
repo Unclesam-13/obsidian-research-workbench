@@ -793,6 +793,16 @@ function startOfDay(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x
 function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
 function mondayOf(d) { const x = startOfDay(d); return addDays(x, -((x.getDay() + 6) % 7)); }
 function isoWeek(d) { const t = startOfDay(d); t.setDate(t.getDate() + 3 - ((t.getDay() + 6) % 7)); const w1 = new Date(t.getFullYear(), 0, 4); return 1 + Math.round(((t - w1) / 864e5 - 3 + ((w1.getDay() + 6) % 7)) / 7); }
+/* 待办状态：写在 - [?] 的方括号里，Obsidian 自己也认 */
+const TASK_STATES = [
+  { ch: ' ', label: '待办', icon: 'square' },
+  { ch: '/', label: '进行中', icon: 'loader' },
+  { ch: 'x', label: '完成', icon: 'check-square' },
+  { ch: '-', label: '不做了', icon: 'x-square' },
+  { ch: '~', label: '暂时忽略', icon: 'eye-off' },
+];
+const TASK_OPEN = (ch) => ch === ' ' || ch === '/';
+const taskStateOf = (ch) => TASK_STATES.find((x) => x.ch === (ch === 'X' ? 'x' : ch)) || { ch, label: '已处理', icon: 'check-square' };
 const EVENT_LABEL = { deadline: '截止', task: '待办', meeting: '会议', note: '笔记' };
 const EVENT_ORDER = { deadline: 0, task: 1, meeting: 2, note: 3 };
 const DEFAULT_INSPIRE_LINKS = [
@@ -1376,8 +1386,12 @@ class WorkbenchView extends ItemView {
 
     // ⑤ 右下：即将截止 / 最近更新
     const ip = this.panel(grid, 'rw-p-list', '', null);
-    const lw = this.panelTabs(ip, 'homeList', [['due', '即将截止', 'alarm-clock'], ['recent', '最近更新', 'clock']]);
-    if (lw === 'recent') {
+    if (!st.homeListV2) { st.homeList = 'todo'; st.homeListV2 = true; this.plugin.saveSettingsSoon(); }
+    const lw = this.panelTabs(ip, 'homeList', [['todo', '常驻待办', 'pin'], ['due', '即将截止', 'alarm-clock'], ['recent', '最近更新', 'clock']]);
+    if (lw === 'todo') {
+      const box = h(ip.body, 'div');
+      this.plugin.collectTasks(this.index).then((tasks) => this.renderPinnedTasks(box, tasks, { empty: '没有常驻待办。没有日期的待办会一直显示在这里，直到处理掉' }));
+    } else if (lw === 'recent') {
       const items = projects.concat(notes).sort((a, b) => b.file.stat.mtime - a.file.stat.mtime).slice(0, 20);
       if (!items.length) h(ip.body, 'div', { cls: 'rw-empty-sm', text: '暂无' });
       for (const it of items) this.rowItem(ip.body, it, relTime(it.file.stat.mtime));
@@ -3180,8 +3194,25 @@ class WorkbenchView extends ItemView {
     for (const t of tops) walk(t, 0);
   }
 
+  taskMenu(e, t) {
+    const pl = this.plugin, m = new Menu();
+    for (const s2 of TASK_STATES) {
+      if (s2.ch === t.status || (s2.ch === ' ' && !t.status)) continue;
+      m.addItem((i) => i.setTitle(s2.ch === ' ' ? '恢复为待办' : s2.label).setIcon(s2.icon).onClick(() => pl.setTaskStatus(t, s2.ch)));
+    }
+    if (!t.done) {
+      m.addSeparator();
+      m.addItem((i) => i.setTitle('推迟到明天').setIcon('calendar-clock').onClick(() => pl.postponeTask(t, 1)));
+      m.addItem((i) => i.setTitle('推迟一周').setIcon('calendar-range').onClick(() => pl.postponeTask(t, 7)));
+    }
+    m.addSeparator();
+    m.addItem((i) => i.setTitle('编辑…').setIcon('pencil').onClick(() => new TaskModal(this.app, pl, t, () => this.render()).open()));
+    m.addItem((i) => i.setTitle('打开所在笔记').setIcon('file-text').onClick(() => pl.openFile(t.file, t.line)));
+    m.showAtMouseEvent(e);
+  }
+
   taskRow(parent, t, depth) {
-    const r = h(parent, 'div', { cls: 'rw-task' + (depth ? ' rw-task-sub' : '') + (t.subTotal ? ' has-subs' : '') });
+    const r = h(parent, 'div', { cls: 'rw-task' + (depth ? ' rw-task-sub' : '') + (t.subTotal ? ' has-subs' : '') + (t.status === '/' ? ' is-doing' : '') });
     if (depth) r.style.setProperty('--tdepth', depth);
     const cb = h(r, 'input', { attr: { type: 'checkbox' } });
     cb.addEventListener('click', async (e) => {
@@ -3190,6 +3221,7 @@ class WorkbenchView extends ItemView {
       await this.plugin.completeTask(t);
     });
     if (depth && t.parentLine >= 0 && !t.parentOpen) h(r, 'span', { cls: 'rw-muted rw-task-orphan', text: '↳' });
+    if (t.status === '/') h(r, 'span', { cls: 'rw-task-state is-doing', text: '进行中' });
     h(r, 'span', { cls: 'rw-task-text', text: t.text });
     if (t.subTotal) {
       const pg = h(r, 'span', { cls: 'rw-task-prog', title: '小步骤完成情况' });
@@ -3202,7 +3234,57 @@ class WorkbenchView extends ItemView {
     }
     if (t.due) h(r, 'span', { cls: 'rw-deadline ' + deadlineCls(t.due), text: t.due.slice(5) + (t.time ? ' ' + t.time : '') + ' · ' + deadlineText(t.due) });
     h(r, 'span', { cls: 'rw-task-src', text: t.file.basename });
+    if (!t.due && !depth) h(r, 'span', { cls: 'rw-task-pin', text: '常驻', title: '没有日期：一直显示，直到完成 / 不做了 / 忽略' });
+    const mb = h(r, 'button', { cls: 'rw-iconbtn rw-task-more', title: '完成 / 进行中 / 不做了 / 暂时忽略 / 推迟…' }); ic(mb, 'more-horizontal');
+    mb.addEventListener('click', (e) => { e.stopPropagation(); this.taskMenu(e, t); });
+    r.addEventListener('contextmenu', (e) => { e.preventDefault(); this.taskMenu(e, t); });
     r.addEventListener('click', () => new TaskModal(this.app, this.plugin, t, () => this.render()).open());
+  }
+
+  /* 常驻待办（没有日期的）+ 一个随手添加框 */
+  renderPinnedTasks(body, tasks, o) {
+    o = o || {};
+    const add = h(body, 'div', { cls: 'rw-pin-add' });
+    const inp = h(add, 'input', { attr: { type: 'text', placeholder: '加一条常驻待办（没有日期，一直显示，直到完成）回车添加' } });
+    const ab = h(add, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(ab, 'plus'); h(ab, 'span', { text: '添加' });
+    const go = async () => { const v = inp.value.trim(); if (!v) return; inp.value = ''; await this.plugin.addTask({ text: v, date: '', project: o.project || '' }); };
+    ab.addEventListener('click', go);
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); go(); } });
+    const pinned = tasks.filter((t) => !t.due && !t.done);
+    const keys = new Set(pinned.map((t) => t.file.path + '#' + t.line));
+    // 有日期的大点下面没日期的小步骤，跟着大点走，不单独常驻
+    const list = pinned.filter((t) => !(t.parentLine >= 0 && t.parentOpen && !keys.has(t.file.path + '#' + t.parentLine)));
+    if (!list.length) { h(body, 'div', { cls: 'rw-empty-sm', text: o.empty || '没有常驻待办' }); return; }
+    // 先显示最近加的 / 进行中的几条，其余折叠
+    const lim = o.limit || 8;
+    const topsAll = list.filter((t) => !(t.parentLine >= 0 && keys.has(t.file.path + '#' + t.parentLine)));
+    if (this.pinAll || topsAll.length <= lim) { this.taskTree(body, list); if (this.pinAll && topsAll.length > lim) { const lb = h(body, 'button', { cls: 'rw-linkbtn rw-pin-more', text: '收起' }); lb.addEventListener('click', () => { this.pinAll = false; this.render(); }); } return; }
+    const pick = topsAll.slice().sort((a, b) => (b.status === '/' ? 1 : 0) - (a.status === '/' ? 1 : 0) || b.file.stat.mtime - a.file.stat.mtime).slice(0, lim);
+    const pk = new Set(pick.map((t) => t.file.path + '#' + t.line));
+    const inPick = (t) => { let cur = t; for (let i = 0; i < 6 && cur; i++) { if (pk.has(cur.file.path + '#' + cur.line)) return true; const pp = cur.parentLine >= 0 ? cur.file.path + '#' + cur.parentLine : ''; cur = pp ? list.find((x) => x.file.path + '#' + x.line === pp) : null; } return false; };
+    this.taskTree(body, list.filter(inPick));
+    const mb = h(body, 'button', { cls: 'rw-linkbtn rw-pin-more', text: '还有 ' + (topsAll.length - lim) + ' 条常驻待办，展开全部 →' });
+    mb.addEventListener('click', () => { this.pinAll = true; this.render(); });
+  }
+
+  /* 已处理的待办：完成 / 不做了 / 忽略，可以恢复 */
+  renderClosedTasks(body, all) {
+    const since = fmtDate(addDays(new Date(), -14));
+    const list = all.filter((t) => t.done && (t.status === '~' || (t.endDate && t.endDate >= since))).sort((a, b) => (b.endDate || '9999').localeCompare(a.endDate || '9999'));
+    if (!list.length) { h(body, 'div', { cls: 'rw-empty-sm', text: '最近两周没有处理过的待办' }); return; }
+    for (const t of list.slice(0, 60)) {
+      const r = h(body, 'div', { cls: 'rw-task rw-task-closed is-st-' + ({ x: 'done', '-': 'cancel', '~': 'ignore' }[t.status] || 'done') });
+      const sti = taskStateOf(t.status);
+      const chip = h(r, 'span', { cls: 'rw-task-state', text: sti.label });
+      ic(chip, sti.icon);
+      h(r, 'span', { cls: 'rw-task-text', text: t.text });
+      if (t.endDate) h(r, 'span', { cls: 'rw-muted rw-task-src', text: t.endDate.slice(5) });
+      h(r, 'span', { cls: 'rw-task-src', text: t.file.basename });
+      const rb = h(r, 'button', { cls: 'rw-btn rw-btn-sm', title: '改回待办' }); ic(rb, 'undo-2'); h(rb, 'span', { text: '恢复' });
+      rb.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.setTaskStatus(t, ' '); });
+      r.addEventListener('contextmenu', (e) => { e.preventDefault(); this.taskMenu(e, t); });
+      r.addEventListener('click', () => new TaskModal(this.app, this.plugin, t, () => this.render()).open());
+    }
   }
 
   /* ---------- 计划页 ---------- */
@@ -3214,11 +3296,20 @@ class WorkbenchView extends ItemView {
     clearInterval(this._clockT);
     this._clockT = setInterval(() => { if (!clock.isConnected) return clearInterval(this._clockT); tickClock(); }, 30000);
     this.btn(right, '添加待办', 'plus', () => this.plugin.addTaskModal({ date: today() }), 'mod-cta');
+    const ps = this.section(el, '常驻待办', 'pin');
+    h(ps.right, 'span', { cls: 'rw-muted', text: '没有日期的待办都在这里，一直显示，直到完成 / 不做了 / 忽略' });
+    const psBody = ps.body;
     const cs = this.section(el, '日历', 'calendar-days');
     this.renderCalendar(cs.body, true);
     const two = h(el, 'div', { cls: 'rw-two rw-two-wide' });
     const left = this.section(two, '未完成待办', 'check-square');
     const loading = h(left.body, 'div', { cls: 'rw-empty-sm', text: '加载中…' });
+    const closedSec = this.section(el, '已处理的待办（近两周，可以恢复）', 'archive');
+    closedSec.el.classList.add('rw-closed-sec');
+    this.plugin.collectTasks(this.index, true).then((allT) => {
+      this.renderPinnedTasks(psBody, allT);
+      this.renderClosedTasks(closedSec.body, allT);
+    });
     this.plugin.collectTasks(this.index).then((tasks) => {
       loading.remove();
       if (!tasks.length) { h(left.body, 'div', { cls: 'rw-empty-sm', text: '🎉 没有未完成的待办' }); return; }
@@ -4547,7 +4638,7 @@ class TaskModal extends Modal {
   constructor(app, plugin, t, onDone) { super(app); this.plugin = plugin; this.t = t; this.onDone = onDone; }
   async onOpen() {
     this.modalEl.classList.add('rw-task-modal');
-    this.titleEl.setText(this.t.done ? '待办（已完成）' : '待办');
+    this.titleEl.setText(this.t.done ? '待办（' + taskStateOf(this.t.status || 'x').label + '）' : '待办');
     this.contentEl.classList.add('rw-modal');
     const data = await this.app.vault.read(this.t.file);
     const lines = data.split('\n');
@@ -4563,8 +4654,11 @@ class TaskModal extends Modal {
     const doneAt = body.match(/✅\s*(\d{4}-\d{2}-\d{2})/);
     this.v = {
       text: body.replace(/(?:📅|due:)\s*\d{4}-\d{2}-\d{2}(\s+\d{1,2}:\d{2})?/, '').replace(/⏰\s*\d{1,2}:\d{2}/, '').replace(/✅\s*\d{4}-\d{2}-\d{2}/, '').replace(/\s+/g, ' ').trim(),
-      date: dm ? dm[1] : '', time: tm ? pad(Number(tm[1])) + ':' + tm[2] : '', done: m[3] !== ' ', doneAt: doneAt ? doneAt[1] : '',
+      date: dm ? dm[1] : '', time: tm ? pad(Number(tm[1])) + ':' + tm[2] : '', done: !TASK_OPEN(m[3]), status: m[3] === 'X' ? 'x' : m[3], doneAt: doneAt ? doneAt[1] : '',
     };
+    const cancelAt = body.match(/❌\s*(\d{4}-\d{2}-\d{2})/);
+    this.v.cancelAt = cancelAt ? cancelAt[1] : '';
+    this.v.text = this.v.text.replace(/❌\s*\d{4}-\d{2}-\d{2}/, '').replace(/\s+/g, ' ').trim();
     // 下面缩进更深的行 = 这条待办的备注
     const notes = [];
     let k = ln + 1;
@@ -4579,7 +4673,7 @@ class TaskModal extends Modal {
     while (k < lines.length && lines[k].trim() && indentWidth(lines[k]) > baseW) {
       const sm = lines[k].match(/^(\s*)[-*+]\s*\[(.)\]\s*(.*)$/);
       const w = indentWidth(lines[k]);
-      if (sm && (subW < 0 || w <= subW)) { if (subW < 0) { subW = w; this.subIndent = sm[1]; } const da = sm[3].match(/\s*✅\s*(\d{4}-\d{2}-\d{2})/); subs.push({ text: sm[3].replace(/\s*✅\s*\d{4}-\d{2}-\d{2}/, '').trim(), done: sm[2] !== ' ', doneAt: da ? da[1] : '', extra: [] }); }
+      if (sm && (subW < 0 || w <= subW)) { if (subW < 0) { subW = w; this.subIndent = sm[1]; } const da = sm[3].match(/\s*(?:✅|❌)\s*(\d{4}-\d{2}-\d{2})/); subs.push({ text: sm[3].replace(/\s*(?:✅|❌)\s*\d{4}-\d{2}-\d{2}/, '').trim(), done: !TASK_OPEN(sm[2]), ch: sm[2] === 'X' ? 'x' : sm[2], doneAt: da ? da[1] : '', extra: [] }); }
       else if (subs.length) subs[subs.length - 1].extra.push(lines[k]);
       else break;
       k++;
@@ -4593,9 +4687,13 @@ class TaskModal extends Modal {
     const c = this.contentEl; clear(c);
     const v = this.v;
     const top = h(c, 'div', { cls: 'rw-task-top' });
-    const cb = h(top, 'input', { attr: { type: 'checkbox', title: '完成' } }); cb.checked = v.done;
-    cb.addEventListener('change', () => { v.done = cb.checked; ta.classList.toggle('is-done', v.done); });
     const ta = h(top, 'textarea', { cls: 'rw-task-text-in' + (v.done ? ' is-done' : ''), attr: { rows: '2', placeholder: '要做什么' } });
+    const stRow = h(c, 'div', { cls: 'rw-task-states' });
+    for (const s2 of TASK_STATES) {
+      const b = h(stRow, 'button', { cls: 'rw-task-stbtn st-' + ({ ' ': 'todo', '/': 'doing', x: 'done', '-': 'cancel', '~': 'ignore' }[s2.ch]) + (v.status === s2.ch ? ' is-active' : '') });
+      ic(b, s2.icon); h(b, 'span', { text: s2.label });
+      b.addEventListener('click', () => { v.status = s2.ch; v.done = !TASK_OPEN(s2.ch); stRow.querySelectorAll('.rw-task-stbtn').forEach((x) => x.classList.remove('is-active')); b.classList.add('is-active'); ta.classList.toggle('is-done', v.done); });
+    }
     ta.value = v.text;
     ta.addEventListener('input', () => { v.text = ta.value.replace(/\n/g, ' '); });
     setTimeout(() => ta.focus(), 30);
@@ -4625,15 +4723,18 @@ class TaskModal extends Modal {
   buildLines() {
     const v = this.v;
     const text = String(v.text || '').replace(/\s+/g, ' ').trim();
-    let line = this.indent + this.bullet + ' [' + (v.done ? 'x' : ' ') + '] ' + text + (v.date ? ' 📅 ' + v.date : '') + (v.time ? ' ⏰ ' + v.time : '');
-    if (v.done) line += ' ✅ ' + (v.doneAt || today());
+    const sc = v.status != null ? v.status : (v.done ? 'x' : ' ');
+    let line = this.indent + this.bullet + ' [' + sc + '] ' + text + (v.date ? ' 📅 ' + v.date : '') + (v.time ? ' ⏰ ' + v.time : '');
+    if (sc === 'x') line += ' ✅ ' + (v.doneAt || today());
+    else if (sc === '-') line += ' ❌ ' + (v.cancelAt || today());
     const notes = String(v.notes || '').split('\n').map((x) => x.trim()).filter(Boolean).map((x) => this.notePrefix + x);
     const subs = [];
     for (const sb of v.subs || []) {
       const t = String(sb.text || '').replace(/\s+/g, ' ').trim();
       if (!t) continue;
-      const done = sb.done || v.done;
-      subs.push(this.subIndent + '- [' + (done ? 'x' : ' ') + '] ' + t + (done && sb.doneAt ? ' ✅ ' + sb.doneAt : ''));
+      let ch2 = sb.done ? (sb.ch && !TASK_OPEN(sb.ch) ? sb.ch : 'x') : (sb.ch && TASK_OPEN(sb.ch) ? sb.ch : ' ');
+      if (TASK_OPEN(ch2) && v.done) ch2 = sc;
+      subs.push(this.subIndent + '- [' + ch2 + '] ' + t + (ch2 === 'x' ? ' ✅ ' + (sb.doneAt || today()) : ch2 === '-' ? ' ❌ ' + (sb.doneAt || today()) : ''));
       for (const x of sb.extra || []) subs.push(x);
     }
     return [line].concat(notes, subs);
@@ -5389,8 +5490,14 @@ class AddTaskModal extends Modal {
     this.titleEl.setText('添加待办');
     new Setting(c).setName('要做什么').setDesc('大目标写这里，下面可以拆成几个小步骤').addText((t) => { t.setPlaceholder('例如：完成 CA1 报告').setValue(this.v.text).onChange((x) => (this.v.text = x)); t.inputEl.style.width = '320px'; setTimeout(() => t.inputEl.focus(), 30); });
     subStepsEditor(c, this.v.subs);
-    new Setting(c).setName('日期').addText((t) => { t.inputEl.type = 'date'; t.setValue(this.v.date).onChange((x) => (this.v.date = x)); });
-    new Setting(c).setName('时间').setDesc('可选；填了会出现在日历周视图的对应时段').addText((t) => { t.inputEl.type = 'time'; t.setValue(this.v.time).onChange((x) => (this.v.time = x)); });
+    const dset = new Setting(c).setName('日期').setDesc(this.v.date ? '' : '常驻待办：没有日期，一直显示在首页和计划页，直到完成 / 不做了 / 忽略');
+    let dIn = null, tIn = null;
+    dset.addText((t) => { dIn = t; t.inputEl.type = 'date'; t.setValue(this.v.date).onChange((x) => { this.v.date = x; tg.checked = !x; dset.setDesc(x ? '' : '常驻待办：没有日期，一直显示，直到处理掉'); }); });
+    const tgl = h(dset.controlEl, 'label', { cls: 'rw-check rw-nodate', title: '不设日期：一直显示，直到完成' });
+    const tg = h(tgl, 'input', { attr: { type: 'checkbox' } }); tg.checked = !this.v.date;
+    h(tgl, 'span', { text: '不设日期（常驻）' });
+    tg.addEventListener('change', () => { if (tg.checked) { this.v.date = ''; this.v.time = ''; dIn.setValue(''); if (tIn) tIn.setValue(''); dset.setDesc('常驻待办：没有日期，一直显示在首页和计划页，直到完成 / 不做了 / 忽略'); } else { this.v.date = today(); dIn.setValue(this.v.date); dset.setDesc(''); } });
+    new Setting(c).setName('时间').setDesc('可选；填了会出现在日历周视图的对应时段').addText((t) => { tIn = t; t.inputEl.type = 'time'; t.setValue(this.v.time).onChange((x) => { this.v.time = x; if (x && !this.v.date) { this.v.date = today(); dIn.setValue(this.v.date); tg.checked = false; } }); });
     const projects = this.plugin.buildIndex().projects.filter((p) => p.status !== '已完成');
     new Setting(c).setName('所属项目').setDesc('写进该项目主页的「待办」小节；不选则写进 科研/计划.md').addDropdown((d) => { d.addOption('', '（不属于项目）'); projects.forEach((p) => d.addOption(p.name, p.title)); d.setValue(this.v.project).onChange((x) => (this.v.project = x)); });
     new Setting(c).addButton((b) => b.setButtonText('添加').setCta().onClick(() => this.submit()));
@@ -18170,7 +18277,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
         if (!type) { looseMd.push(file); continue; }
         inferred = true;
       }
-      const openTasks = cache && cache.listItems ? cache.listItems.filter((li) => li.task === ' ').length : 0;
+      const openTasks = cache && cache.listItems ? cache.listItems.filter((li) => TASK_OPEN(li.task)).length : 0;
       if (type === 'project') {
         const p = {
           kind: 'project', file, fm, name: file.basename,
@@ -18261,7 +18368,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     let c = 0;
     for (const p of index.projects) {
       const cache = this.app.metadataCache.getFileCache(p.file);
-      if (cache && cache.listItems) c += cache.listItems.filter((li) => li.task === ' ').length;
+      if (cache && cache.listItems) c += cache.listItems.filter((li) => TASK_OPEN(li.task)).length;
     }
     for (const n of index.notes) c += n.openTasks;
     return c;
@@ -18276,7 +18383,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     for (const it of items) {
       const cache = this.app.metadataCache.getFileCache(it.file);
       const all = cache && cache.listItems ? cache.listItems : [];
-      const open = all.filter((li) => li.task === ' ' || (withDone && li.task && li.task !== ' '));
+      const open = all.filter((li) => TASK_OPEN(li.task) || (withDone && li.task !== undefined && !TASK_OPEN(li.task)));
       if (!open.length) continue;
       const lines = (await this.app.vault.cachedRead(it.file)).split('\n');
       const taskAt = new Map(all.filter((li) => li.task !== undefined).map((li) => [li.position.start.line, li]));
@@ -18287,10 +18394,11 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
         if (!text) continue;
         const dm = text.match(/(?:📅|@|due:\s*)\s*(\d{4}-\d{2}-\d{2})/);
         const tm = text.match(/⏰\s*(\d{1,2}):(\d{2})/) || text.match(/(?:📅|due:)\s*\d{4}-\d{2}-\d{2}\s+(\d{1,2}):(\d{2})/);
-        const clean = text.replace(/(?:📅|due:)\s*\d{4}-\d{2}-\d{2}(\s+\d{1,2}:\d{2})?/, '').replace(/⏰\s*\d{1,2}:\d{2}/, '').replace(/✅\s*\d{4}-\d{2}-\d{2}/, '').trim();
+        const endM = text.match(/(?:✅|❌)\s*(\d{4}-\d{2}-\d{2})/);
+        const clean = text.replace(/(?:📅|due:)\s*\d{4}-\d{2}-\d{2}(\s+\d{1,2}:\d{2})?/, '').replace(/⏰\s*\d{1,2}:\d{2}/, '').replace(/(?:✅|❌)\s*\d{4}-\d{2}-\d{2}/, '').trim();
         const par = li.parent >= 0 && taskAt.has(li.parent) ? li.parent : -1;
         const kids = all.filter((x) => x.parent === line && x.task !== undefined);
-        out.push({ file: it.file, projectName: it.projectName, line, raw, text: clean, due: dm ? dm[1] : '', time: tm ? pad(Number(tm[1])) + ':' + tm[2] : '', done: li.task !== ' ', parentLine: par, parentOpen: par >= 0 && taskAt.get(par).task === ' ', subTotal: kids.length, subDone: kids.filter((x) => x.task !== ' ').length });
+        out.push({ file: it.file, projectName: it.projectName, line, raw, text: clean, due: dm ? dm[1] : '', time: tm ? pad(Number(tm[1])) + ':' + tm[2] : '', done: !TASK_OPEN(li.task), status: li.task === 'X' ? 'x' : li.task, endDate: endM ? endM[1] : '', parentLine: par, parentOpen: par >= 0 && TASK_OPEN(taskAt.get(par).task), subTotal: kids.filter((x) => x.task !== '~').length, subDone: kids.filter((x) => x.task !== '~' && !TASK_OPEN(x.task)).length });
       }
     }
     return out;
@@ -18310,7 +18418,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       ev.push({ date: n.date, kind: n.type === 'meeting' ? 'meeting' : 'note', title: n.title, project: n.projectName, file: n.file, time: n.type === 'meeting' && tmv ? pad(Number(tmv[1])) + ':' + tmv[2] : '' });
     }
     const tasks = await this.collectTasks(index, true);
-    for (const t of tasks) if (t.due) ev.push({ date: t.due, kind: 'task', title: t.text, project: t.projectName, file: t.file, time: t.time, task: t, done: t.done });
+    for (const t of tasks) if (t.due && t.status !== '~') ev.push({ date: t.due, kind: 'task', title: t.text, project: t.projectName, file: t.file, time: t.time, task: t, done: t.done });
     return ev;
   }
 
@@ -19346,25 +19454,55 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     openExternalUrl(url);
   }
 
-  async completeTask(t) {
-    let subs = 0;
+  async completeTask(t) { return this.setTaskStatus(t, 'x'); }
+  /* 改待办状态：完成 ✅ / 不做了 ❌ / 暂时忽略 / 进行中 / 恢复待办；大点结束时，没处理的小步骤跟着一起改 */
+  async setTaskStatus(t, ch) {
+    let subs = 0, ok = false;
+    const mark = (l, c) => {
+      let x = l.replace(/^(\s*[-*+]\s*)\[.\]/, '$1[' + c + ']').replace(/\s*(?:✅|❌)\s*\d{4}-\d{2}-\d{2}/g, '');
+      if (c === 'x') x += ' ✅ ' + today();
+      else if (c === '-') x += ' ❌ ' + today();
+      return x;
+    };
     await this.app.vault.process(t.file, (data) => {
       const lines = data.split('\n');
-      const l = lines[t.line];
-      if (l != null && /\[ \]/.test(l)) {
-        lines[t.line] = l.replace('[ ]', '[x]') + (/✅/.test(l) ? '' : ' ✅ ' + today());
-        // 大点完成 = 下面没勾的小步骤一起完成
+      let ln = t.line;
+      if (lines[ln] !== t.raw && t.raw) { const j = lines.indexOf(t.raw); if (j >= 0) ln = j; }
+      const l = lines[ln];
+      if (l == null || !/^\s*[-*+]\s*\[.\]/.test(l)) return data;
+      lines[ln] = mark(l, ch);
+      ok = true;
+      if (!TASK_OPEN(ch)) {
         const ind = indentWidth(l);
-        for (let k = t.line + 1; k < lines.length; k++) {
+        for (let k = ln + 1; k < lines.length; k++) {
           const x = lines[k];
           if (!x.trim()) break;
           if (indentWidth(x) <= ind) break;
-          if (/^\s*[-*+]\s*\[ \]/.test(x)) { lines[k] = x.replace('[ ]', '[x]'); subs++; }
+          const m = x.match(/^\s*[-*+]\s*\[(.)\]/);
+          if (m && TASK_OPEN(m[1])) { lines[k] = mark(x, ch); subs++; }
         }
       }
       return lines.join('\n');
     });
-    new Notice('✅ 已完成：' + t.text.slice(0, 30) + (subs ? '（连同 ' + subs + ' 个小步骤）' : ''));
+    if (!ok) { new Notice('原笔记里找不到这条待办了'); return; }
+    const lab = taskStateOf(ch).label;
+    new Notice((ch === 'x' ? '✅ ' : '') + (ch === ' ' ? '已恢复为待办：' : lab + '：') + trunc(t.text, 30) + (subs ? '（连同 ' + subs + ' 个小步骤）' : ''));
+    this.refreshViews();
+  }
+  /* 推迟：改 📅 日期 */
+  async postponeTask(t, days) {
+    const d = fmtDate(addDays(t.due && parseDate(t.due) && daysUntil(t.due) >= 0 ? parseDate(t.due) : new Date(), days));
+    await this.app.vault.process(t.file, (data) => {
+      const lines = data.split('\n');
+      let ln = t.line;
+      if (lines[ln] !== t.raw && t.raw) { const j = lines.indexOf(t.raw); if (j >= 0) ln = j; }
+      const l = lines[ln];
+      if (l == null) return data;
+      lines[ln] = /📅\s*\d{4}-\d{2}-\d{2}/.test(l) ? l.replace(/📅\s*\d{4}-\d{2}-\d{2}/, '📅 ' + d) : l.replace(/\s*$/, '') + ' 📅 ' + d;
+      return lines.join('\n');
+    });
+    new Notice('已推迟到 ' + d + '：' + trunc(t.text, 30));
+    this.refreshViews();
   }
   /* 在一条待办下面加小步骤（加在它已有的小步骤 / 备注之后） */
   async addSubtask(t, text) {
