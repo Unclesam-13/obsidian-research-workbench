@@ -1742,6 +1742,7 @@ class WorkbenchView extends ItemView {
     m.addItem((i) => i.setTitle('预览').setIcon('eye').onClick(() => this.plugin.previewNotes([n], n)));
     m.addItem((i) => i.setTitle('移动到文件夹…（可跨项目）').setIcon('folder-input').onClick(() => this.plugin.pickFolder(n.projectName || '', { title: '把「' + n.title + '」移动到…' }, (dest) => this.plugin.moveFileTo(n.file, dest))));
     m.addItem((i) => i.setTitle('附件（' + this.plugin.attachmentsOf(n).length + '）…').setIcon('paperclip').onClick(() => new AttachModal(this.app, this.plugin, n.file, () => this.render()).open()));
+    if (n.type === 'draft') m.addItem((i) => i.setTitle('在写作工作台打开（左写右 AI）').setIcon('pen-tool').onClick(() => this.plugin.openWriteStudio(n.file)));
     if (n.type === 'meeting' && this.plugin.attachmentsOf(n).length) m.addItem((i) => i.setTitle('重新生成材料区（录音 / 附件）').setIcon('refresh-cw').onClick(async () => { try { await this.plugin.writeMeetingMaterials(n.file); new Notice('已更新材料区'); } catch (e) { console.error(e); new Notice('更新失败：' + (e.message || e)); } }));
     if (n.type === 'idea') {
       m.addItem((i) => i.setTitle('转为科研项目').setIcon('rocket').onClick(() => this.plugin.ideaToProject(n)));
@@ -1839,7 +1840,10 @@ class WorkbenchView extends ItemView {
     }
     const inferredList = this.index.notes.filter((n) => ofType(n) && n.inferred);
     if (inferredList.length) this.btn(right, '补全属性（' + inferredList.length + '）', 'wand', () => this.plugin.fillProps(inferredList), 'rw-btn-warn');
-    if (type === 'draft') this.btn(right, '引用文献写作', 'quote', () => this.plugin.litWriteModal({ project: curProject }), '');
+    if (type === 'draft') {
+      this.btn(right, '自己写（写作工作台）', 'pen-tool', () => this.plugin.pickWritingNote({ project: curProject }), 'mod-cta');
+      this.btn(right, 'AI 文献综合', 'quote', () => this.plugin.litWriteModal({ project: curProject }), '');
+    }
     if (type === 'experiment') {
       this.btn(right, '新建数据分析', 'bar-chart-3', () => this.plugin.newNoteModal({ type: 'data', project: curProject }));
       this.btn(right, '新建实验记录', 'plus', () => this.plugin.newNoteModal({ type, project: curProject }), 'mod-cta');
@@ -5776,6 +5780,240 @@ class LitWriteModal extends Modal {
   onClose() { clear(this.contentEl); }
 }
 
+/* ═════════ 写作工作台：左边自己写（Obsidian 编辑器），右边 AI 对话 + 文献 + 引用 ═════════ */
+const CITE_RE = /\[\[([^\]|]+)\|\[(\d+)\]\]\]/g;
+class CitePickModal extends obsidian.FuzzySuggestModal {
+  constructor(app, plugin, onPick) { super(app); this.plugin = plugin; this.onPick = onPick; this.setPlaceholder('搜文献标题 / 作者 / 年份，回车插入引用'); }
+  getItems() { return this.plugin.buildIndex().notes.filter((n) => n.type === 'literature'); }
+  getItemText(n) { const m = this.plugin.lwMeta(n); return n.title + ' ' + m.authors + ' ' + m.year; }
+  renderSuggestion(it, el) { const n = it.item; const m = this.plugin.lwMeta(n); el.createDiv({ text: n.title }); el.createDiv({ cls: 'rw-muted', text: [m.short, m.year, n.projectName].filter(Boolean).join(' · ') }).style.fontSize = '12px'; }
+  onChooseItem(n) { this.onPick(n); }
+}
+/* 在编辑器里输入「[@」弹出文献，回车插入引用 */
+class CiteSuggest extends obsidian.EditorSuggest {
+  constructor(app, plugin) { super(app); this.plugin = plugin; }
+  onTrigger(cursor, editor) {
+    const line = editor.getLine(cursor.line).slice(0, cursor.ch);
+    const m = line.match(/\[@([^\]\n]{0,40})$/);
+    if (!m) return null;
+    return { start: { line: cursor.line, ch: cursor.ch - m[0].length }, end: cursor, query: m[1] };
+  }
+  getSuggestions(ctx) {
+    const q = String(ctx.query || '').toLowerCase().trim();
+    const pl = this.plugin;
+    let list = pl.buildIndex().notes.filter((n) => n.type === 'literature');
+    if (q) list = list.filter((n) => { const m = pl.lwMeta(n); return (n.title + ' ' + m.authors + ' ' + m.year).toLowerCase().includes(q); });
+    return list.slice(0, 30);
+  }
+  renderSuggestion(n, el) { const m = this.plugin.lwMeta(n); el.createDiv({ text: n.title }); const s = el.createDiv({ cls: 'rw-muted', text: [m.short, m.year, n.projectName].filter(Boolean).join(' · ') }); s.style.fontSize = '12px'; }
+  selectSuggestion(n) {
+    const ctx = this.context; if (!ctx) return;
+    // 编辑器自动补的「]」一起去掉
+    let end = ctx.end;
+    const after = ctx.editor.getLine(end.line).charAt(end.ch);
+    if (after === ']') end = { line: end.line, ch: end.ch + 1 };
+    ctx.editor.replaceRange('', ctx.start, end);
+    ctx.editor.setCursor(ctx.start);
+    this.plugin.citeInsert(ctx.editor, n);
+  }
+}
+/* 选几篇文献（加进 AI 的上下文） */
+class LitPickModal extends Modal {
+  constructor(app, plugin, selected, onDone) { super(app); this.plugin = plugin; this.sel = new Set(selected || []); this.onDone = onDone; this.q = ''; this.project = ''; }
+  onOpen() { this.modalEl.classList.add('rw-litpick-modal'); this.titleEl.setText('选文献放进 AI 对话'); this.draw(); }
+  draw() {
+    const c = this.contentEl; clear(c);
+    const pl = this.plugin, idx = pl.buildIndex();
+    const bar = h(c, 'div', { cls: 'rw-lw-filter' });
+    const ps = h(bar, 'select', { cls: 'dropdown rw-select rw-select-sm' });
+    const ao = (v, t) => { const o = h(ps, 'option', { text: t }); o.value = v; };
+    ao('', '全部项目'); for (const p of idx.projects) ao(p.name, p.title);
+    ps.value = this.project; ps.addEventListener('change', () => { this.project = ps.value; this.draw(); });
+    const qi = h(bar, 'input', { cls: 'rw-filter-input', attr: { type: 'search', placeholder: '搜标题 / 作者…' } }); qi.value = this.q;
+    qi.addEventListener('input', () => { this.q = qi.value; clearTimeout(this._t); this._t = setTimeout(() => { this.draw(); const q2 = this.contentEl.querySelector('input[type=search]'); if (q2) { q2.focus(); q2.setSelectionRange(q2.value.length, q2.value.length); } }, 250); });
+    let list = idx.notes.filter((n) => n.type === 'literature');
+    if (this.project) list = list.filter((n) => n.projectName === this.project || this.sel.has(n.file.path));
+    if (this.q) { const q = this.q.toLowerCase(); list = list.filter((n) => (n.title + ' ' + pl.lwMeta(n).authors).toLowerCase().includes(q) || this.sel.has(n.file.path)); }
+    list.sort((a, b) => (this.sel.has(b.file.path) ? 1 : 0) - (this.sel.has(a.file.path) ? 1 : 0) || (Number(str(b.fm.year)) || 0) - (Number(str(a.fm.year)) || 0));
+    const box = h(c, 'div', { cls: 'rw-lw-list' });
+    for (const n of list.slice(0, 300)) {
+      const r = h(box, 'label', { cls: 'rw-lw-row' + (this.sel.has(n.file.path) ? ' is-sel' : '') });
+      const cb = h(r, 'input', { attr: { type: 'checkbox' } }); cb.checked = this.sel.has(n.file.path);
+      cb.addEventListener('change', () => { if (cb.checked) this.sel.add(n.file.path); else this.sel.delete(n.file.path); r.classList.toggle('is-sel', cb.checked); cnt.textContent = '已选 ' + this.sel.size + ' 篇'; });
+      const t = h(r, 'div', { cls: 'rw-lw-rtext' }); h(t, 'div', { cls: 'rw-lw-rtitle', text: n.title });
+      const m = pl.lwMeta(n); h(t, 'div', { cls: 'rw-muted rw-lw-rmeta', text: [m.year, trunc(m.authors, 40), n.projectName].filter(Boolean).join(' · ') });
+    }
+    const foot = h(c, 'div', { cls: 'rw-lw-foot' });
+    const cnt = h(foot, 'div', { cls: 'rw-muted rw-lw-where', text: '已选 ' + this.sel.size + ' 篇' });
+    const ok = h(foot, 'button', { cls: 'rw-btn mod-cta' }); ic(ok, 'check'); h(ok, 'span', { text: '确定' });
+    ok.addEventListener('click', () => { this.onDone([...this.sel]); this.close(); });
+  }
+  onClose() { clear(this.contentEl); }
+}
+
+const WA_SYSTEM = '你是用户的论文写作助手。用户自己写正文，你负责讨论、出主意、检查和润色建议。默认不要替用户整段代写，除非用户明确要求写某一段。回答要具体、简洁，用 Markdown。引用文献时只能用材料里给出的编号 [n]，不得编造文献、数据或结论；材料里没有的就说没有。';
+const WA_QUICK = [
+  ['检查逻辑', '看看我目前写的内容：论证链条哪里不连贯、哪里跳步、哪里需要补证据？逐条指出位置并给修改建议（不要重写全文）。'],
+  ['哪些论断缺引用', '找出我写的内容里需要文献支撑却还没有引用的句子，逐条列出，并从给你的文献里推荐可以引用的编号 [n]；没有合适的就说明。'],
+  ['这段怎么改', '针对我选中的这段，给出 2 个更清楚、更学术的改写版本，并说明改了什么。'],
+  ['下一段写什么', '根据我已经写的内容和这些文献，给出下一段的提纲（3–5 个要点，每点注明可引用的 [n]），不要直接写成段落。'],
+  ['对比这几篇', '对比给你的这几篇文献：问题、方法、数据、结论、局限各有什么异同？用表格，带 [n]。'],
+];
+class WriteAssistView extends ItemView {
+  constructor(leaf, plugin) { super(leaf); this.plugin = plugin; this.file = null; this.busy = false; }
+  getViewType() { return WRITE_ASSIST_VIEW; }
+  getDisplayText() { return '写作助手'; }
+  getIcon() { return 'pen-tool'; }
+  async onOpen() {
+    this.contentEl.addClass('rw-wa');
+    this.registerEvent(this.app.workspace.on('active-leaf-change', (leaf) => {
+      if (!leaf || leaf === this.leaf) return;
+      const v = leaf.view;
+      if (v && v.getViewType && v.getViewType() === 'markdown' && v.file && v.file !== this.file) { this.targetLeaf = leaf; this.setFile(v.file); }
+      else if (v && v.getViewType && v.getViewType() === 'markdown') this.targetLeaf = leaf;
+    }));
+    const af = this.app.workspace.getActiveFile();
+    if (!this.file && af && af.extension === 'md') this.setFile(af);
+    this.draw();
+  }
+  async setState(state, result) { if (state && state.path) { const f = this.app.vault.getAbstractFileByPath(state.path); if (f instanceof TFile) this.setFile(f); } return super.setState(state, result); }
+  getState() { return Object.assign(super.getState(), { path: this.file ? this.file.path : '' }); }
+  setFile(f) { this.file = f; this.draw(); }
+  editor() {
+    const leaves = this.app.workspace.getLeavesOfType('markdown');
+    let l = this.targetLeaf && leaves.includes(this.targetLeaf) && this.targetLeaf.view.file === this.file ? this.targetLeaf : leaves.find((x) => x.view.file === this.file);
+    if (l) this.targetLeaf = l;
+    return l && l.view && l.view.editor ? l.view.editor : null;
+  }
+  state() {
+    const pl = this.plugin, key = this.file ? this.file.path : '';
+    pl._wa = pl._wa || new Map();
+    if (!pl._wa.has(key)) {
+      // 默认把这篇已经引用 / references 里的文献放进来
+      const sel = [];
+      if (this.file) {
+        const fm = (this.app.metadataCache.getFileCache(this.file) || {}).frontmatter || {};
+        const refs = Array.isArray(fm.references) ? fm.references : [];
+        for (const r of refs) { const m = String(r).match(/\[\[([^\]|]+)/); if (m) { const f = this.app.metadataCache.getFirstLinkpathDest(m[1], this.file.path); if (f) sel.push(f.path); } }
+      }
+      pl._wa.set(key, { papers: sel, msgs: [], useDoc: true, useSel: true });
+    }
+    return pl._wa.get(key);
+  }
+  papers() { const idx = this.plugin.buildIndex(); return this.state().papers.map((p) => idx.notes.find((n) => n.file.path === p)).filter(Boolean); }
+  draw() {
+    const c = this.contentEl; clear(c);
+    const pl = this.plugin;
+    const head = h(c, 'div', { cls: 'rw-wa-head' });
+    ic(head, 'pen-tool');
+    const ht = h(head, 'div', { cls: 'rw-wa-htext' });
+    h(ht, 'b', { text: this.file ? this.file.basename : '先在左边打开一篇写作笔记' });
+    h(ht, 'div', { cls: 'rw-muted', text: '左边自己写 · 这里和 AI 讨论 · 输入「[@」插入引用' });
+    if (!this.file) return;
+    const st = this.state();
+    // 文献
+    const ps = h(c, 'div', { cls: 'rw-wa-papers' });
+    const ph = h(ps, 'div', { cls: 'rw-wa-sech' }); ic(ph, 'library'); h(ph, 'span', { text: '放进 AI 的文献（' + st.papers.length + '）' });
+    const add = h(ph, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(add, 'plus'); h(add, 'span', { text: '选文献' });
+    add.addEventListener('click', () => new LitPickModal(this.app, pl, st.papers, (sel) => { st.papers = sel; this.draw(); }).open());
+    const list = h(ps, 'div', { cls: 'rw-wa-plist' });
+    const papers = this.papers();
+    if (!papers.length) h(list, 'div', { cls: 'rw-muted rw-wa-empty', text: '还没选文献。选几篇后，AI 回答会基于它们并用 [1][2] 标出处；点每篇的「引用」插入到你正在写的位置。' });
+    papers.forEach((n, i) => {
+      const r = h(list, 'div', { cls: 'rw-wa-paper' });
+      h(r, 'span', { cls: 'rw-wa-pn', text: String(i + 1) });
+      const m = pl.lwMeta(n);
+      const t = h(r, 'div', { cls: 'rw-wa-ptext', title: n.title });
+      h(t, 'div', { cls: 'rw-wa-ptitle', text: n.title });
+      h(t, 'div', { cls: 'rw-muted', text: [m.short, m.year].filter(Boolean).join(' · ') });
+      const cb = h(r, 'button', { cls: 'rw-btn rw-btn-sm', title: '在左边光标处插入引用' }); ic(cb, 'quote'); h(cb, 'span', { text: '引用' });
+      cb.addEventListener('click', () => { const ed = this.editor(); if (!ed) return new Notice('左边没有打开这篇笔记'); pl.citeInsert(ed, n); });
+      const ob = h(r, 'button', { cls: 'rw-iconbtn', title: '打开文献' }); ic(ob, 'external-link'); ob.addEventListener('click', () => { const c2 = pl.paperOf(n.file); if (c2) pl.openPaperReader(c2); else pl.openFile(n.file); });
+      const xb = h(r, 'button', { cls: 'rw-iconbtn', title: '从 AI 上下文里拿掉' }); ic(xb, 'x'); xb.addEventListener('click', () => { st.papers = st.papers.filter((p) => p !== n.file.path); this.draw(); });
+    });
+    const tools = h(ps, 'div', { cls: 'rw-wa-tools' });
+    const t1 = h(tools, 'button', { cls: 'rw-linkbtn', text: '插入引用（搜全部文献）' }); t1.addEventListener('click', () => { const ed = this.editor(); if (!ed) return new Notice('左边没有打开这篇笔记'); new CitePickModal(this.app, pl, (n) => { pl.citeInsert(ed, n); if (!st.papers.includes(n.file.path)) { st.papers.push(n.file.path); this.draw(); } }).open(); });
+    const t2 = h(tools, 'button', { cls: 'rw-linkbtn', text: '整理编号 + 更新参考文献' }); t2.addEventListener('click', () => { const ed = this.editor(); if (!ed) return new Notice('左边没有打开这篇笔记'); pl.citeRenumber(ed); });
+    const t3 = h(tools, 'button', { cls: 'rw-linkbtn', text: '把文中引用的都加进来' }); t3.addEventListener('click', () => { const ed = this.editor(); const txt = ed ? ed.getValue() : ''; const got = pl.citedPapers(txt, this.file); let k = 0; for (const n of got) if (!st.papers.includes(n.file.path)) { st.papers.push(n.file.path); k++; } new Notice(k ? '加进来 ' + k + ' 篇' : '文中引用的都已经在里面了'); this.draw(); });
+    // 对话
+    const chat = h(c, 'div', { cls: 'rw-wa-chat' });
+    if (!st.msgs.length) {
+      const tip = h(chat, 'div', { cls: 'rw-wa-tip' });
+      h(tip, 'div', { text: '可以问：这段论证够不够？这里该引用哪篇？这两篇的结论矛盾吗？下一段写什么？' });
+      h(tip, 'div', { cls: 'rw-muted', text: 'AI 会看到：你选的文献 +（可选）你正在写的全文 / 选中的段落。它默认给建议，不替你写。' });
+    }
+    for (const m of st.msgs) {
+      const b = h(chat, 'div', { cls: 'rw-wa-msg is-' + m.role });
+      if (m.role === 'user') { h(b, 'div', { cls: 'rw-wa-utext', text: m.show || m.content }); continue; }
+      const body = h(b, 'div', { cls: 'rw-md rw-wa-atext' });
+      renderAiMarkdown(this.app, m.content, body, this);
+      const ab = h(b, 'div', { cls: 'rw-wa-macts' });
+      const cp = h(ab, 'button', { cls: 'rw-linkbtn', text: '复制' }); cp.addEventListener('click', () => { navigator.clipboard.writeText(m.content); new Notice('已复制'); });
+      const ins = h(ab, 'button', { cls: 'rw-linkbtn', text: '插入到光标处' }); ins.addEventListener('click', () => this.insertReply(m.content, m.papers));
+    }
+    if (this.busy) h(chat, 'div', { cls: 'rw-wa-msg is-assistant rw-wa-busy', text: 'AI 思考中…' });
+    setTimeout(() => { chat.scrollTop = chat.scrollHeight; }, 20);
+    // 输入
+    const inp = h(c, 'div', { cls: 'rw-wa-input' });
+    const qk = h(inp, 'div', { cls: 'rw-wa-quick' });
+    for (const [lab, prompt] of WA_QUICK) { const b = h(qk, 'button', { cls: 'rw-catchip', text: lab }); b.addEventListener('click', () => this.send(prompt, lab)); }
+    const opt = h(inp, 'div', { cls: 'rw-wa-opts' });
+    const o1 = h(opt, 'label', { cls: 'rw-check' }); const c1 = h(o1, 'input', { attr: { type: 'checkbox' } }); c1.checked = st.useDoc; h(o1, 'span', { text: '带上我写的全文' }); c1.addEventListener('change', () => { st.useDoc = c1.checked; });
+    const o2 = h(opt, 'label', { cls: 'rw-check' }); const c2 = h(o2, 'input', { attr: { type: 'checkbox' } }); c2.checked = st.useSel; h(o2, 'span', { text: '带上选中的段落' }); c2.addEventListener('change', () => { st.useSel = c2.checked; });
+    if (st.msgs.length) { const cl = h(opt, 'button', { cls: 'rw-linkbtn', text: '清空对话' }); cl.addEventListener('click', () => { st.msgs = []; this.draw(); }); }
+    const row = h(inp, 'div', { cls: 'rw-wa-row' });
+    const ta = h(row, 'textarea', { attr: { rows: '3', placeholder: '问 AI…（Enter 发送，Shift+Enter 换行）' } });
+    ta.value = this._draft || ''; ta.addEventListener('input', () => { this._draft = ta.value; });
+    ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); const v = ta.value.trim(); if (v) { this._draft = ''; this.send(v); } } });
+    const sb = h(row, 'button', { cls: 'rw-btn mod-cta' }); ic(sb, 'send'); sb.disabled = this.busy;
+    sb.addEventListener('click', () => { const v = ta.value.trim(); if (v) { this._draft = ''; this.send(v); } });
+  }
+  async send(text, label) {
+    const pl = this.plugin;
+    if (this.busy) return;
+    if (!pl.directAiReady()) return new Notice('先在 设置 → 科研工作台 → AI 填接口地址和密钥');
+    const st = this.state();
+    const ed = this.editor();
+    const doc = ed ? ed.getValue() : (this.file ? await this.app.vault.cachedRead(this.file) : '');
+    const selText = ed ? ed.getSelection() : '';
+    if (label === '这段怎么改' && !selText) return new Notice('先在左边选中一段');
+    this.busy = true;
+    const papers = this.papers();
+    st.msgs.push({ role: 'user', content: text, show: label ? '【' + label + '】' + (selText && st.useSel ? '（含选中段落）' : '') : text });
+    this.draw();
+    try {
+      await pl.pgLoad();
+      const mats = [];
+      for (let i = 0; i < papers.length; i++) mats.push(await pl.lwMaterial(papers[i], i + 1, 'fast', text));
+      let ctx = '';
+      if (mats.length) { let budget = 60000; ctx += '【文献材料（编号即引用编号）】\n' + mats.map((m) => { const s2 = m.slice(0, Math.max(1200, Math.floor(budget / mats.length))); return s2; }).join('\n\n---\n\n') + '\n\n'; }
+      else ctx += '【没有选文献】回答里不要出现 [n] 引用。\n\n';
+      if (st.useDoc && doc) ctx += '【我正在写的全文】\n' + doc.replace(/^---\n[\s\S]*?\n---\n?/, '').replace(CITE_RE, (m0, path, k) => '[' + this.ctxNum(path, papers) + ']').slice(0, 30000) + '\n\n';
+      if (st.useSel && selText) ctx += '【我选中的段落】\n' + selText.replace(CITE_RE, (m0, path, k) => '[' + this.ctxNum(path, papers) + ']') + '\n\n';
+      const history = st.msgs.slice(0, -1).slice(-8).map((m) => ({ role: m.role, content: m.content }));
+      const messages = [{ role: 'system', content: WA_SYSTEM }].concat(history, [{ role: 'user', content: ctx + '【我的问题】\n' + text }]);
+      const out = await pl.directChat(messages);
+      st.msgs.push({ role: 'assistant', content: out, papers: papers.map((n) => n.file.path) });
+    } catch (e) {
+      st.msgs.push({ role: 'assistant', content: '⚠️ ' + (e.message || e) });
+    } finally { this.busy = false; this.draw(); }
+  }
+  // 文中已有的引用链接 → AI 上下文里的编号（没放进来的显示为 ?）
+  ctxNum(path, papers) { const i = papers.findIndex((n) => n.file.path.replace(/\.md$/, '') === path.replace(/\.md$/, '') || n.file.basename === path.split('/').pop()); return i >= 0 ? i + 1 : '?'; }
+  insertReply(text, paperPaths) {
+    const ed = this.editor(); if (!ed) return new Notice('左边没有打开这篇笔记');
+    const idx = this.plugin.buildIndex();
+    const papers = (paperPaths || []).map((p) => idx.notes.find((n) => n.file.path === p)).filter(Boolean);
+    // 把 AI 回答里的 [n] 换成这篇文章的真实引用
+    let out = String(text);
+    const used = new Map();
+    out = out.replace(/\[(\d{1,2})\]/g, (m0, k) => { const n = papers[Number(k) - 1]; if (!n) return m0; if (!used.has(n.file.path)) used.set(n.file.path, this.plugin.citeLink(ed.getValue() + '\n' + [...used.values()].join(' '), n)); return used.get(n.file.path); });
+    ed.replaceSelection(out);
+    new Notice('已插入' + (used.size ? '，带 ' + used.size + ' 处引用' : ''));
+  }
+  async onClose() { clear(this.contentEl); }
+}
+
 class TextPromptModal extends Modal {
   constructor(app, title, value, onSubmit) { super(app); this.t = title; this.value = value || ''; this.onSubmit = onSubmit; }
   onOpen() {
@@ -7544,6 +7782,7 @@ function excerptToMd(x) {
 
 /* ───────────────────────── 文献阅读：PDF（中）+ Mindflow 式 AI 问答树（右） ───────────────────────── */
 const PAPER_READER_VIEW = 'research-workbench-paper';
+const WRITE_ASSIST_VIEW = 'research-workbench-write-assist';
 const MF_PRESETS = ['详细解释这段', '举个例子说明', '这段在论文里起什么作用？', '有哪些前提或假设？'];
 /* 文献阅读右侧 AI 问答的提示词（设置里可改；{title} = 论文标题） */
 const RD_SYS_PROMPT = '你是论文阅读助手，正在陪用户精读论文《{title}》。回答要基于论文内容，用简体中文，条理清楚；引用论文时注明页码（正文里有 [第 N 页] 标记）；公式用 LaTeX（行内 $…$，独立 $$…$$）。论文里没有的内容要说明是你的补充。';
@@ -18164,6 +18403,12 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     this.addCommand({ id: 'write-agent-guide', name: '生成 / 更新 CLAUDE.md 与 AGENTS.md', callback: () => this.writeAgentGuide() });
     this.registerView(READER_VIEW, (leaf) => new ReaderView(leaf, this));
     this.registerView(PAPER_READER_VIEW, (leaf) => new PaperReaderView(leaf, this));
+    this.registerView(WRITE_ASSIST_VIEW, (leaf) => new WriteAssistView(leaf, this));
+    this.addCommand({ id: 'open-write-studio', name: '写作工作台：打开（左边写，右边 AI + 文献）', callback: () => this.pickWritingNote({ project: this.currentProjectName() }) });
+    this.addCommand({ id: 'open-write-assist', name: '写作工作台：在右边打开 AI 助手（当前笔记）', callback: () => this.openWriteAssist(this.app.workspace.getActiveFile()) });
+    this.addCommand({ id: 'insert-citation', name: '写作：插入文献引用', editorCallback: (editor, view) => new CitePickModal(this.app, this, (n) => this.citeInsert(editor, n)).open() });
+    this.addCommand({ id: 'update-references', name: '写作：整理引用编号并更新参考文献', editorCallback: (editor) => this.citeRenumber(editor) });
+    if (obsidian.EditorSuggest) this.registerEditorSuggest(new CiteSuggest(this.app, this));
     this.setupMindflow();
     this.setupLife();
     this.addCommand({ id: 'open-life', name: '打开生活面板', callback: () => this.openLife() });
@@ -18475,6 +18720,95 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       add(fmtDate(new Date(x.mtime || x.file.stat.mtime)), Object.assign({ what: '修改文件' }, it));
     }
     return map;
+  }
+
+  /* ---------- 写作工作台 ---------- */
+  pickWritingNote(o) {
+    o = o || {};
+    const idx = this.buildIndex();
+    const notes = idx.notes.filter((n) => n.type === 'draft').sort((a, b) => b.file.stat.mtime - a.file.stat.mtime);
+    const self = this;
+    class M extends obsidian.FuzzySuggestModal {
+      getItems() { return [{ isNew: true }].concat(notes); }
+      getItemText(n) { return n.isNew ? '＋ 新建一篇写作笔记' : n.title + ' ' + (n.projectName || ''); }
+      renderSuggestion(it, el) { const n = it.item; if (n.isNew) { el.createDiv({ text: '＋ 新建一篇写作笔记' }); return; } el.createDiv({ text: n.title }); const s2 = el.createDiv({ cls: 'rw-muted', text: [n.projectName, n.status, relTime(n.file.stat.mtime)].filter(Boolean).join(' · ') }); s2.style.fontSize = '12px'; }
+      onChooseItem(n) {
+        if (n.isNew) {
+          new TextPromptModal(self.app, '新写作笔记的标题（例如：引言 / 相关工作 / 第 3 章）', '', async (v) => { if (!v) return; const f = await self.createNote({ type: 'draft', title: v, project: o.project || '', silent: true }); self.openWriteStudio(f); }).open();
+        } else self.openWriteStudio(n.file);
+      }
+    }
+    const m = new M(this.app); m.setPlaceholder('选一篇写作笔记打开（或新建）'); m.open();
+  }
+  async openWriteStudio(file) {
+    if (!file) return;
+    const ws = this.app.workspace;
+    let leaf = ws.getLeavesOfType('markdown').find((l) => l.view.file === file);
+    if (!leaf) { leaf = ws.getLeaf('tab'); await leaf.openFile(file, { state: { mode: 'source' } }); }
+    ws.setActiveLeaf(leaf, { focus: true });
+    await this.openWriteAssist(file, leaf);
+  }
+  async openWriteAssist(file, srcLeaf) {
+    const ws = this.app.workspace;
+    let leaf = ws.getLeavesOfType(WRITE_ASSIST_VIEW)[0];
+    if (!leaf) {
+      if (IS_MOBILE || !srcLeaf) leaf = ws.getRightLeaf(false);
+      else leaf = ws.createLeafBySplit(srcLeaf, 'vertical');
+      await leaf.setViewState({ type: WRITE_ASSIST_VIEW, active: false, state: { path: file ? file.path : '' } });
+    }
+    const v = leaf.view;
+    if (v && file) { v.targetLeaf = srcLeaf || v.targetLeaf; v.setFile(file); }
+    ws.revealLeaf(leaf);
+    if (srcLeaf) ws.setActiveLeaf(srcLeaf, { focus: true });
+  }
+  /* 文中已引用的文献（按第一次出现的顺序） */
+  citedPapers(text, file) {
+    const out = [], seen = new Set();
+    const idx = this.buildIndex();
+    let m; CITE_RE.lastIndex = 0;
+    while ((m = CITE_RE.exec(text))) {
+      const f = this.app.metadataCache.getFirstLinkpathDest(m[1], file ? file.path : '');
+      if (!f || seen.has(f.path)) continue;
+      seen.add(f.path);
+      const n = idx.notes.find((x) => x.file.path === f.path);
+      if (n) out.push(n);
+    }
+    return out;
+  }
+  /* 引用某篇：已经引用过就用它的编号，否则用下一个编号 */
+  citeLink(text, n) {
+    const lp = n.file.path.replace(/\.md$/, '');
+    let max = 0, mine = 0, m;
+    CITE_RE.lastIndex = 0;
+    while ((m = CITE_RE.exec(text))) {
+      const k = Number(m[2]); if (k > max) max = k;
+      const f = this.app.metadataCache.getFirstLinkpathDest(m[1], '');
+      if (!mine && (m[1] === lp || (f && f.path === n.file.path))) mine = k;
+    }
+    return '[[' + lp + '|[' + (mine || max + 1) + ']]]';
+  }
+  citeInsert(editor, n) {
+    const link = this.citeLink(editor.getValue(), n);
+    editor.replaceSelection(link);
+    new Notice('已引用：' + trunc(n.title, 30));
+  }
+  /* 按第一次出现重新编号，并重写文末「## 参考文献」 */
+  citeRenumber(editor) {
+    let text = editor.getValue();
+    const file = this.app.workspace.getActiveFile();
+    const body = text.replace(/\n## 参考文献\n[\s\S]*$/, '');
+    const order = [];
+    const keyOf2 = (p) => { const f = this.app.metadataCache.getFirstLinkpathDest(p, file ? file.path : ''); return f ? f.path : p; };
+    let m; CITE_RE.lastIndex = 0;
+    while ((m = CITE_RE.exec(body))) { const k = keyOf2(m[1]); if (!order.includes(k)) order.push(k); }
+    if (!order.length) return new Notice('文中还没有引用。输入「[@」或在右边点「引用」插入');
+    const nb = body.replace(CITE_RE, (m0, p) => '[[' + p + '|[' + (order.indexOf(keyOf2(p)) + 1) + ']]]');
+    const idx = this.buildIndex();
+    const refs = order.map((pth, i) => { const n = idx.notes.find((x) => x.file.path === pth); if (!n) return '[' + (i + 1) + '] [[' + pth.replace(/\.md$/, '') + ']]'; const mm = this.lwMeta(n); return '[' + (i + 1) + '] [[' + pth.replace(/\.md$/, '') + '|' + n.title.replace(/[|\]]/g, ' ') + ']]' + (mm.authors ? ' — ' + mm.authors : '') + (mm.year ? ' (' + mm.year + ')' : '') + (mm.venue ? ' · ' + mm.venue : ''); });
+    const cur = editor.getCursor();
+    editor.setValue(nb.replace(/\s*$/, '') + '\n\n## 参考文献\n' + refs.join('\n') + '\n');
+    try { editor.setCursor(cur); } catch (e) { /* ignore */ }
+    new Notice('已整理 ' + order.length + ' 篇引用的编号，并更新参考文献');
   }
 
   /* ---------- 引用文献写作 ---------- */
