@@ -4736,3 +4736,10 @@ input.rw-lw-extra { width: 100%; }
 .modal button.rw-task-stbtn.st-ignore.is-active { background: #868e96; border-color: #868e96; }
 .rw-nodate { margin-left: 10px; white-space: nowrap; }
 .rw-pin-more { margin: 4px 0 0 8px; }
+
+/* v0.25.2 生活：日历按项目筛选时右边只看这个项目 */
+.dh-only-banner { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 12px; margin-bottom: 10px; border-radius: 12px; background: var(--dh-accent-soft); border: 1px solid var(--dh-accent-line); font-weight: 600; }
+.dh-only-icon { display: inline-flex; color: var(--dh-accent); }
+.dh-only-icon svg { width: 16px; height: 16px; }
+.dh-only-banner .dh-btn { margin-left: auto; }
+.dh-only-empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 28px 12px; color: var(--text-muted); border: 1px dashed var(--dh-border); border-radius: 14px; }

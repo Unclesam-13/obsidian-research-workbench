@@ -15572,9 +15572,11 @@ class DailyHubView extends ItemView {
         this.selectDate(dates.at(-1));
       } else {
         this.renderCalendar();
+        this.renderDay();
       }
     } else {
       this.renderCalendar();
+      this.renderDay();
     }
     this.els.calendar?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
@@ -16427,12 +16429,14 @@ class DailyHubView extends ItemView {
     const el = this.els.day;
     if (!el) return;
     el.empty();
-    const files = this.filesByDate.get(this.selectedDate) || [];
     const recordPath = normalizePath(this.s.dateRecordFolder);
+    // 日历按项目筛选时：右边只显示这个项目当天的内容（不再显示日记框）
+    const only = this.calProject && normalizePath(this.calProject) !== recordPath ? normalizePath(this.calProject) : "";
+    const files = only ? this.filesFor(this.selectedDate) : this.filesByDate.get(this.selectedDate) || [];
     const groups = this.groupFiles(files);
     groups.delete(recordPath); // 日常记录单独以时间线展示
     const otherCount = [...groups.values()].reduce((n, g) => n + g.files.length, 0);
-    const sel = this.selectionFor(this.selectedDate, groups);
+    const sel = only ? new Set(groups.keys()) : this.selectionFor(this.selectedDate, groups);
     const d = parseKey(this.selectedDate);
 
     const head = el.createDiv({ cls: "dh-day-head" });
@@ -16440,7 +16444,7 @@ class DailyHubView extends ItemView {
     h.createEl("h2", { text: `${d.getMonth() + 1} 月 ${d.getDate()} 日` });
     h.createDiv({ cls: "dh-card-sub", text: `${WEEKDAY_FULL[d.getDay()]} · ${files.length} 篇笔记` });
     const right = head.createDiv({ cls: "dh-day-actions" });
-    const record = this.recordFileFor(this.selectedDate);
+    const record = only ? null : this.recordFileFor(this.selectedDate);
     if (record) {
       const ai = right.createEl("button", {
         cls: "dh-btn dh-btn-ai",
@@ -16452,6 +16456,30 @@ class DailyHubView extends ItemView {
       ai.addEventListener("click", () => this.runAi(record));
     }
     this.els.dayCount = right.createDiv({ cls: "dh-pill" });
+
+    if (only) {
+      const bn = el.createDiv({ cls: "dh-only-banner" });
+      setIcon(bn.createSpan({ cls: "dh-only-icon" }), "filter");
+      bn.createSpan({ text: `只看「${this.labelForFolder(only)}」` });
+      const clr = bn.createEl("button", { cls: "dh-btn", text: "显示这天全部内容" });
+      clr.addEventListener("click", () => this.showProjectTimeline(""));
+      this.els.journal = null;
+      this.els.filters = null;
+      this.els.notes = el.createDiv({ cls: "dh-notes" });
+      if (!otherCount) {
+        this.els.dayCount.setText("0");
+        const em = this.els.notes.createDiv({ cls: "dh-empty dh-only-empty" });
+        em.createDiv({ text: `「${this.labelForFolder(only)}」这一天没有内容` });
+        const dates = this.projectDates(only);
+        if (dates.length) {
+          const last = dates.filter((x) => x !== this.selectedDate).at(-1);
+          if (last) { const go = em.createEl("button", { cls: "dh-btn", text: `跳到最近一次：${last}` }); go.addEventListener("click", () => this.selectDate(last)); }
+        }
+        return;
+      }
+      this.renderNotes(groups, sel, otherCount);
+      return;
+    }
 
     this.els.journal = el.createEl("section", { cls: "dh-card dh-journal" });
     this.renderJournal();
