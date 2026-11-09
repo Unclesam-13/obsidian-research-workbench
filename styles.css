@@ -4651,3 +4651,26 @@ label.rw-att-row { cursor: pointer; }
 .rw-narrow .rw-meet .rw-meet-main { display: none; }
 .rw-narrow .rw-meet.is-detail .rw-meet-side { display: none; }
 .rw-narrow .rw-meet.is-detail .rw-meet-main { display: flex; padding: 12px; }
+
+/* ======== v0.24.5 待办：大点 + 小步骤 ======== */
+.rw-substeps { border: 1px solid var(--background-modifier-border); border-radius: 10px; padding: 10px 12px; margin: 8px 0 12px; background: var(--background-secondary); }
+.rw-substeps-head { display: flex; align-items: center; gap: 6px; font-weight: 600; margin-bottom: 6px; }
+.rw-substeps-head svg { width: 16px; height: 16px; }
+.rw-substeps-prog { font-weight: 400; font-size: 12px; margin-left: 4px; }
+.rw-substeps-list { display: flex; flex-direction: column; gap: 6px; }
+.rw-substep { display: flex; align-items: center; gap: 6px; }
+.rw-substep-n { flex: none; width: 20px; height: 20px; border-radius: 50%; background: var(--interactive-accent); color: var(--text-on-accent); font-size: 11px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
+.rw-substep.is-done .rw-substep-n { background: var(--background-modifier-border); color: var(--text-muted); }
+.rw-substep input.rw-substep-in { flex: 1; min-width: 0; }
+.rw-substep.is-done input.rw-substep-in { text-decoration: line-through; color: var(--text-muted); }
+.rw-substep-add { align-self: flex-start; margin-top: 2px; }
+.modal.rw-addtask-modal { width: min(560px, 94vw); }
+.rw-task.rw-task-sub { padding-left: calc(10px + var(--tdepth, 1) * 22px); position: relative; font-size: .95em; }
+.rw-task.rw-task-sub::before { content: ''; position: absolute; left: calc(var(--tdepth, 1) * 22px - 6px); top: 0; bottom: 50%; width: 10px; border-left: 1.5px solid var(--background-modifier-border); border-bottom: 1.5px solid var(--background-modifier-border); border-bottom-left-radius: 6px; }
+.rw-task.has-subs .rw-task-text { font-weight: 600; }
+.rw-task-prog { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--text-muted); flex: none; }
+.rw-task-progbar { width: 46px; height: 5px; border-radius: 3px; background: var(--background-modifier-border); overflow: hidden; display: inline-block; }
+.rw-task-progbar i { display: block; height: 100%; background: var(--rw-accent, var(--interactive-accent)); border-radius: 3px; }
+.rw-root button.rw-task-addsub { opacity: 0; transition: opacity .15s; flex: none; }
+.rw-task:hover button.rw-task-addsub, .rw-touch button.rw-task-addsub { opacity: .8; }
+.rw-task-orphan { margin-right: -2px; }

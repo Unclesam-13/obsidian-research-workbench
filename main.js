@@ -430,6 +430,7 @@ function projectOfPathIn(path, root) {
   if (!String(path).startsWith(pre)) return '';
   return String(path).slice(pre.length).split('/')[0] || '';
 }
+function indentWidth(l) { const m = String(l).match(/^[ \t]*/)[0]; let w = 0; for (const ch of m) w += ch === '\t' ? 4 : 1; return w; }
 function sanitize(name) { return String(name).replace(/[\\/:*?"<>|#^[\]]/g, '-').trim(); }
 function q(v) { return JSON.stringify(v == null ? '' : String(v)); }
 function hue(name) {
@@ -3154,20 +3155,49 @@ class WorkbenchView extends ItemView {
     const sub = { projects: [p], notes, byName: this.index.byName };
     this.plugin.collectTasks(sub).then((tasks) => {
       if (!tasks.length) { h(tsec.body, 'div', { cls: 'rw-empty-sm', text: '没有未完成的待办' }); return; }
-      tasks.sort((a, b) => (a.due || '9999').localeCompare(b.due || '9999'));
-      for (const t of tasks) this.taskRow(tsec.body, t);
+      this.taskTree(tsec.body, tasks);
     });
   }
 
-  taskRow(parent, t) {
-    const r = h(parent, 'div', { cls: 'rw-task' });
+  /* 待办列表：大点在上，小步骤缩进跟在下面 */
+  taskTree(parent, tasks) {
+    const key = (t) => t.file.path + '#' + t.line;
+    const byKey = new Map(tasks.map((t) => [key(t), t]));
+    const kids = new Map();
+    const tops = [];
+    for (const t of tasks) {
+      const pk = t.parentLine >= 0 ? t.file.path + '#' + t.parentLine : '';
+      if (pk && byKey.has(pk)) { if (!kids.has(pk)) kids.set(pk, []); kids.get(pk).push(t); }
+      else tops.push(t);
+    }
+    tops.sort((a, b) => (a.due || '9999').localeCompare(b.due || '9999'));
+    const walk = (t, depth) => {
+      this.taskRow(parent, t, depth);
+      for (const c of (kids.get(key(t)) || []).sort((a, b) => a.line - b.line)) walk(c, depth + 1);
+    };
+    for (const t of tops) walk(t, 0);
+  }
+
+  taskRow(parent, t, depth) {
+    const r = h(parent, 'div', { cls: 'rw-task' + (depth ? ' rw-task-sub' : '') + (t.subTotal ? ' has-subs' : '') });
+    if (depth) r.style.setProperty('--tdepth', depth);
     const cb = h(r, 'input', { attr: { type: 'checkbox' } });
     cb.addEventListener('click', async (e) => {
       e.stopPropagation();
       r.classList.add('is-done');
       await this.plugin.completeTask(t);
     });
+    if (depth && t.parentLine >= 0 && !t.parentOpen) h(r, 'span', { cls: 'rw-muted rw-task-orphan', text: '↳' });
     h(r, 'span', { cls: 'rw-task-text', text: t.text });
+    if (t.subTotal) {
+      const pg = h(r, 'span', { cls: 'rw-task-prog', title: '小步骤完成情况' });
+      const bar = h(pg, 'span', { cls: 'rw-task-progbar' }); h(bar, 'i').style.width = Math.round((t.subDone / t.subTotal) * 100) + '%';
+      h(pg, 'span', { text: t.subDone + '/' + t.subTotal });
+    }
+    if (!depth) {
+      const add = h(r, 'button', { cls: 'rw-iconbtn rw-task-addsub', title: '加一个小步骤' }); ic(add, 'list-plus');
+      add.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.promptText('给「' + trunc(t.text, 20) + '」加一个小步骤', '', async (v) => { if (String(v || '').trim()) await this.plugin.addSubtask(t, v); }); });
+    }
     if (t.due) h(r, 'span', { cls: 'rw-deadline ' + deadlineCls(t.due), text: t.due.slice(5) + (t.time ? ' ' + t.time : '') + ' · ' + deadlineText(t.due) });
     h(r, 'span', { cls: 'rw-task-src', text: t.file.basename });
     r.addEventListener('click', () => new TaskModal(this.app, this.plugin, t, () => this.render()).open());
@@ -3201,9 +3231,8 @@ class WorkbenchView extends ItemView {
         const gh = h(g, 'div', { cls: 'rw-task-group-head' });
         if (k.startsWith('（')) h(gh, 'span', { cls: 'rw-muted', text: k });
         else this.projectChip(gh, k);
-        h(gh, 'span', { cls: 'rw-col-count', text: items.length });
-        items.sort((a, b) => (a.due || '9999').localeCompare(b.due || '9999'));
-        for (const t of items) this.taskRow(g, t);
+        h(gh, 'span', { cls: 'rw-col-count', text: items.filter((t) => !(t.parentLine >= 0 && t.parentOpen)).length });
+        this.taskTree(g, items);
       }
     });
 
@@ -4541,6 +4570,21 @@ class TaskModal extends Modal {
     this.noteEnd = k;
     this.notePrefix = notes.length ? notes[0].match(/^\s*(?:[-*+]\s+)?/)[0] : this.indent + '    - ';
     this.v.notes = notes.map((l) => l.replace(/^\s*(?:[-*+]\s+)?/, '')).join('\n');
+    // 再往下、缩进更深的待办 = 小步骤（小步骤自己的备注 / 更深一层原样保留）
+    const baseW = indentWidth(raw);
+    const subs = [];
+    let subW = -1;
+    while (k < lines.length && lines[k].trim() && indentWidth(lines[k]) > baseW) {
+      const sm = lines[k].match(/^(\s*)[-*+]\s*\[(.)\]\s*(.*)$/);
+      const w = indentWidth(lines[k]);
+      if (sm && (subW < 0 || w <= subW)) { if (subW < 0) { subW = w; this.subIndent = sm[1]; } const da = sm[3].match(/\s*✅\s*(\d{4}-\d{2}-\d{2})/); subs.push({ text: sm[3].replace(/\s*✅\s*\d{4}-\d{2}-\d{2}/, '').trim(), done: sm[2] !== ' ', doneAt: da ? da[1] : '', extra: [] }); }
+      else if (subs.length) subs[subs.length - 1].extra.push(lines[k]);
+      else break;
+      k++;
+    }
+    this.subEnd = k;
+    if (!this.subIndent) this.subIndent = this.indent + '\t';
+    this.v.subs = subs;
     this.draw();
   }
   draw() {
@@ -4557,6 +4601,7 @@ class TaskModal extends Modal {
     dt.addText((t) => { t.inputEl.type = 'date'; t.setValue(v.date).onChange((x) => (v.date = x)); });
     dt.addText((t) => { t.inputEl.type = 'time'; t.setValue(v.time).onChange((x) => (v.time = x)); });
     dt.addExtraButton && dt.addExtraButton((b) => b.setIcon('x').setTooltip('清除日期和时间').onClick(() => { v.date = ''; v.time = ''; this.draw(); }));
+    subStepsEditor(c, v.subs, { showDone: true });
     h(c, 'div', { cls: 'rw-field-label', text: '备注' });
     const nt = h(c, 'textarea', { cls: 'rw-task-notes', attr: { rows: '4', placeholder: '补充说明、链接、进度…（每行一条，会写在待办下面）' } });
     nt.value = v.notes;
@@ -4581,7 +4626,15 @@ class TaskModal extends Modal {
     let line = this.indent + this.bullet + ' [' + (v.done ? 'x' : ' ') + '] ' + text + (v.date ? ' 📅 ' + v.date : '') + (v.time ? ' ⏰ ' + v.time : '');
     if (v.done) line += ' ✅ ' + (v.doneAt || today());
     const notes = String(v.notes || '').split('\n').map((x) => x.trim()).filter(Boolean).map((x) => this.notePrefix + x);
-    return [line].concat(notes);
+    const subs = [];
+    for (const sb of v.subs || []) {
+      const t = String(sb.text || '').replace(/\s+/g, ' ').trim();
+      if (!t) continue;
+      const done = sb.done || v.done;
+      subs.push(this.subIndent + '- [' + (done ? 'x' : ' ') + '] ' + t + (done && sb.doneAt ? ' ✅ ' + sb.doneAt : ''));
+      for (const x of sb.extra || []) subs.push(x);
+    }
+    return [line].concat(notes, subs);
   }
   async edit(fn) {
     let ok = false;
@@ -4589,7 +4642,7 @@ class TaskModal extends Modal {
       const lines = data.split('\n');
       let ln = this.ln;
       if (!/^\s*[-*+]\s*\[.\]/.test(lines[ln] || '')) return data;
-      const end = this.noteEnd + (ln - this.ln);
+      const end = (this.subEnd || this.noteEnd) + (ln - this.ln);
       const out = fn(lines, ln, end);
       ok = true;
       return out.join('\n');
@@ -4604,7 +4657,7 @@ class TaskModal extends Modal {
     if (this.onDone) setTimeout(() => this.onDone(), 150);
   }
   async remove() {
-    const ok0 = await this.plugin.confirmDelete({ title: '删除待办', lines: ['从「' + this.t.file.basename + '」里删掉这条待办' + (this.v.notes ? '和它的备注' : '') + '？', trunc(this.v.text, 80)], noTrashNote: true, confirmText: '删除' });
+    const ok0 = await this.plugin.confirmDelete({ title: '删除待办', lines: ['从「' + this.t.file.basename + '」里删掉这条待办' + (this.v.notes ? '和它的备注' : '') + ((this.v.subs || []).length ? '（连同 ' + this.v.subs.length + ' 个小步骤）' : '') + '？', trunc(this.v.text, 80)], noTrashNote: true, confirmText: '删除' });
     if (!ok0) return;
     await this.edit((lines, ln, end) => lines.slice(0, ln).concat(lines.slice(end)));
     new Notice('已删除待办');
@@ -5284,23 +5337,66 @@ class ThemeModal extends Modal {
   onClose() { clear(this.contentEl); }
 }
 
+/* 小步骤编辑器：一行一个，回车加下一行；items = [{ text, done, extra? }] */
+function subStepsEditor(c, items, opts) {
+  opts = opts || {};
+  const box = h(c, 'div', { cls: 'rw-substeps' });
+  const head = h(box, 'div', { cls: 'rw-substeps-head' });
+  ic(head, 'list-tree');
+  const ht = h(head, 'span', { text: '小步骤' });
+  const prog = h(head, 'span', { cls: 'rw-muted rw-substeps-prog' });
+  const list = h(box, 'div', { cls: 'rw-substeps-list' });
+  const upd = () => { const n = items.filter((x) => String(x.text || '').trim()).length, d = items.filter((x) => x.done && String(x.text || '').trim()).length; prog.textContent = n ? (opts.showDone ? d + ' / ' + n + ' 完成' : n + ' 步') : '（可选）把这件事拆成几步，一步步勾掉'; };
+  const draw = (focusIdx) => {
+    clear(list);
+    items.forEach((it, i) => {
+      const r = h(list, 'div', { cls: 'rw-substep' + (it.done ? ' is-done' : '') });
+      h(r, 'span', { cls: 'rw-substep-n', text: String(i + 1) });
+      if (opts.showDone) {
+        const cb = h(r, 'input', { attr: { type: 'checkbox', title: '完成这一步' } }); cb.checked = !!it.done;
+        cb.addEventListener('change', () => { it.done = cb.checked; r.classList.toggle('is-done', it.done); upd(); if (opts.onChange) opts.onChange(); });
+      }
+      const inp = h(r, 'input', { cls: 'rw-substep-in', attr: { type: 'text', placeholder: '第 ' + (i + 1) + ' 步要做什么' } });
+      inp.value = it.text || '';
+      inp.addEventListener('input', () => { it.text = inp.value; upd(); });
+      inp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.isComposing && !e.ctrlKey && !e.metaKey) { e.preventDefault(); e.stopPropagation(); items.splice(i + 1, 0, { text: '', done: false }); draw(i + 1); }
+        else if (e.key === 'Backspace' && !inp.value && items.length > 1) { e.preventDefault(); items.splice(i, 1); draw(Math.max(0, i - 1)); upd(); }
+      });
+      const up = h(r, 'button', { cls: 'rw-iconbtn', title: '上移' }); ic(up, 'arrow-up');
+      up.disabled = i === 0;
+      up.addEventListener('click', () => { if (i > 0) { [items[i - 1], items[i]] = [items[i], items[i - 1]]; draw(i - 1); } });
+      const x = h(r, 'button', { cls: 'rw-iconbtn', title: '删掉这一步' }); ic(x, 'x');
+      x.addEventListener('click', () => { items.splice(i, 1); draw(); upd(); });
+      if (focusIdx === i) setTimeout(() => inp.focus(), 10);
+    });
+    const add = h(list, 'button', { cls: 'rw-btn rw-btn-sm rw-substep-add' }); ic(add, 'plus'); h(add, 'span', { text: items.length ? '再加一步' : '拆成小步骤' });
+    add.addEventListener('click', () => { items.push({ text: '', done: false }); draw(items.length - 1); });
+    upd();
+  };
+  draw();
+  return box;
+}
+
 class AddTaskModal extends Modal {
-  constructor(app, plugin, preset) { super(app); this.plugin = plugin; this.v = Object.assign({ text: '', date: today(), time: '', project: '' }, preset || {}); }
+  constructor(app, plugin, preset) { super(app); this.plugin = plugin; this.v = Object.assign({ text: '', date: today(), time: '', project: '', subs: [] }, preset || {}); }
   onOpen() {
     const c = this.contentEl;
     c.classList.add('rw-modal');
+    this.modalEl.classList.add('rw-addtask-modal');
     this.titleEl.setText('添加待办');
-    new Setting(c).setName('要做什么').addText((t) => { t.setPlaceholder('例如：和导师讨论实验结果').setValue(this.v.text).onChange((x) => (this.v.text = x)); t.inputEl.style.width = '320px'; setTimeout(() => t.inputEl.focus(), 30); });
+    new Setting(c).setName('要做什么').setDesc('大目标写这里，下面可以拆成几个小步骤').addText((t) => { t.setPlaceholder('例如：完成 CA1 报告').setValue(this.v.text).onChange((x) => (this.v.text = x)); t.inputEl.style.width = '320px'; setTimeout(() => t.inputEl.focus(), 30); });
+    subStepsEditor(c, this.v.subs);
     new Setting(c).setName('日期').addText((t) => { t.inputEl.type = 'date'; t.setValue(this.v.date).onChange((x) => (this.v.date = x)); });
     new Setting(c).setName('时间').setDesc('可选；填了会出现在日历周视图的对应时段').addText((t) => { t.inputEl.type = 'time'; t.setValue(this.v.time).onChange((x) => (this.v.time = x)); });
     const projects = this.plugin.buildIndex().projects.filter((p) => p.status !== '已完成');
     new Setting(c).setName('所属项目').setDesc('写进该项目主页的「待办」小节；不选则写进 科研/计划.md').addDropdown((d) => { d.addOption('', '（不属于项目）'); projects.forEach((p) => d.addOption(p.name, p.title)); d.setValue(this.v.project).onChange((x) => (this.v.project = x)); });
     new Setting(c).addButton((b) => b.setButtonText('添加').setCta().onClick(() => this.submit()));
-    c.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing && e.target.tagName === 'INPUT') this.submit(); });
+    c.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing && e.target.tagName === 'INPUT' && !e.target.classList.contains('rw-substep-in')) this.submit(); if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) this.submit(); });
   }
   async submit() {
     if (this.busy) return;
-    if (!this.v.text.trim()) { new Notice('请填写待办内容'); return; }
+    if (!this.v.text.trim()) { new Notice('请填写待办内容（大目标）'); return; }
     this.busy = true;
     try { await this.plugin.addTask(this.v); this.close(); } finally { this.busy = false; }
   }
@@ -18019,9 +18115,11 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     if (pf instanceof TFile && !items.some((x) => x.file === pf)) items.push({ file: pf, projectName: '' });
     for (const it of items) {
       const cache = this.app.metadataCache.getFileCache(it.file);
-      const open = cache && cache.listItems ? cache.listItems.filter((li) => li.task === ' ' || (withDone && li.task && li.task !== ' ')) : [];
+      const all = cache && cache.listItems ? cache.listItems : [];
+      const open = all.filter((li) => li.task === ' ' || (withDone && li.task && li.task !== ' '));
       if (!open.length) continue;
       const lines = (await this.app.vault.cachedRead(it.file)).split('\n');
+      const taskAt = new Map(all.filter((li) => li.task !== undefined).map((li) => [li.position.start.line, li]));
       for (const li of open) {
         const line = li.position.start.line;
         const raw = lines[line] || '';
@@ -18030,7 +18128,9 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
         const dm = text.match(/(?:📅|@|due:\s*)\s*(\d{4}-\d{2}-\d{2})/);
         const tm = text.match(/⏰\s*(\d{1,2}):(\d{2})/) || text.match(/(?:📅|due:)\s*\d{4}-\d{2}-\d{2}\s+(\d{1,2}):(\d{2})/);
         const clean = text.replace(/(?:📅|due:)\s*\d{4}-\d{2}-\d{2}(\s+\d{1,2}:\d{2})?/, '').replace(/⏰\s*\d{1,2}:\d{2}/, '').replace(/✅\s*\d{4}-\d{2}-\d{2}/, '').trim();
-        out.push({ file: it.file, projectName: it.projectName, line, raw, text: clean, due: dm ? dm[1] : '', time: tm ? pad(Number(tm[1])) + ':' + tm[2] : '', done: li.task !== ' ' });
+        const par = li.parent >= 0 && taskAt.has(li.parent) ? li.parent : -1;
+        const kids = all.filter((x) => x.parent === line && x.task !== undefined);
+        out.push({ file: it.file, projectName: it.projectName, line, raw, text: clean, due: dm ? dm[1] : '', time: tm ? pad(Number(tm[1])) + ':' + tm[2] : '', done: li.task !== ' ', parentLine: par, parentOpen: par >= 0 && taskAt.get(par).task === ' ', subTotal: kids.length, subDone: kids.filter((x) => x.task !== ' ').length });
       }
     }
     return out;
@@ -18087,6 +18187,8 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     const text = String(o.text || '').trim();
     if (!text) return null;
     let line = '- [ ] ' + text + (o.date ? ' 📅 ' + o.date : '') + (o.time ? ' ⏰ ' + o.time : '');
+    const subs = (o.subs || []).map((x) => String(x.text || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+    if (subs.length) line += '\n' + subs.map((x) => '\t- [ ] ' + x).join('\n');
     let file;
     const p = o.project ? this.buildIndex().byName.get(o.project) : null;
     if (p) file = p.file;
@@ -18108,7 +18210,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       const before = lines.slice(0, k).filter((l) => !/^\s*[-*+]\s*\[ \]\s*$/.test(l));
       return data.slice(0, startI) + before.concat([line]).concat(lines.slice(k)).join('\n');
     });
-    new Notice('✅ 已添加待办' + (o.date ? '：' + o.date + (o.time ? ' ' + o.time : '') : '') + (p ? ' → ' + p.title : ' → 计划.md'));
+    new Notice('✅ 已添加待办' + (subs.length ? '（' + subs.length + ' 个小步骤）' : '') + (o.date ? '：' + o.date + (o.time ? ' ' + o.time : '') : '') + (p ? ' → ' + p.title : ' → 计划.md'));
     this.refreshViews();
     return file;
   }
@@ -18999,15 +19101,49 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
   }
 
   async completeTask(t) {
+    let subs = 0;
     await this.app.vault.process(t.file, (data) => {
       const lines = data.split('\n');
       const l = lines[t.line];
       if (l != null && /\[ \]/.test(l)) {
         lines[t.line] = l.replace('[ ]', '[x]') + (/✅/.test(l) ? '' : ' ✅ ' + today());
+        // 大点完成 = 下面没勾的小步骤一起完成
+        const ind = indentWidth(l);
+        for (let k = t.line + 1; k < lines.length; k++) {
+          const x = lines[k];
+          if (!x.trim()) break;
+          if (indentWidth(x) <= ind) break;
+          if (/^\s*[-*+]\s*\[ \]/.test(x)) { lines[k] = x.replace('[ ]', '[x]'); subs++; }
+        }
       }
       return lines.join('\n');
     });
-    new Notice('✅ 已完成：' + t.text.slice(0, 30));
+    new Notice('✅ 已完成：' + t.text.slice(0, 30) + (subs ? '（连同 ' + subs + ' 个小步骤）' : ''));
+  }
+  /* 在一条待办下面加小步骤（加在它已有的小步骤 / 备注之后） */
+  async addSubtask(t, text) {
+    text = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!text) return;
+    let ok = false;
+    await this.app.vault.process(t.file, (data) => {
+      const lines = data.split('\n');
+      let ln = t.line;
+      if (lines[ln] !== t.raw) { const j = lines.indexOf(t.raw); if (j >= 0) ln = j; }
+      const l = lines[ln];
+      if (l == null || !/^\s*[-*+]\s*\[.\]/.test(l)) return data;
+      const base = l.match(/^\s*/)[0];
+      const ind = indentWidth(l);
+      let k = ln + 1, childIndent = '';
+      while (k < lines.length && lines[k].trim() && indentWidth(lines[k]) > ind) {
+        if (!childIndent && /^\s*[-*+]\s*\[.\]/.test(lines[k])) childIndent = lines[k].match(/^\s*/)[0];
+        k++;
+      }
+      lines.splice(k, 0, (childIndent || base + '\t') + '- [ ] ' + text);
+      ok = true;
+      return lines.join('\n');
+    });
+    new Notice(ok ? '已加小步骤：' + trunc(text, 30) : '原笔记里找不到这条待办了');
+    this.refreshViews();
   }
 
   currentProjectName() {
