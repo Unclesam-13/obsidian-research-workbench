@@ -1825,6 +1825,7 @@ class WorkbenchView extends ItemView {
     }
     const inferredList = this.index.notes.filter((n) => ofType(n) && n.inferred);
     if (inferredList.length) this.btn(right, '补全属性（' + inferredList.length + '）', 'wand', () => this.plugin.fillProps(inferredList), 'rw-btn-warn');
+    if (type === 'draft') this.btn(right, '引用文献写作', 'quote', () => this.plugin.litWriteModal({ project: curProject }), '');
     if (type === 'experiment') {
       this.btn(right, '新建数据分析', 'bar-chart-3', () => this.plugin.newNoteModal({ type: 'data', project: curProject }));
       this.btn(right, '新建实验记录', 'plus', () => this.plugin.newNoteModal({ type, project: curProject }), 'mod-cta');
@@ -2747,6 +2748,7 @@ class WorkbenchView extends ItemView {
     }, 'mod-cta rw-btn-sm');
     runB.title = '让 AI 读每篇论文全文，填写每一列';
     this.btn(bar, '添加列', 'columns-3', () => new PgColumnModal(this.app, pl, null, () => this.render()).open(), 'rw-btn-sm');
+    { const wb = this.btn(bar, selN.length ? '用选中的 ' + selN.length + ' 篇写作' : '引用文献写作', 'quote', () => pl.litWriteModal({ project: f.project && f.project !== '__none' ? f.project : '', paths: selN.filter((n) => !n.pdfOnly).map((n) => n.file.path) }), 'rw-btn-sm'); wb.title = '选几篇文献，让 AI 做文献调研、提研究想法、写带引用的草稿'; }
     this.btn(bar, '导出', 'file-down', () => pl.pgExportMarkdown(list), 'rw-btn-sm');
     {
       const noTitle = list.filter((n) => !str(n.fm.title) && (looksLikeFileName(n.title) || n.title === n.file.basename || litH1Title(n.file, this.app.metadataCache.getFileCache(n.file)) === '') && !(n.pdfOnly && (pl.settings.pdfMeta || {})[n.file.path]));
@@ -5507,6 +5509,164 @@ class WorkShotModal extends Modal {
     this.scope.register([], 'ArrowRight', () => { if (this.imgs.length > 1) { this.i = (this.i + 1) % this.imgs.length; draw(); } return false; });
   }
   onClose() { this.contentEl.empty(); }
+}
+
+/* ═════════ 引用文献写作：选文献 → 文献调研 / 研究想法 / 带引用的草稿 ═════════ */
+const LW_SYSTEM = '你是严谨的科研写作助手。只能依据用户给出的文献材料写作：每个具体论断后用 [编号] 标注出自哪篇（可多篇，如 [1][3]）；不得编造文献、作者、数据、实验结果或结论；材料里没有的信息就写「材料中未提及」。比较时要具体（方法、数据、指标、结论的差异），不要空泛。输出 Markdown，标题层级严格按要求。';
+const LW_TASKS = {
+  survey: { label: '文献调研', icon: 'table-2', desc: '对比表 + 共识与分歧 + 研究空白', prompt: '## 文献调研\n### 对比表\n用 Markdown 表格，每篇一行，列：编号 | 文献（简称+年份） | 研究问题 | 方法 | 数据 / 实验设置 | 主要结论 | 局限。单元格内不要换行，不要用竖线。\n### 共识与分歧\n分点写，每点带引用。\n### 研究空白\n分点写出这些文献都没解决或做得不够的地方，每点说明依据（引用）。' },
+  ideas: { label: '研究想法', icon: 'lightbulb', desc: '3–5 个有依据、可验证的想法', prompt: '## 研究想法\n给出 3–5 个想法，依次用「### 想法 1：一句话标题」「### 想法 2：…」开头（写真实序号），下面依次写：\n- **动机**：从哪些文献的什么不足出发（带引用）\n- **核心思路**：具体做什么，和已有工作的区别\n- **可验证的假设**：\n- **验证方法 / 实验设计**：数据、基线、指标\n- **风险与替代方案**：\n想法要具体、能落地，不要泛泛的「结合深度学习」之类。' },
+  draft: { label: '写作草稿', icon: 'pen-line', desc: '带引用的相关工作 / 引言段落', prompt: '## 写作草稿\n写一段可以直接放进论文「相关工作 / 引言」的正文（3–6 段），按主题而不是按文献逐篇罗列来组织，句中用 [编号] 引用，最后一段点出现有工作的不足并引出本文要做的事。' },
+};
+class LitWriteModal extends Modal {
+  constructor(app, plugin, preset) {
+    super(app); this.plugin = plugin;
+    const st = plugin.settings;
+    this.v = Object.assign({ project: '', coll: '', q: '', topic: st.lwTopic || '', tasks: st.lwTasks || ['survey', 'ideas', 'draft'], lang: st.lwLang || '中文', depth: st.lwDepth || 'fast', extra: '' }, preset || {});
+    this.sel = new Set(preset && preset.paths ? preset.paths : []);
+  }
+  onOpen() {
+    this.modalEl.classList.add('rw-lw-modal');
+    this.titleEl.setText('引用文献写作');
+    this.contentEl.classList.add('rw-modal');
+    this.draw();
+  }
+  papers() {
+    const pl = this.plugin, idx = pl.buildIndex();
+    let list = idx.notes.filter((n) => n.type === 'literature');
+    const v = this.v;
+    if (v.project === '__none') list = list.filter((n) => !n.projectName);
+    else if (v.project) list = list.filter((n) => n.projectName === v.project || this.sel.has(n.file.path));
+    if (v.coll) list = list.filter((n) => pl.inColl(n, v.coll) || this.sel.has(n.file.path));
+    if (v.q) { const q = v.q.toLowerCase(); list = list.filter((n) => (n.title + ' ' + str(n.fm.authors || n.fm.author) + ' ' + n.file.path).toLowerCase().includes(q) || this.sel.has(n.file.path)); }
+    return list.sort((a, b) => (this.sel.has(b.file.path) ? 1 : 0) - (this.sel.has(a.file.path) ? 1 : 0) || (Number(str(b.fm.year)) || 0) - (Number(str(a.fm.year)) || 0) || a.title.localeCompare(b.title));
+  }
+  draw() {
+    const c = this.contentEl; clear(c);
+    const pl = this.plugin, v = this.v, st = pl.settings;
+    if (this.result) return this.drawResult();
+    // ① 选文献
+    const s1 = h(c, 'div', { cls: 'rw-lw-step' });
+    const h1 = h(s1, 'div', { cls: 'rw-lw-stephead' }); h(h1, 'span', { cls: 'rw-lw-num', text: '1' }); h(h1, 'b', { text: '选要引用的文献' }); const cnt = h(h1, 'span', { cls: 'rw-muted' });
+    const fb = h(s1, 'div', { cls: 'rw-lw-filter' });
+    const ps = h(fb, 'select', { cls: 'dropdown rw-select rw-select-sm' });
+    const ao = (sel, val, t) => { const o = h(sel, 'option', { text: t }); o.value = val; };
+    ao(ps, '', '全部项目'); ao(ps, '__none', '未归属项目');
+    for (const p of pl.buildIndex().projects) ao(ps, p.name, p.title);
+    ps.value = v.project || '';
+    ps.addEventListener('change', () => { v.project = ps.value; this.draw(); });
+    const colls = pl.litCollections ? pl.litCollections() : [];
+    if (colls.length) {
+      const cs = h(fb, 'select', { cls: 'dropdown rw-select rw-select-sm' });
+      ao(cs, '', '全部分类'); for (const x of colls) ao(cs, x, x);
+      cs.value = v.coll || ''; cs.addEventListener('change', () => { v.coll = cs.value; this.draw(); });
+    }
+    const qi = h(fb, 'input', { cls: 'rw-filter-input', attr: { type: 'search', placeholder: '搜标题 / 作者…' } }); qi.value = v.q;
+    qi.addEventListener('input', () => { v.q = qi.value; clearTimeout(this._qt); this._qt = setTimeout(() => { this.draw(); const q2 = this.contentEl.querySelector('.rw-lw-filter input[type=search]'); if (q2) { q2.focus(); q2.setSelectionRange(q2.value.length, q2.value.length); } }, 250); });
+    const list = this.papers();
+    const allB = h(fb, 'button', { cls: 'rw-linkbtn', text: '全选列表' }); allB.addEventListener('click', () => { list.forEach((n) => this.sel.add(n.file.path)); this.draw(); });
+    const noneB = h(fb, 'button', { cls: 'rw-linkbtn', text: '清空' }); noneB.addEventListener('click', () => { this.sel.clear(); this.draw(); });
+    const box = h(s1, 'div', { cls: 'rw-lw-list' });
+    if (!list.length) h(box, 'div', { cls: 'rw-empty-sm', text: '没有文献笔记。先在「文献」里给 PDF 建笔记。' });
+    const cols = pl.pgColumns();
+    for (const n of list.slice(0, 300)) {
+      const r = h(box, 'label', { cls: 'rw-lw-row' + (this.sel.has(n.file.path) ? ' is-sel' : '') });
+      const cb = h(r, 'input', { attr: { type: 'checkbox' } }); cb.checked = this.sel.has(n.file.path);
+      cb.addEventListener('change', () => { if (cb.checked) this.sel.add(n.file.path); else this.sel.delete(n.file.path); r.classList.toggle('is-sel', cb.checked); upd(); });
+      const t = h(r, 'div', { cls: 'rw-lw-rtext' });
+      h(t, 'div', { cls: 'rw-lw-rtitle', text: n.title });
+      const meta = [str(n.fm.year), trunc(str(n.fm.authors || n.fm.author), 40), n.projectName].filter(Boolean).join(' · ');
+      const m2 = h(t, 'div', { cls: 'rw-muted rw-lw-rmeta' });
+      if (meta) h(m2, 'span', { text: meta });
+      const nDone = cols.filter((col) => { const x = pl.pgCell(n.file.path, col.id); return x && x.status === 'done'; }).length;
+      if (nDone) h(m2, 'span', { cls: 'rw-lw-tag', text: 'AI 分析 ' + nDone + '/' + cols.length, title: '「我的文献」表格里已经分析过的列，会作为材料' });
+      const cpp = pl.paperOf(n.file); const fi = cpp && cpp.pdf ? pl.ftInfo(cpp.pdf) : null;
+      if (fi && fi.md) h(m2, 'span', { cls: 'rw-lw-tag', text: '全文 MD' });
+      else if (cpp && cpp.pdf) h(m2, 'span', { cls: 'rw-lw-tag', text: 'PDF' });
+    }
+    const upd = () => { cnt.textContent = this.sel.size ? '已选 ' + this.sel.size + ' 篇' : '（建议 3–20 篇）'; };
+    upd();
+    // ② 写什么
+    const s2 = h(c, 'div', { cls: 'rw-lw-step' });
+    const h2 = h(s2, 'div', { cls: 'rw-lw-stephead' }); h(h2, 'span', { cls: 'rw-lw-num', text: '2' }); h(h2, 'b', { text: '想写什么' });
+    const ta = h(s2, 'textarea', { cls: 'rw-lw-topic', attr: { rows: '2', placeholder: '主题或研究问题，例如：基于 BFI 的人体感知中的隐私攻击与防御，现有方法的不足和可能的切入点' } });
+    ta.value = v.topic; ta.addEventListener('input', () => { v.topic = ta.value; });
+    const tk = h(s2, 'div', { cls: 'rw-lw-tasks' });
+    for (const [id, d] of Object.entries(LW_TASKS)) {
+      const lab = h(tk, 'label', { cls: 'rw-lw-task' + (v.tasks.includes(id) ? ' is-on' : '') });
+      const cb = h(lab, 'input', { attr: { type: 'checkbox' } }); cb.checked = v.tasks.includes(id);
+      ic(lab, d.icon);
+      const tt = h(lab, 'div'); h(tt, 'b', { text: d.label }); h(tt, 'div', { cls: 'rw-muted', text: d.desc });
+      cb.addEventListener('change', () => { v.tasks = v.tasks.filter((x) => x !== id); if (cb.checked) v.tasks.push(id); lab.classList.toggle('is-on', cb.checked); });
+    }
+    const opt = h(s2, 'div', { cls: 'rw-lw-opts' });
+    h(opt, 'span', { cls: 'rw-muted', text: '草稿语言' });
+    const ls = h(opt, 'select', { cls: 'dropdown rw-select rw-select-sm' }); for (const x of ['中文', 'English']) ao(ls, x, x); ls.value = v.lang; ls.addEventListener('change', () => { v.lang = ls.value; });
+    h(opt, 'span', { cls: 'rw-muted', text: '材料' });
+    const ds = h(opt, 'select', { cls: 'dropdown rw-select rw-select-sm', title: '快速：用每篇的 AI 分析列、笔记和摘录；精读：先让 AI 逐篇读全文提炼要点再综合（更准，但每篇多一次 AI 调用）' });
+    ao(ds, 'fast', '快速（分析列 + 笔记）'); ao(ds, 'full', '精读（逐篇读全文）'); ds.value = v.depth; ds.addEventListener('change', () => { v.depth = ds.value; });
+    const ex = h(s2, 'input', { cls: 'rw-lw-extra', attr: { type: 'text', placeholder: '额外要求（可选）：例如 重点比较防御方法；草稿 600 字左右；想法偏向可在 MATLAB 仿真验证' } });
+    ex.value = v.extra; ex.addEventListener('input', () => { v.extra = ex.value; });
+    // ③ 生成
+    const s3 = h(c, 'div', { cls: 'rw-lw-foot' });
+    const prj = h(s3, 'div', { cls: 'rw-muted rw-lw-where' });
+    const proj = v.project && v.project !== '__none' ? (pl.buildIndex().byName.get(v.project) || {}).title || v.project : '';
+    prj.textContent = '结果存为一篇写作笔记：' + (proj ? '项目「' + proj + '」/写作' : pl.settings.rootFolder + '/写作') + '，带编号引用和参考文献链接';
+    this.status = h(s3, 'div', { cls: 'rw-lw-status' });
+    const go = h(s3, 'button', { cls: 'rw-btn mod-cta' }); ic(go, 'sparkles'); h(go, 'span', { text: '开始生成' });
+    go.addEventListener('click', () => this.run(go));
+  }
+  setStatus(t) { if (this.status) this.status.textContent = t; }
+  async run(btn) {
+    const pl = this.plugin, v = this.v, st = pl.settings;
+    if (!pl.directAiReady()) return new Notice('先在 设置 → 科研工作台 → AI 填接口地址和密钥');
+    if (!this.sel.size) return new Notice('先勾选要引用的文献');
+    if (!v.tasks.length) return new Notice('至少选一项：文献调研 / 研究想法 / 写作草稿');
+    if (!String(v.topic || '').trim()) return new Notice('写一句主题或研究问题，AI 才知道往哪个方向综合');
+    st.lwTopic = v.topic; st.lwTasks = v.tasks; st.lwLang = v.lang; st.lwDepth = v.depth; pl.saveSettingsSoon();
+    btn.disabled = true;
+    try {
+      await pl.pgLoad();
+      const idx = pl.buildIndex();
+      const notes = [...this.sel].map((p) => idx.notes.find((n) => n.file.path === p)).filter(Boolean);
+      const mats = [];
+      let i = 0;
+      for (const n of notes) {
+        i++;
+        this.setStatus('整理材料 ' + i + ' / ' + notes.length + '：' + trunc(n.title, 30));
+        mats.push(await pl.lwMaterial(n, i, v.depth, v.topic));
+      }
+      this.setStatus('AI 正在综合 ' + notes.length + ' 篇文献……（大约需要 30 秒到几分钟）');
+      const out = await pl.lwSynthesize(v, mats);
+      this.setStatus('保存笔记……');
+      const file = await pl.lwSave(v, notes, out);
+      this.result = { file, out, notes };
+      this.draw();
+    } catch (e) {
+      console.error('[research-workbench] 引用文献写作失败', e);
+      this.setStatus('出错：' + (e.message || e));
+      new Notice('生成失败：' + (e.message || e), 10000);
+    } finally { btn.disabled = false; }
+  }
+  drawResult() {
+    const c = this.contentEl, pl = this.plugin, r = this.result;
+    const bar = h(c, 'div', { cls: 'rw-lw-resbar' });
+    ic(bar, 'check-circle-2');
+    h(bar, 'b', { text: '已生成并保存：' + r.file.basename });
+    h(bar, 'div', { cls: 'rw-spacer' });
+    const ob = h(bar, 'button', { cls: 'rw-btn mod-cta rw-btn-sm' }); ic(ob, 'file-text'); h(ob, 'span', { text: '打开笔记' });
+    ob.addEventListener('click', () => { this.close(); pl.openFile(r.file); });
+    const ideas = pl.lwParseIdeas(r.out);
+    if (ideas.length) {
+      const ib = h(bar, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(ib, 'lightbulb'); h(ib, 'span', { text: '把 ' + ideas.length + ' 个想法存成灵感' });
+      ib.addEventListener('click', async () => { ib.disabled = true; const n = await pl.lwSaveIdeas(ideas, r.file, r.notes, this.v.project); new Notice('已存成 ' + n + ' 条灵感'); h(ib, 'span', { text: ' ✓' }); });
+    }
+    const again = h(bar, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(again, 'rotate-ccw'); h(again, 'span', { text: '换个方向再写' });
+    again.addEventListener('click', () => { this.result = null; this.draw(); });
+    const box = h(c, 'div', { cls: 'rw-lw-out rw-md' });
+    renderAiMarkdown(this.app, r.out + '\n\n' + pl.lwRefs(r.notes), box, this.plugin);
+  }
+  onClose() { clear(this.contentEl); }
 }
 
 class TextPromptModal extends Modal {
@@ -18010,7 +18170,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
         if (!type) { looseMd.push(file); continue; }
         inferred = true;
       }
-      const openTasks = cache.listItems ? cache.listItems.filter((li) => li.task === ' ').length : 0;
+      const openTasks = cache && cache.listItems ? cache.listItems.filter((li) => li.task === ' ').length : 0;
       if (type === 'project') {
         const p = {
           kind: 'project', file, fm, name: file.basename,
@@ -18179,6 +18339,92 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       add(fmtDate(new Date(x.mtime || x.file.stat.mtime)), Object.assign({ what: '修改文件' }, it));
     }
     return map;
+  }
+
+  /* ---------- 引用文献写作 ---------- */
+  litWriteModal(preset) { new LitWriteModal(this.app, this, preset || {}).open(); }
+  lwMeta(n) {
+    const fm = n.fm || {};
+    const au = str(fm.authors || fm.author).split(/[,，;；]| and /).map((x) => x.trim()).filter(Boolean);
+    const short = au.length ? au[0].split(/\s+/).pop() + (au.length > 1 ? ' 等' : '') : '';
+    return { authors: au.join(', '), short, year: str(fm.year), venue: str(fm.venue || fm.journal || fm.publication || fm.booktitle) };
+  }
+  async lwMaterial(n, i, depth, topic) {
+    const m = this.lwMeta(n);
+    const head = '[' + i + '] ' + n.title + (m.authors ? ' — ' + m.authors : '') + (m.year ? ' (' + m.year + ')' : '') + (m.venue ? ' · ' + m.venue : '');
+    const parts = [head];
+    for (const col of this.pgColumns()) { const x = this.pgCell(n.file.path, col.id); if (x && x.status === 'done' && x.answer) parts.push(col.name + '：' + String(x.answer).replace(/\s+/g, ' ').slice(0, 600)); }
+    let body = '';
+    try { body = (await this.app.vault.cachedRead(n.file)).replace(/^---\n[\s\S]*?\n---\n?/, '').replace(/!\[\[[^\]]*\]\]/g, '').replace(/\n{3,}/g, '\n\n').trim(); } catch (e) { /* ignore */ }
+    if (body) parts.push('我的笔记 / 摘录：' + body.slice(0, depth === 'full' ? 1500 : 2500));
+    if (depth === 'full') {
+      const c = this.paperOf(n.file);
+      let full = '';
+      const fi = c && c.pdf ? this.ftInfo(c.pdf) : null;
+      if (fi && fi.md) { try { full = await this.app.vault.cachedRead(fi.md); } catch (e) { /* ignore */ } }
+      if (!full && c && c.pdf) full = await this.paperText({ pdf: c.pdf });
+      if (full) {
+        this._lwDigest = this._lwDigest || new Map();
+        const key = n.file.path + '|' + full.length + '|' + topic;
+        let dg = this._lwDigest.get(key);
+        if (!dg) {
+          dg = await this.directChat([
+            { role: 'system', content: '你是科研助理。根据论文全文提炼要点，只写原文里有的内容，不编造。用中文，600 字以内，分条：研究问题；方法（关键步骤、模型、假设）；数据与实验设置；主要结果（带关键数字）；局限 / 作者承认的不足；与用户主题相关的点。' },
+            { role: 'user', content: '用户主题：' + topic + '\n\n论文：' + n.title + '\n\n全文（可能被截断）：\n' + full.slice(0, 40000) },
+          ]);
+          this._lwDigest.set(key, dg);
+        }
+        parts.push('全文要点：' + dg);
+      }
+    }
+    return parts.join('\n');
+  }
+  async lwSynthesize(v, mats) {
+    let budget = 90000;
+    const used = [];
+    for (const m of mats) { const piece = m.slice(0, Math.max(1500, Math.floor(budget / Math.max(1, mats.length - used.length)))); used.push(piece); budget -= piece.length; }
+    const tasks = ['survey', 'ideas', 'draft'].filter((x) => v.tasks.includes(x)).map((x) => LW_TASKS[x].prompt.replace('写一段可以直接放进论文', '用' + (v.lang === 'English' ? '英文（学术英语）' : '中文') + '写一段可以直接放进论文'));
+    const user = '主题 / 研究问题：' + v.topic + (v.extra ? '\n额外要求：' + v.extra : '') + '\n\n文献材料（编号即引用编号）：\n\n' + used.join('\n\n---\n\n') + '\n\n请按顺序输出下面这些部分（只输出这些部分，不要输出参考文献列表，系统会自动附上）：\n\n' + tasks.join('\n\n');
+    const out = await this.directChat([{ role: 'system', content: LW_SYSTEM }, { role: 'user', content: user }], { maxTokens: 8000 });
+    return out.replace(/\n#+\s*参考文献[\s\S]*$/, '').trim();
+  }
+  lwRefs(notes) {
+    return '## 参考文献\n' + notes.map((n, i) => { const m = this.lwMeta(n); return '[' + (i + 1) + '] [[' + n.file.path.replace(/\.md$/, '') + '|' + n.title.replace(/[|\]]/g, ' ') + ']]' + (m.authors ? ' — ' + m.authors : '') + (m.year ? ' (' + m.year + ')' : '') + (m.venue ? ' · ' + m.venue : ''); }).join('\n');
+  }
+  async lwSave(v, notes, out) {
+    const proj = v.project && v.project !== '__none' ? v.project : '';
+    const title = '文献写作：' + trunc(String(v.topic).replace(/[\n\r]/g, ' '), 40).replace(/…$/, '');
+    const file = await this.createNote({ type: 'draft', title, project: proj, silent: true });
+    const body = '> [!info] 引用文献写作\n> 主题：' + String(v.topic).replace(/\n/g, ' ') + '\n> 生成：' + today() + ' · ' + (this.settings.llmModel || 'AI') + ' · ' + notes.length + ' 篇文献 · ' + (v.depth === 'full' ? '精读全文' : '快速（分析列 + 笔记）') + '\n> 引用 [n] 对应文末参考文献；AI 生成内容请核对原文后再用。\n\n' + out + '\n\n' + this.lwRefs(notes) + '\n';
+    await this.app.vault.process(file, (data) => {
+      const m = data.match(/^---\n[\s\S]*?\n---\n/);
+      const fmPart = m ? m[0] : '';
+      const h1 = (data.slice(fmPart.length).match(/^# .*\n/) || [''])[0];
+      return fmPart + (h1 || '# ' + title + '\n') + '\n' + body;
+    });
+    await this.app.fileManager.processFrontMatter(file, (fm) => { fm.status = NOTE_TYPES.draft.statuses.includes('大纲') ? '大纲' : (fm.status || NOTE_TYPES.draft.statuses[0]); fm.litwrite = true; fm.references = notes.map((n) => '[[' + n.file.path.replace(/\.md$/, '') + ']]'); });
+    setTimeout(() => { try { this.refreshViews(); } catch (e) { console.error(e); } }, 300);
+    return file;
+  }
+  lwParseIdeas(out) {
+    const sec = (String(out).match(/## 研究想法\n([\s\S]*?)(?=\n## |$)/) || [])[1] || '';
+    const parts = sec.split(/\n(?=### )/).map((x) => x.trim()).filter((x) => /^### /.test(x));
+    return parts.map((x) => { const t = x.split('\n')[0].replace(/^###\s*/, '').replace(/^想法\s*[\dNn一二三四五六七八九十]*\s*[：:]\s*/, '').trim(); return { title: t, body: x.split('\n').slice(1).join('\n').trim() }; }).filter((x) => x.title);
+  }
+  async lwSaveIdeas(ideas, srcFile, notes, project) {
+    const proj = project && project !== '__none' ? project : '';
+    let n = 0;
+    for (const it of ideas) {
+      try {
+        const f = await this.createNote({ type: 'idea', title: trunc(it.title, 50).replace(/…$/, ''), project: proj, silent: true });
+        let body = it.body;
+        body = body.replace(/\[(\d{1,2})\]/g, (m0, k) => { const nn = notes[Number(k) - 1]; return nn ? '[[' + nn.file.path.replace(/\.md$/, '') + '|[' + k + ']]]' : m0; });
+        await this.app.vault.process(f, (data) => data.replace(/\s*$/, '') + '\n\n## 来自文献写作\n来源：[[' + srcFile.path.replace(/\.md$/, '') + ']]\n\n' + body + '\n');
+        n++;
+      } catch (e) { console.error(e); }
+    }
+    this.refreshViews();
+    return n;
   }
 
   /* ---------- 添加待办（写入项目主页「待办」小节或 科研/计划.md） ---------- */
