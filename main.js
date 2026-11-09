@@ -5878,7 +5878,12 @@ class WriteAssistView extends ItemView {
   }
   async setState(state, result) { if (state && state.path) { const f = this.app.vault.getAbstractFileByPath(state.path); if (f instanceof TFile) this.setFile(f); } return super.setState(state, result); }
   getState() { return Object.assign(super.getState(), { path: this.file ? this.file.path : '' }); }
-  setFile(f) { this.file = f; this.draw(); }
+  async setFile(f) {
+    this.file = f;
+    if (f) await this.plugin.waLoad(f.path);
+    if (this.file === f) this.draw();
+  }
+  save() { if (this.file) this.plugin.waSaveSoon(this.file.path); }
   editor() {
     const leaves = this.app.workspace.getLeavesOfType('markdown');
     let l = this.targetLeaf && leaves.includes(this.targetLeaf) && this.targetLeaf.view.file === this.file ? this.targetLeaf : leaves.find((x) => x.view.file === this.file);
@@ -5896,7 +5901,7 @@ class WriteAssistView extends ItemView {
         const refs = Array.isArray(fm.references) ? fm.references : [];
         for (const r of refs) { const m = String(r).match(/\[\[([^\]|]+)/); if (m) { const f = this.app.metadataCache.getFirstLinkpathDest(m[1], this.file.path); if (f) sel.push(f.path); } }
       }
-      pl._wa.set(key, { papers: sel, msgs: [], useDoc: true, useSel: true });
+      pl._wa.set(key, { papers: sel, msgs: [], useDoc: true, useSel: true, waKey: key });
     }
     return pl._wa.get(key);
   }
@@ -5915,7 +5920,7 @@ class WriteAssistView extends ItemView {
     const ps = h(c, 'div', { cls: 'rw-wa-papers' });
     const ph = h(ps, 'div', { cls: 'rw-wa-sech' }); ic(ph, 'library'); h(ph, 'span', { text: '放进 AI 的文献（' + st.papers.length + '）' });
     const add = h(ph, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(add, 'plus'); h(add, 'span', { text: '选文献' });
-    add.addEventListener('click', () => new LitPickModal(this.app, pl, st.papers, (sel) => { st.papers = sel; this.draw(); }).open());
+    add.addEventListener('click', () => new LitPickModal(this.app, pl, st.papers, (sel) => { st.papers = sel; this.save(); this.draw(); }).open());
     const list = h(ps, 'div', { cls: 'rw-wa-plist' });
     const papers = this.papers();
     if (!papers.length) h(list, 'div', { cls: 'rw-muted rw-wa-empty', text: '还没选文献。选几篇后，AI 回答会基于它们并用 [1][2] 标出处；点每篇的「引用」插入到你正在写的位置。' });
@@ -5926,15 +5931,18 @@ class WriteAssistView extends ItemView {
       const t = h(r, 'div', { cls: 'rw-wa-ptext', title: n.title });
       h(t, 'div', { cls: 'rw-wa-ptitle', text: n.title });
       h(t, 'div', { cls: 'rw-muted', text: [m.short, m.year].filter(Boolean).join(' · ') });
+      const qb = h(r, 'button', { cls: 'rw-btn rw-btn-sm', title: '把这篇放进下面的提问框（问 AI 关于这篇的问题）' }); ic(qb, 'message-square-plus'); h(qb, 'span', { text: '提问' });
+      qb.addEventListener('click', () => this.addToInput(i + 1, n));
       const cb = h(r, 'button', { cls: 'rw-btn rw-btn-sm', title: '在左边光标处插入引用' }); ic(cb, 'quote'); h(cb, 'span', { text: '引用' });
       cb.addEventListener('click', () => { const ed = this.editor(); if (!ed) return new Notice('左边没有打开这篇笔记'); pl.citeInsert(ed, n); });
       const ob = h(r, 'button', { cls: 'rw-iconbtn', title: '打开文献' }); ic(ob, 'external-link'); ob.addEventListener('click', () => { const c2 = pl.paperOf(n.file); if (c2) pl.openPaperReader(c2); else pl.openFile(n.file); });
-      const xb = h(r, 'button', { cls: 'rw-iconbtn', title: '从 AI 上下文里拿掉' }); ic(xb, 'x'); xb.addEventListener('click', () => { st.papers = st.papers.filter((p) => p !== n.file.path); this.draw(); });
+      const xb = h(r, 'button', { cls: 'rw-iconbtn', title: '从 AI 上下文里拿掉' }); ic(xb, 'x'); xb.addEventListener('click', () => { st.papers = st.papers.filter((p) => p !== n.file.path); this.save(); this.draw(); });
     });
+    if (papers.length > 1) { const allq = h(list, 'button', { cls: 'rw-linkbtn rw-wa-allq', text: '全部放进提问框' }); allq.addEventListener('click', () => papers.forEach((n, i) => this.addToInput(i + 1, n))); }
     const tools = h(ps, 'div', { cls: 'rw-wa-tools' });
-    const t1 = h(tools, 'button', { cls: 'rw-linkbtn', text: '插入引用（搜全部文献）' }); t1.addEventListener('click', () => { const ed = this.editor(); if (!ed) return new Notice('左边没有打开这篇笔记'); new CitePickModal(this.app, pl, (n) => { pl.citeInsert(ed, n); if (!st.papers.includes(n.file.path)) { st.papers.push(n.file.path); this.draw(); } }).open(); });
+    const t1 = h(tools, 'button', { cls: 'rw-linkbtn', text: '插入引用（搜全部文献）' }); t1.addEventListener('click', () => { const ed = this.editor(); if (!ed) return new Notice('左边没有打开这篇笔记'); new CitePickModal(this.app, pl, (n) => { pl.citeInsert(ed, n); if (!st.papers.includes(n.file.path)) { st.papers.push(n.file.path); this.save(); this.draw(); } }).open(); });
     const t2 = h(tools, 'button', { cls: 'rw-linkbtn', text: '整理编号 + 更新参考文献' }); t2.addEventListener('click', () => { const ed = this.editor(); if (!ed) return new Notice('左边没有打开这篇笔记'); pl.citeRenumber(ed); });
-    const t3 = h(tools, 'button', { cls: 'rw-linkbtn', text: '把文中引用的都加进来' }); t3.addEventListener('click', () => { const ed = this.editor(); const txt = ed ? ed.getValue() : ''; const got = pl.citedPapers(txt, this.file); let k = 0; for (const n of got) if (!st.papers.includes(n.file.path)) { st.papers.push(n.file.path); k++; } new Notice(k ? '加进来 ' + k + ' 篇' : '文中引用的都已经在里面了'); this.draw(); });
+    const t3 = h(tools, 'button', { cls: 'rw-linkbtn', text: '把文中引用的都加进来' }); t3.addEventListener('click', () => { const ed = this.editor(); const txt = ed ? ed.getValue() : ''; const got = pl.citedPapers(txt, this.file); let k = 0; for (const n of got) if (!st.papers.includes(n.file.path)) { st.papers.push(n.file.path); k++; } new Notice(k ? '加进来 ' + k + ' 篇' : '文中引用的都已经在里面了'); this.save(); this.draw(); });
     // 对话
     const chat = h(c, 'div', { cls: 'rw-wa-chat' });
     if (!st.msgs.length) {
@@ -5960,9 +5968,12 @@ class WriteAssistView extends ItemView {
     const opt = h(inp, 'div', { cls: 'rw-wa-opts' });
     const o1 = h(opt, 'label', { cls: 'rw-check' }); const c1 = h(o1, 'input', { attr: { type: 'checkbox' } }); c1.checked = st.useDoc; h(o1, 'span', { text: '带上我写的全文' }); c1.addEventListener('change', () => { st.useDoc = c1.checked; });
     const o2 = h(opt, 'label', { cls: 'rw-check' }); const c2 = h(o2, 'input', { attr: { type: 'checkbox' } }); c2.checked = st.useSel; h(o2, 'span', { text: '带上选中的段落' }); c2.addEventListener('change', () => { st.useSel = c2.checked; });
-    if (st.msgs.length) { const cl = h(opt, 'button', { cls: 'rw-linkbtn', text: '清空对话' }); cl.addEventListener('click', () => { st.msgs = []; this.draw(); }); }
+    c1.addEventListener('change', () => this.save()); c2.addEventListener('change', () => this.save());
+    const syncTip = h(opt, 'span', { cls: 'rw-muted rw-wa-sync', text: '对话已存进库，会同步到其他电脑', title: pl.waFileHint(this.file.path) });
+    if (st.msgs.length) { const cl = h(opt, 'button', { cls: 'rw-linkbtn', text: '清空对话' }); cl.addEventListener('click', async () => { if (!(await pl.confirmDelete({ title: '清空对话', lines: ['清空这篇笔记和 AI 的全部对话？（文献选择保留）'], noTrashNote: true, confirmText: '清空' }))) return; st.msgs = []; this.save(); this.draw(); }); }
     const row = h(inp, 'div', { cls: 'rw-wa-row' });
     const ta = h(row, 'textarea', { attr: { rows: '3', placeholder: '问 AI…（Enter 发送，Shift+Enter 换行）' } });
+    this._ta = ta;
     ta.value = this._draft || ''; ta.addEventListener('input', () => { this._draft = ta.value; });
     ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); const v = ta.value.trim(); if (v) { this._draft = ''; this.send(v); } } });
     const sb = h(row, 'button', { cls: 'rw-btn mod-cta' }); ic(sb, 'send'); sb.disabled = this.busy;
@@ -5993,10 +6004,19 @@ class WriteAssistView extends ItemView {
       const history = st.msgs.slice(0, -1).slice(-8).map((m) => ({ role: m.role, content: m.content }));
       const messages = [{ role: 'system', content: WA_SYSTEM }].concat(history, [{ role: 'user', content: ctx + '【我的问题】\n' + text }]);
       const out = await pl.directChat(messages);
-      st.msgs.push({ role: 'assistant', content: out, papers: papers.map((n) => n.file.path) });
+      st.msgs.push({ role: 'assistant', content: out, papers: papers.map((n) => n.file.path), at: Date.now() });
     } catch (e) {
-      st.msgs.push({ role: 'assistant', content: '⚠️ ' + (e.message || e) });
-    } finally { this.busy = false; this.draw(); }
+      st.msgs.push({ role: 'assistant', content: '⚠️ ' + (e.message || e), at: Date.now() });
+    } finally { this.busy = false; this.save(); this.draw(); }
+  }
+  addToInput(k, n) {
+    const tag = '[' + k + ']《' + trunc(n.title, 60) + '》';
+    const ta = this._ta;
+    const cur = ta ? ta.value : this._draft || '';
+    if (cur.includes(tag)) { if (ta) ta.focus(); return; }
+    const v = (cur && !/\s$/.test(cur) ? cur + ' ' : cur) + tag + ' ';
+    this._draft = v;
+    if (ta) { ta.value = v; ta.focus(); ta.setSelectionRange(v.length, v.length); }
   }
   // 文中已有的引用链接 → AI 上下文里的编号（没放进来的显示为 ?）
   ctxNum(path, papers) { const i = papers.findIndex((n) => n.file.path.replace(/\.md$/, '') === path.replace(/\.md$/, '') || n.file.basename === path.split('/').pop()); return i >= 0 ? i + 1 : '?'; }
@@ -18723,6 +18743,27 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
   }
 
   /* ---------- 写作工作台 ---------- */
+  /* 对话和选的文献存进库（工作台数据/写作对话/），跟着库同步到其他电脑 */
+  async waLoad(path) {
+    this._wa = this._wa || new Map();
+    if (this._wa.has(path) && this._wa.get(path)._loaded) return;
+    const f = this.dataFind('写作对话', path);
+    const obj = f ? await this.dataRead(f) : null;
+    if (obj && obj.waKey) { obj._loaded = true; this._wa.set(path, obj); }
+    else if (this._wa.has(path)) this._wa.get(path)._loaded = true;
+  }
+  waSaveSoon(path) {
+    this._waT = this._waT || {};
+    clearTimeout(this._waT[path]);
+    this._waT[path] = setTimeout(() => {
+      const st = this._wa && this._wa.get(path);
+      if (!st) return;
+      const obj = { waKey: path, papers: st.papers || [], msgs: (st.msgs || []).slice(-200), useDoc: st.useDoc !== false, useSel: st.useSel !== false, updated: Date.now() };
+      const base = path.split('/').pop().replace(/\.md$/, '');
+      this.dataWrite('写作对话', base, path, obj, '写作工作台：「' + base + '」的 AI 对话和选的文献');
+    }, 600);
+  }
+  waFileHint(path) { return '存在 ' + this.dataDir() + '/写作对话/ 里'; }
   pickWritingNote(o) {
     o = o || {};
     const idx = this.buildIndex();
@@ -21754,6 +21795,11 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       const old = this.mfStore.cache.get(obj.key);
       if (old) { for (const k of Object.keys(old)) delete old[k]; Object.assign(old, obj); } else this.mfStore.cache.set(obj.key, obj);
       this.mfEmit({ type: 'reload', key: obj.key });
+    } else if (obj.waKey) {
+      this._wa = this._wa || new Map();
+      obj._loaded = true;
+      this._wa.set(obj.waKey, obj);
+      for (const l of this.app.workspace.getLeavesOfType(WRITE_ASSIST_VIEW)) if (l.view && l.view.file && l.view.file.path === obj.waKey && !l.view.busy) l.view.draw();
     } else if (obj.cells) {
       this._pg = obj.cells;
       if (Array.isArray(obj.columns) && obj.columns.length) { this.settings.pgColumns = obj.columns; }

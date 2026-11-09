@@ -4778,3 +4778,8 @@ input.rw-lw-extra { width: 100%; }
 .rw-wa-row { display: flex; gap: 6px; align-items: flex-end; }
 .rw-wa-row textarea { flex: 1; min-width: 0; resize: vertical; }
 .modal.rw-litpick-modal { width: min(760px, 96vw); }
+/* v0.26.1 写作助手：提问按钮 + 对话同步提示 */
+.rw-wa-allq { font-size: 12px; margin-top: 4px; }
+.rw-wa-sync { font-size: 11px; }
+.rw-wa-paper .rw-btn-sm { padding: 0 7px; gap: 3px; }
+.rw-wa-paper .rw-btn-sm svg { width: 13px; height: 13px; }
