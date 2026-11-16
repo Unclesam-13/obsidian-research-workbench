@@ -3026,10 +3026,69 @@ class WorkbenchView extends ItemView {
     if (p.deadline && parseDate(p.deadline)) h(chips, 'span', { cls: 'rw-deadline ' + deadlineCls(p.deadline), text: '截止 ' + p.deadline + ' · ' + deadlineText(p.deadline) });
     h(chips, 'span', { cls: 'rw-muted', text: '最近活动 ' + relTime(p.lastActivity) });
     this.stepper(top, p);
+    // 名字不一致 / 笔记属性里还是旧名 → 提示一键统一
+    const stale = this.index.notes.filter((n) => n.projectName === p.name && n.staleProject);
+    if ((p.folderName && p.folderName !== p.name) || stale.length) {
+      const bn = h(top, 'div', { cls: 'rw-name-warn' });
+      ic(bn, 'alert-triangle');
+      const tx = h(bn, 'div', { cls: 'rw-name-warn-text' });
+      if (p.folderName && p.folderName !== p.name) {
+        h(tx, 'div', { text: '项目文件夹叫「' + p.folderName + '」，项目主页叫「' + p.name + '」——统一成一个名字：' });
+        const b1 = h(bn, 'button', { cls: 'rw-btn rw-btn-sm mod-cta', text: '用「' + p.folderName + '」' });
+        b1.addEventListener('click', () => this.plugin.unifyProjectName(p, p.folderName));
+        const b2 = h(bn, 'button', { cls: 'rw-btn rw-btn-sm', text: '用「' + p.name + '」' });
+        b2.addEventListener('click', () => this.plugin.unifyProjectName(p, p.name));
+      }
+      if (stale.length) {
+        const olds = [...new Set(stale.map((n) => n.staleProject))];
+        h(tx, 'div', { text: stale.length + ' 篇笔记的项目属性还写着旧名「' + olds.join('、') + '」（已按所在文件夹算进本项目）' });
+        const b3 = h(bn, 'button', { cls: 'rw-btn rw-btn-sm', text: '把它们改成「' + p.name + '」' });
+        b3.addEventListener('click', async () => { for (const o of olds) await this.plugin.syncProjectRefs(o, p.name); new Notice('已更新 ' + stale.length + ' 篇笔记的项目属性'); this.plugin.refreshViews(); });
+      }
+    }
     const nx = h(top, 'div', { cls: 'rw-next rw-next-lg is-clickable', title: '点击修改下一步' });
     ic(nx, 'arrow-right-circle');
     h(nx, 'span', { text: p.next ? '下一步：' + p.next : '点击设置下一步要做什么…' });
     nx.addEventListener('click', () => this.plugin.promptText('下一步要做什么？', p.next, (v) => this.plugin.setField(p.file, 'next', v)));
+
+    // ① 项目文件夹：主界面，放在最上面
+    const files = this.index.files.filter((x) => x.projectName === p.name);
+    const fview = this.plugin.settings.detailFileView || 'folder';
+    const fsec = this.section(el, fview === 'folder' ? '项目文件夹' : '项目文件 · ' + files.length, fview === 'folder' ? 'folder-tree' : 'paperclip');
+    fsec.el.classList.add('rw-dsec', 'rw-proj-main');
+    fsec.el.style.setProperty('--pc', projectColor(p.name));
+    this.seg(fsec.right, [['folder', '文件夹'], ['cat', '分类']], fview, (v) => { this.plugin.settings.detailFileView = v; this.plugin.saveSettingsSoon(); this.render(); });
+    if (fview === 'folder') this.renderFolderBrowser(fsec.body, p);
+    else if (!files.length) h(fsec.body, 'div', { cls: 'rw-empty-sm', text: '还没有文件。把实验数据、PPT、PDF 等拖到本页任意位置即可。' });
+    for (const k of fview === 'folder' ? [] : Object.keys(FILE_CATS)) {
+      const fl = files.filter((x) => x.cat === k).sort((a, b) => b.mtime - a.mtime);
+      if (!fl.length) continue;
+      const g = h(fsec.body, 'div', { cls: 'rw-fgroup' });
+      const gh = h(g, 'div', { cls: 'rw-fgroup-head' });
+      ic(gh, FILE_CATS[k].icon);
+      h(gh, 'span', { text: FILE_CATS[k].label });
+      h(gh, 'span', { cls: 'rw-tab-count', text: fl.length });
+      for (const x of fl.slice(0, 4)) {
+        const r = h(g, 'div', { cls: 'rw-row rw-frow' });
+        const iw = h(r, 'span', { cls: 'rw-ficon cat-' + x.cat });
+        ic(iw, fileIcon(x.ext));
+        const mid = h(r, 'div', { cls: 'rw-row-mid' });
+        h(mid, 'div', { cls: 'rw-row-title', text: x.name, title: x.kind === 'link' ? x.extPath : x.file.path });
+        h(mid, 'div', { cls: 'rw-row-sub', text: [fmtSize(x.size), relTime(x.mtime), x.kind === 'link' ? '库外链接' : ''].filter(Boolean).join(' · ') });
+        const b = h(r, 'button', { cls: 'rw-iconbtn', title: '在文件夹中显示' });
+        ic(b, 'folder-open');
+        b.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.revealEntry(x); });
+        this.trashBtn(r, x.kind === 'link' ? '删除链接记录' : '删除文件', () => this.plugin.deleteEntry(x));
+        r.addEventListener('click', () => this.plugin.previewEntries(fl, fl.indexOf(x)));
+        r.addEventListener('dblclick', () => this.plugin.openEntry(x));
+        r.addEventListener('contextmenu', (e) => this.fileMenu(e, x));
+      }
+      if (fl.length > 4) {
+        const more = h(g, 'button', { cls: 'rw-linkbtn rw-fgroup-more', text: '还有 ' + (fl.length - 4) + ' 个，查看全部 →' });
+        more.addEventListener('click', () => this.switchTab('files', { project: p.name, cat: k }));
+      }
+    }
+
 
     this.dropArea(el, '把这个项目的任何文件拖到这里：数据、PPT、PDF、录音、文稿…', () => ({ project: p.name }));
 
@@ -3129,43 +3188,6 @@ class WorkbenchView extends ItemView {
         ic(b, NOTE_TYPES[type].icon);
         h(b, 'span', { text: type === 'experiment' ? '实验与数据' : type === 'meeting' ? '会议纪要' : NOTE_TYPES[type].label });
         b.addEventListener('click', () => this.plugin.newNoteModal({ type, project: p.name }));
-      }
-    }
-
-    // 文件：按文件夹（默认）/ 按分类
-    const files = this.index.files.filter((x) => x.projectName === p.name);
-    const fview = this.plugin.settings.detailFileView || 'folder';
-    const fsec = this.section(rightCol, fview === 'folder' ? '项目文件夹' : '文件 · ' + files.length, fview === 'folder' ? 'folder-tree' : 'paperclip');
-    fsec.el.classList.add('rw-dsec');
-    this.seg(fsec.right, [['folder', '文件夹'], ['cat', '分类']], fview, (v) => { this.plugin.settings.detailFileView = v; this.plugin.saveSettingsSoon(); this.render(); });
-    if (fview === 'folder') this.renderFolderBrowser(fsec.body, p);
-    else if (!files.length) h(fsec.body, 'div', { cls: 'rw-empty-sm', text: '还没有文件。把实验数据、PPT、PDF 等拖到本页任意位置即可。' });
-    for (const k of fview === 'folder' ? [] : Object.keys(FILE_CATS)) {
-      const fl = files.filter((x) => x.cat === k).sort((a, b) => b.mtime - a.mtime);
-      if (!fl.length) continue;
-      const g = h(fsec.body, 'div', { cls: 'rw-fgroup' });
-      const gh = h(g, 'div', { cls: 'rw-fgroup-head' });
-      ic(gh, FILE_CATS[k].icon);
-      h(gh, 'span', { text: FILE_CATS[k].label });
-      h(gh, 'span', { cls: 'rw-tab-count', text: fl.length });
-      for (const x of fl.slice(0, 4)) {
-        const r = h(g, 'div', { cls: 'rw-row rw-frow' });
-        const iw = h(r, 'span', { cls: 'rw-ficon cat-' + x.cat });
-        ic(iw, fileIcon(x.ext));
-        const mid = h(r, 'div', { cls: 'rw-row-mid' });
-        h(mid, 'div', { cls: 'rw-row-title', text: x.name, title: x.kind === 'link' ? x.extPath : x.file.path });
-        h(mid, 'div', { cls: 'rw-row-sub', text: [fmtSize(x.size), relTime(x.mtime), x.kind === 'link' ? '库外链接' : ''].filter(Boolean).join(' · ') });
-        const b = h(r, 'button', { cls: 'rw-iconbtn', title: '在文件夹中显示' });
-        ic(b, 'folder-open');
-        b.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.revealEntry(x); });
-        this.trashBtn(r, x.kind === 'link' ? '删除链接记录' : '删除文件', () => this.plugin.deleteEntry(x));
-        r.addEventListener('click', () => this.plugin.previewEntries(fl, fl.indexOf(x)));
-        r.addEventListener('dblclick', () => this.plugin.openEntry(x));
-        r.addEventListener('contextmenu', (e) => this.fileMenu(e, x));
-      }
-      if (fl.length > 4) {
-        const more = h(g, 'button', { cls: 'rw-linkbtn rw-fgroup-more', text: '还有 ' + (fl.length - 4) + ' 个，查看全部 →' });
-        more.addEventListener('click', () => this.switchTab('files', { project: p.name, cat: k }));
       }
     }
 
@@ -18493,6 +18515,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     this.app.workspace.onLayoutReady(scan);
     this.registerEvent(this.app.vault.on('modify', (f) => this.onDataFileChanged(f)));
     this.registerEvent(this.app.vault.on('create', (f) => { if (this.app.workspace.layoutReady) this.onDataFileChanged(f); }));
+    this.registerEvent(this.app.vault.on('rename', (f, old) => { this.onProjectRenamed(f, old); }));
     this.registerEvent(this.app.vault.on('rename', async (f, old) => {
       try { await this.mfStore.rename(old, f.path); } catch (e) { /* ignore */ }
       if (this._pg && this._pg[old]) { this._pg[f.path] = this._pg[old]; delete this._pg[old]; this.pgSaveSoon(); }
@@ -18600,6 +18623,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
           kind: 'link', file, name, ext, extPath,
           cat: FILE_CATS[str(fm.category)] ? str(fm.category) : catOfExt(ext),
           projectName: parseLinkName(fm.project) || projectOfPath(file.path),
+          fmProject: parseLinkName(fm.project), pathProject: projectOfPath(file.path),
           size: Number(fm.size) || null, mtime: file.stat.mtime,
         });
       } else if (NOTE_TYPES[type]) {
@@ -18634,9 +18658,23 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       for (let i = segs.length - 2; i >= 1; i--) { if (FOLDER_CAT[segs[i]]) { cat = FOLDER_CAT[segs[i]]; break; } }
       files.push({ kind: 'file', file: f, name: f.name, ext: 'md', cat: cat || 'other', projectName: projectOfPath(f.path), size: f.stat.size, mtime: f.stat.mtime, looseMd: true });
     }
-    // 项目主页已删除的“孤儿”笔记 / 文件视为未归属
-    for (const x of files) if (x.projectName && !byName.has(x.projectName)) x.projectName = '';
-    for (const n of notes) if (n.projectName && !byName.has(n.projectName)) n.projectName = '';
+    // 项目文件夹名和主页名不一样时（在 Obsidian 里只改了其中一个）：文件夹里的东西仍算这个项目
+    const folderToProj = new Map();
+    for (const p of projects) {
+      if (!p.file.path.startsWith(projRoot)) continue;
+      const rest = p.file.path.slice(projRoot.length);
+      if (rest.split('/').length !== 2) continue;
+      p.folderName = rest.split('/')[0];
+      if (!folderToProj.has(p.folderName) || p.folderName === p.name) folderToProj.set(p.folderName, p.name);
+    }
+    const resolveProj = (nm) => (!nm ? '' : byName.has(nm) ? nm : folderToProj.get(nm) || '');
+    for (const x of files) x.projectName = resolveProj(x.projectName);
+    // 属性里写的项目已不存在（多半是旧名）→ 按所在文件夹归属
+    for (const n of notes) {
+      let r = resolveProj(n.projectName);
+      if (!r && n.pathProject) { r = resolveProj(n.pathProject); if (r && n.fmProject) n.staleProject = n.fmProject; }
+      n.projectName = r;
+    }
     for (const x of files) {
       const p = byName.get(x.projectName);
       if (p) { p.fileCount = (p.fileCount || 0) + 1; if (x.mtime > p.lastActivity) p.lastActivity = x.mtime; }
@@ -18654,7 +18692,8 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       if (p.parentName && !byName.has(p.parentName)) p.parentName = '';
     }
     projects.sort((a, b) => KIND_ORDER.indexOf(a.pkind) - KIND_ORDER.indexOf(b.pkind) || stageIdxOf(a) - stageIdxOf(b) || b.lastActivity - a.lastActivity);
-    return { projects, notes, files, byName };
+    this._lastIdx = { projects, notes, files, byName };
+    return this._lastIdx;
   }
 
   countOpenTasks(index) {
@@ -21876,7 +21915,8 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
   projectDir(name) {
     if (name === '__kb') return normalizePath(this.settings.kbFolder || '知识库');
     if (name === '__life') return normalizePath(this.settings.lifeFolder || '生活');
-    return normalizePath(this.settings.rootFolder + '/项目/' + name);
+    const p = this._lastIdx && this._lastIdx.byName.get(name);
+    return normalizePath(this.settings.rootFolder + '/项目/' + (p && p.folderName ? p.folderName : name));
   }
   listDir(path) {
     const f = this.app.vault.getAbstractFileByPath(path);
@@ -22474,6 +22514,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     const folder = this.app.vault.getAbstractFileByPath(oldFolder);
     const homeInFolder = homePath.startsWith(oldFolder + '/');
     const inDetail = this.app.workspace.getLeavesOfType(VIEW_TYPE).map((l) => l.view).filter((v) => v && v.tab === 'detail' && v.detailProject === old);
+    this._projRenaming = Date.now();
     try {
       await this.actWith({}, async () => {
         // ① 项目主页改名
@@ -22520,9 +22561,118 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     return true;
   }
 
+  /* 在 Obsidian 里直接改了项目文件夹或项目主页的名字：把另一半、属性里的项目名、标题都跟上 */
+  /* 文件夹名和主页名统一 */
+  async unifyProjectName(p, target) {
+    const projRoot = normalizePath((this.settings.rootFolder || '科研') + '/项目');
+    this._projRenaming = Date.now();
+    try {
+      if (target === p.name) {
+        const dir = p.file.parent, to = normalizePath(projRoot + '/' + target);
+        if (this.app.vault.getAbstractFileByPath(to)) { new Notice('已经有文件夹「' + target + '」了'); return; }
+        await this.app.fileManager.renameFile(dir, to);
+        new Notice('项目文件夹已改成「' + target + '」');
+      } else {
+        const old = p.name, to = normalizePath(p.file.parent.path + '/' + target + '.md');
+        if (this.app.vault.getAbstractFileByPath(to)) { new Notice('文件夹里已经有「' + target + '.md」了'); return; }
+        await this.app.fileManager.renameFile(p.file, to);
+        await new Promise((r) => setTimeout(r, 400));
+        const n = await this.syncProjectRefs(old, target);
+        new Notice('项目已统一叫「' + target + '」' + (n ? '（更新了 ' + n + ' 篇笔记的项目属性）' : ''));
+      }
+    } catch (e) { console.error(e); new Notice('没改成：' + (e.message || e)); }
+    finally { this._projRenaming = Date.now(); setTimeout(() => this.refreshViews(), 300); }
+  }
+  /* 项目改名后：属性里的项目名、主页标题、正文 [[旧名]]、工作台记着的旧名都换成新名 */
+  async syncProjectRefs(oldName, newName) {
+      const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const linkRe = new RegExp('\\[\\[' + esc(oldName) + '(?=\\]\\]|\\||#)', 'g');
+      const fixVal = (v) => { if (Array.isArray(v)) return v.map(fixVal); if (typeof v !== 'string') return v; if (v.trim() === oldName) return newName; return v.replace(linkRe, '[[' + newName); };
+      let nFm = 0;
+      // 属性里写着旧项目名的笔记（project / parent / projects）
+      for (const md of this.app.vault.getMarkdownFiles()) {
+        const fm = (this.app.metadataCache.getFileCache(md) || {}).frontmatter;
+        if (!fm) continue;
+        const hit = ['project', 'parent', 'projects'].some((k) => fm[k] != null && JSON.stringify(fm[k]).includes(oldName) && JSON.stringify(fixVal(fm[k])) !== JSON.stringify(fm[k]));
+        if (!hit) continue;
+        await this.app.fileManager.processFrontMatter(md, (x) => { for (const k of ['project', 'parent', 'projects']) if (x[k] != null) x[k] = fixVal(x[k]); });
+        nFm++;
+      }
+      // 标题：和旧名一样就跟着改
+      const homeNow = (this.buildIndex().byName.get(newName) || {}).file;
+      if (homeNow instanceof TFile) {
+        const fm = (this.app.metadataCache.getFileCache(homeNow) || {}).frontmatter || {};
+        if (!str(fm.title) || str(fm.title) === oldName) await this.app.fileManager.processFrontMatter(homeNow, (x) => { x.title = newName; });
+        await this.app.vault.process(homeNow, (d) => d.replace(new RegExp('^# ' + esc(oldName) + '[ \\t]*$', 'm'), '# ' + newName));
+      }
+      // 正文里没被 Obsidian 自动更新的 [[旧名]]
+      const un = this.app.metadataCache.unresolvedLinks || {};
+      for (const src of Object.keys(un)) {
+        if (!un[src] || !un[src][oldName]) continue;
+        const sf = this.app.vault.getAbstractFileByPath(src);
+        if (sf instanceof TFile) await this.app.vault.process(sf, (d) => d.replace(linkRe, '[[' + newName));
+      }
+      // 工作台里记着旧名的地方
+      for (const l of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+        const v = l.view; if (!v) continue;
+        if (v.detailProject === oldName) v.detailProject = newName;
+        if (v.logProject === oldName) v.logProject = newName;
+        if (v.filters) for (const k of Object.keys(v.filters)) if (v.filters[k] && v.filters[k].project === oldName) v.filters[k].project = newName;
+        if (v.actF && v.actF.project === oldName) v.actF.project = newName;
+      }
+      if (this.settings.lastProject === oldName) { this.settings.lastProject = newName; this.saveSettingsSoon(); }
+      return nFm;
+  }
+
+  async onProjectRenamed(f, oldPath) {
+    if (this._projRenaming && Date.now() - this._projRenaming < 8000) return; // 工作台自己改名时不重复处理
+    const projRoot = normalizePath((this.settings.rootFolder || '科研') + '/项目');
+    const parentOf = (x) => x.split('/').slice(0, -1).join('/');
+    const baseOf = (x) => x.split('/').pop();
+    let oldName = '', newName = '', home = null, folderDone = false;
+    if (f.children !== undefined) {
+      // 文件夹：科研/项目/旧名 → 科研/项目/新名
+      if (parentOf(oldPath) !== projRoot || parentOf(f.path) !== projRoot) return;
+      oldName = baseOf(oldPath); newName = f.name;
+      home = f.children.find((c) => c instanceof TFile && c.extension === 'md' && c.basename === oldName);
+      if (!home) return;
+      const fm = (this.app.metadataCache.getFileCache(home) || {}).frontmatter || {};
+      if (normType(fm.type) !== 'project') return;
+      folderDone = true;
+    } else if (f instanceof TFile && f.extension === 'md') {
+      // 项目主页：科研/项目/X/旧名.md → 科研/项目/X/新名.md（同一个文件夹里改名）
+      if (parentOf(oldPath) !== parentOf(f.path) || parentOf(parentOf(f.path)) !== projRoot) return;
+      const fm = (this.app.metadataCache.getFileCache(f) || {}).frontmatter || {};
+      if (normType(fm.type) !== 'project') return;
+      oldName = baseOf(oldPath).replace(/\.md$/, ''); newName = f.basename; home = f;
+    } else return;
+    if (!oldName || !newName || oldName === newName) return;
+    this._projRenaming = Date.now();
+    try {
+      // 另一半也改名：文件夹改了就改主页，主页改了且文件夹同名就改文件夹
+      if (folderDone) {
+        const target = normalizePath(f.path + '/' + newName + '.md');
+        if (!this.app.vault.getAbstractFileByPath(target)) await this.app.fileManager.renameFile(home, target);
+      } else {
+        const dir = home.parent;
+        const target = normalizePath(projRoot + '/' + newName);
+        if (dir && dir.name === oldName && !this.app.vault.getAbstractFileByPath(target)) await this.app.fileManager.renameFile(dir, target);
+      }
+      await new Promise((r) => setTimeout(r, 400));
+      const nFm = await this.syncProjectRefs(oldName, newName);
+      new Notice('✏️ 项目改名已同步：' + oldName + ' → ' + newName + (nFm ? '（更新了 ' + nFm + ' 篇笔记的项目属性）' : ''));
+    } catch (e) {
+      console.error('[科研工作台] 同步项目改名失败', e);
+      new Notice('项目改名同步没完成：' + (e.message || e));
+    } finally {
+      this._projRenaming = Date.now();
+      setTimeout(() => this.refreshViews(), 300);
+    }
+  }
+
   async deleteProject(p) {
     const idx = this.buildIndex();
-    const folderPath = normalizePath(this.settings.rootFolder + '/项目/' + p.name);
+    const folderPath = this.projectDir(p.name);
     const folder = this.app.vault.getAbstractFileByPath(folderPath);
     const inFolder = (f) => f.path.startsWith(folderPath + '/');
     const notesIn = idx.notes.filter((n) => inFolder(n.file)).length;

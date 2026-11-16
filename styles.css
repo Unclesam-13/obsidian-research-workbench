@@ -4783,3 +4783,13 @@ input.rw-lw-extra { width: 100%; }
 .rw-wa-sync { font-size: 11px; }
 .rw-wa-paper .rw-btn-sm { padding: 0 7px; gap: 3px; }
 .rw-wa-paper .rw-btn-sm svg { width: 13px; height: 13px; }
+
+/* v0.26.2 项目详情：项目文件夹是主界面 */
+.rw-proj-main { border: 1.5px solid color-mix(in srgb, var(--pc, var(--rw-accent)) 45%, var(--rw-border)); border-top: 4px solid var(--pc, var(--rw-accent)); border-radius: var(--rw-radius); padding: 10px 12px 12px; background: var(--rw-surface); box-shadow: 0 2px 10px rgba(0,0,0,.05); margin-bottom: 14px; }
+.rw-proj-main > .rw-sec-head, .rw-proj-main .rw-section-head { font-size: 1.12em; }
+.rw-proj-main .rw-fb { border: none; background: transparent; }
+.rw-proj-main .rw-fb-list { max-height: 62vh; }
+.rw-proj-main .rw-fb-bar { padding: 6px 4px 8px; }
+.rw-name-warn { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; padding: 8px 12px; border-radius: 10px; background: color-mix(in srgb, #f08c00 12%, transparent); border: 1px solid color-mix(in srgb, #f08c00 40%, transparent); font-size: 13px; }
+.rw-name-warn > .rw-icon svg { color: #e67700; width: 16px; height: 16px; }
+.rw-name-warn-text { flex: 1; min-width: 220px; display: flex; flex-direction: column; gap: 2px; }
