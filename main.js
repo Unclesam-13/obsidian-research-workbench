@@ -8048,6 +8048,56 @@ class MindflowPanel {
     this.render();
   }
   setQuote(q) { this.quote = q; this.tab = 'chat'; this.render(); setTimeout(() => this.inputEl && this.inputEl.focus(), 40); }
+  /* 跳到 PDF 某页：同一个阅读视图里就直接翻，否则打开 PDF */
+  gotoPage(page) {
+    const pl = this.plugin;
+    for (const l of this.app.workspace.getLeavesOfType(PAPER_READER_VIEW)) { const v = l.view; if (v && v.mf === this && v.pane && v.pane.goto) { v.pane.goto(Number(page)); return; } }
+    if (this.ctx && this.ctx.pdf) pl.openPdfPage(this.ctx.pdf, page);
+  }
+  /* 摘录：这篇文献笔记「划线摘录」里的每一条 */
+  async renderExcerptTab(body) {
+    const pl = this.plugin, c = this.ctx;
+    const note = c && (c.note || (c.noteObj && c.noteObj.file));
+    if (!note) { h(body, 'div', { cls: 'rw-empty-sm', text: '这篇还没有文献笔记，摘录会存在笔记的「划线摘录」里。先在「信息」或文献页给它建笔记。' }); return; }
+    const all = await pl.readExcerpts(note);
+    if (this.tab !== 'excerpt') return;
+    const bar = h(body, 'div', { cls: 'rw-mf-exbar' });
+    h(bar, 'span', { cls: 'rw-muted', text: all.length ? all.length + ' 条摘录' : '' });
+    const q = h(bar, 'input', { cls: 'rw-mf-exq', attr: { type: 'search', placeholder: '搜摘录…' } }); q.value = this._exQ || '';
+    const ob = h(bar, 'button', { cls: 'rw-tp-btn', title: '在笔记里打开「划线摘录」' }); ic(ob, 'file-text'); ob.addEventListener('click', () => pl.openFile(note));
+    const list = h(body, 'div', { cls: 'rw-mf-exlist' });
+    const draw = () => {
+      clear(list);
+      const kw = (this._exQ || '').toLowerCase().trim();
+      const xs = kw ? all.filter((x) => [x.text, x.translation, x.note].concat((x.ai || []).map((a) => a.content)).join(' ').toLowerCase().includes(kw)) : all;
+      if (!all.length) { h(list, 'div', { cls: 'rw-empty-sm', text: '还没有摘录。PDF 里选中文字点「摘录」/「❝」，或在 AI 回答里划线点「存为摘录」，都会出现在这里。' }); return; }
+      if (!xs.length) { h(list, 'div', { cls: 'rw-empty-sm', text: '没有匹配的摘录' }); return; }
+      for (const x of xs) {
+        const r = h(list, 'div', { cls: 'rw-mf-exi' });
+        const hd = h(r, 'div', { cls: 'rw-mf-exhead' });
+        if (x.page) { const pg = h(hd, 'button', { cls: 'rw-linkbtn', text: 'p.' + x.page, title: '跳到这一页' }); pg.addEventListener('click', () => this.gotoPage(x.page)); }
+        if (x.source) h(hd, 'span', { cls: 'rw-mf-extag', text: x.source });
+        if (x.date) h(hd, 'span', { cls: 'rw-muted', text: x.date.slice(5) });
+        h(hd, 'span', { cls: 'rw-tp-sp' });
+        const ask = h(hd, 'button', { cls: 'rw-tp-btn', title: '拿这段原文去问 AI' }); ic(ask, 'message-square-plus');
+        ask.addEventListener('click', () => this.setQuote({ text: x.text, page: x.page, from: 'excerpt' }));
+        const cp = h(hd, 'button', { cls: 'rw-tp-btn', title: '复制原文' }); ic(cp, 'copy'); cp.addEventListener('click', () => pl.copyText(x.text));
+        const del = h(hd, 'button', { cls: 'rw-tp-btn', title: '删除这条摘录' }); ic(del, 'trash-2');
+        del.addEventListener('click', async () => { if (await pl.confirmDelete({ title: '删除摘录', lines: ['删除这条摘录？', trunc(x.text, 80)], noTrashNote: true })) { await pl.deleteExcerpt(note, x); this.render(); } });
+        if (x.text) setMathText(h(r, 'div', { cls: 'rw-mf-exsrc' }), x.text, 2000);
+        if (x.translation) h(r, 'div', { cls: 'rw-mf-exdst', text: x.translation });
+        for (const a of x.ai || []) {
+          const d = h(r, 'details', { cls: 'rw-mf-exai' });
+          h(d, 'summary', { text: a.label });
+          const bd = h(d, 'div', { cls: 'rw-md' });
+          d.addEventListener('toggle', () => { if (d.open && !bd.childNodes.length) renderAiMarkdown(this.app, a.content, bd, this.comp); }, { once: false });
+        }
+        if (x.note) { const nn = h(r, 'div', { cls: 'rw-mf-exnote' }); h(nn, 'b', { text: '我的笔记：' }); nn.appendChild(document.createTextNode(x.note)); }
+      }
+    };
+    q.addEventListener('input', () => { this._exQ = q.value; draw(); });
+    draw();
+  }
   onEvent(ev) {
     if (ev.type === 'reload') { this.load(); return; }
     if (ev.type === 'delta' && ev.nodeId === this.session.cur && this.tab === 'chat') {
@@ -8112,6 +8162,7 @@ class MindflowPanel {
     const tb = (id, icon, title) => { const b = h(tabs, 'button', { cls: 'rw-tp-btn' + (this.tab === id ? ' is-on' : ''), title }); ic(b, icon); b.addEventListener('click', () => { this.tab = id; this.render(); }); };
     tb('chat', 'messages-square', '对话');
     tb('tree', 'git-fork', '问答树');
+    tb('excerpt', 'bookmark', '摘录（这篇文献的划线摘录）');
     const more = h(head, 'button', { cls: 'rw-tp-btn', title: '更多' }); ic(more, 'more-horizontal');
     more.addEventListener('click', (e) => this.moreMenu(e));
     if (!this.ctx) { h(el, 'div', { cls: 'rw-empty-sm', text: '打开一篇文献后，可以在这里基于全文提问。' }); return; }
@@ -8122,6 +8173,7 @@ class MindflowPanel {
     }
     if (!s) { h(el, 'div', { cls: 'rw-empty-sm', text: '加载中…' }); return; }
     if (this.tab === 'tree') { this.renderTree(h(el, 'div', { cls: 'rw-mf-body' })); return; }
+    if (this.tab === 'excerpt') { this.renderExcerptTab(h(el, 'div', { cls: 'rw-mf-body rw-mf-ex' })); return; }
     // 对话
     this.msgsEl = h(el, 'div', { cls: 'rw-mf-msgs' });
     this.msgEls = new Map(); this.thinkEls = new Map();

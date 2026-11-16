@@ -4815,3 +4815,17 @@ input.rw-lw-extra { width: 100%; }
 .rw-ptree-empty { font-size: 12px; padding: 2px 0 4px; }
 .rw-ptree-more { font-size: 12px; align-self: flex-start; margin: 2px 0 0 4px; }
 .rw-ptree-text { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+
+/* v0.27.1 文献问答面板：摘录页 */
+.rw-mf-ex { display: flex; flex-direction: column; gap: 8px; }
+.rw-mf-exbar { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.rw-mf-exbar input.rw-mf-exq { flex: 1; min-width: 0; height: 26px; font-size: 12px; }
+.rw-mf-exlist { display: flex; flex-direction: column; gap: 8px; }
+.rw-mf-exi { border: 1px solid var(--background-modifier-border); border-left: 3px solid var(--rw-accent, var(--interactive-accent)); border-radius: 8px; padding: 6px 10px 8px; background: var(--background-primary); }
+.rw-mf-exhead { display: flex; align-items: center; gap: 6px; font-size: 11.5px; margin-bottom: 4px; }
+.rw-mf-extag { padding: 0 6px; border-radius: 8px; background: var(--background-secondary); color: var(--text-muted); }
+.rw-mf-exsrc { font-size: 13px; line-height: 1.6; }
+.rw-mf-exdst { font-size: 12.5px; line-height: 1.6; color: var(--text-muted); margin-top: 4px; padding-top: 4px; border-top: 1px dashed var(--background-modifier-border); }
+.rw-mf-exai { margin-top: 4px; font-size: 12.5px; }
+.rw-mf-exai summary { cursor: pointer; color: var(--text-accent); }
+.rw-mf-exnote { margin-top: 4px; font-size: 12.5px; background: var(--background-secondary); border-radius: 6px; padding: 4px 8px; }
