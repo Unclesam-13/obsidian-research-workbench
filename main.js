@@ -1338,9 +1338,25 @@ class WorkbenchView extends ItemView {
     if (actMode) this.renderActivity(lp.body, { compact: true });
     else this.renderWorklog({ body: lp.body, right: lp.right }, true);
 
-    // ② 中上：流程看板
-    const bp = this.panel(grid, 'rw-p-board', '流程看板', 'kanban-square');
+    // ② 中上：项目时间树（自己写的一句话进展）/ 流程看板
+    if (!st.homeBoardV2) { st.homeBoard = 'tree'; st.homeBoardV2 = true; this.plugin.saveSettingsSoon(); }
+    const treeMode = st.homeBoard !== 'board';
+    const bp = this.panel(grid, 'rw-p-board', treeMode ? '项目时间树' : '流程看板', treeMode ? 'git-commit-vertical' : 'kanban-square');
     const shown = st.showDoneOnBoard ? projects : active;
+    if (treeMode) {
+      this.segmented(bp.right, [['tree', '时间树'], ['board', '流程看板']], 'tree', (v) => { st.homeBoard = v; this.plugin.saveSettingsSoon(); this.render(); });
+      const dt = h(bp.right, 'label', { cls: 'rw-check', title: '显示已完成的项目' });
+      const dcb = h(dt, 'input', { attr: { type: 'checkbox' } }); dcb.checked = !!st.showDoneOnBoard;
+      h(dt, 'span', { text: '已完成' });
+      dcb.addEventListener('change', () => { st.showDoneOnBoard = cb2(dcb); });
+      const cb2 = (x) => { st.showDoneOnBoard = x.checked; this.plugin.saveSettingsSoon(); this.render(); return x.checked; };
+      if (!projects.length) {
+        const empty = h(bp.body, 'div', { cls: 'rw-empty' });
+        h(empty, 'div', { text: '还没有科研项目。' });
+        this.btn(empty, '创建第一个项目', 'folder-plus', () => this.plugin.newProjectModal(), 'mod-cta');
+      } else this.renderProjectTrees(bp.body, shown);
+    } else {
+    this.segmented(bp.right, [['tree', '时间树'], ['board', '流程看板']], 'board', (v) => { st.homeBoard = v; this.plugin.saveSettingsSoon(); this.render(); });
     const kindsPresent = KIND_ORDER.filter((k) => shown.some((p) => p.pkind === k));
     if (kindsPresent.length > 1) {
       if (st.homeKind !== 'all' && !kindsPresent.includes(st.homeKind)) st.homeKind = kindsPresent[0];
@@ -1368,6 +1384,7 @@ class WorkbenchView extends ItemView {
         if (ks.length > 1 || kindsPresent.length <= 1) this.kindHeader(bp.body, k, list.length);
         this.renderFlowGroups(bp.body, list, k, st.homeView === 'matrix');
       }
+    }
     }
 
     // ③ 中下：图表（时间轴 / 活跃度 / 每月新增，三选一）
@@ -1399,6 +1416,60 @@ class WorkbenchView extends ItemView {
       const dls = this.collectDeadlines().filter((x) => daysUntil(x.date) >= -30).slice(0, 20);
       if (!dls.length) h(ip.body, 'div', { cls: 'rw-empty-sm', text: '没有设置截止日期的项目或笔记' });
       for (const x of dls) this.rowItem(ip.body, x.item, deadlineText(x.date), deadlineCls(x.date));
+    }
+  }
+
+  /* 首页：每个项目一棵时间树（项目主页「📌 进展日志」里自己写的一句话） */
+  renderProjectTrees(body, list) {
+    const pl = this.plugin;
+    const wrap = h(body, 'div', { cls: 'rw-ptree-grid' });
+    const sorted = list.slice().sort((a, b) => b.lastActivity - a.lastActivity);
+    for (const p of sorted) {
+      const card = h(wrap, 'div', { cls: 'rw-ptree' });
+      card.style.setProperty('--pc', projectColor(p.name));
+      const hd = h(card, 'div', { cls: 'rw-ptree-head' });
+      h(hd, 'span', { cls: 'rw-ptree-dot' });
+      const tt = h(hd, 'b', { cls: 'rw-ptree-title', text: p.title, title: '打开项目' });
+      tt.addEventListener('click', () => this.openProject(p.name));
+      if (p.stage) h(hd, 'span', { cls: 'rw-ptree-stage', text: p.stage });
+      if (p.status && p.status !== '进行中') h(hd, 'span', { cls: 'rw-status st-' + p.status, text: p.status });
+      const inp = h(card, 'input', { cls: 'rw-ptree-input', attr: { type: 'text', placeholder: '写一句进展，回车记下' } });
+      inp.addEventListener('keydown', async (e) => {
+        if (e.key !== 'Enter' || e.isComposing) return;
+        e.preventDefault();
+        const v = inp.value.trim(); if (!v) return;
+        inp.disabled = true;
+        await pl.addProjectProgress(p, v);
+        inp.value = ''; inp.disabled = false;
+      });
+      const tree = h(card, 'div', { cls: 'rw-ptree-list' });
+      pl.readProjectProgress(p).then((items) => {
+        if (!items.length) { h(tree, 'div', { cls: 'rw-muted rw-ptree-empty', text: '还没有进展记录' }); return; }
+        const showAll = this._ptreeAll && this._ptreeAll.has(p.name);
+        const shownItems = showAll ? items : items.slice(0, 5);
+        let lastDate = '';
+        for (const it of shownItems) {
+          const r = h(tree, 'div', { cls: 'rw-ptree-item' + (it.auto ? ' is-auto' : '') });
+          h(r, 'span', { cls: 'rw-ptree-node' });
+          const when = h(r, 'span', { cls: 'rw-ptree-when', text: it.date === lastDate ? (it.time || '') : (daysUntil(it.date) === 0 ? '今天' : it.date.slice(5)) + (it.time ? ' ' + it.time : '') });
+          lastDate = it.date;
+          when.title = it.date + (it.time ? ' ' + it.time : '');
+          h(r, 'span', { cls: 'rw-ptree-text', text: it.text, title: it.text });
+          r.addEventListener('click', () => pl.promptText('修改这条进展（' + it.date + '）', it.text, async (v) => { if (v != null) await pl.editProjectProgress(p, it, v); }));
+          r.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            const m = new Menu();
+            m.addItem((i) => i.setTitle('修改').setIcon('pencil').onClick(() => pl.promptText('修改这条进展（' + it.date + '）', it.text, async (v) => { if (v != null) await pl.editProjectProgress(p, it, v); })));
+            m.addItem((i) => i.setTitle('删除这条').setIcon('trash-2').onClick(async () => { if (await pl.confirmDelete({ title: '删除进展', lines: [it.date + ' ' + it.text], noTrashNote: true })) await pl.editProjectProgress(p, it, null); }));
+            m.addItem((i) => i.setTitle('打开项目主页').setIcon('file-text').onClick(() => pl.openFile(p.file)));
+            m.showAtMouseEvent(e);
+          });
+        }
+        if (items.length > 5) {
+          const mb = h(tree, 'button', { cls: 'rw-linkbtn rw-ptree-more', text: showAll ? '收起' : '还有 ' + (items.length - 5) + ' 条 →' });
+          mb.addEventListener('click', () => { this._ptreeAll = this._ptreeAll || new Set(); if (showAll) this._ptreeAll.delete(p.name); else this._ptreeAll.add(p.name); this.render(); });
+        }
+      });
     }
   }
 
@@ -20078,6 +20149,59 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       if (k === 'direction') fm.parent = '';
     });
     new Notice('「' + p.title + '」→ ' + KINDS[k].label);
+  }
+
+  /* 项目主页「📌 进展日志」：读 / 追加 / 修改 */
+  progressBlock(data) {
+    const m = data.match(/\n## [^\n]*进展日志[^\n]*\n/);
+    if (!m) return null;
+    const pos = m.index + m[0].length;
+    const rest = data.slice(pos);
+    const nextHead = rest.search(/\n## /);
+    return { start: pos, end: pos + (nextHead >= 0 ? nextHead : rest.length) };
+  }
+  async readProjectProgress(p) {
+    let data = '';
+    try { data = await this.app.vault.cachedRead(p.file); } catch (e) { return []; }
+    const b = this.progressBlock(data);
+    if (!b) return [];
+    const out = [];
+    data.slice(b.start, b.end).split('\n').forEach((l, i) => {
+      const m = l.match(/^\s*[-*+]\s+(\d{4}-\d{2}-\d{2})(?:\s+(\d{1,2}:\d{2}))?\s+(.+)$/);
+      if (!m) return;
+      const text = m[3].trim();
+      out.push({ date: m[1], time: m[2] ? pad(Number(m[2].split(':')[0])) + ':' + m[2].split(':')[1] : '', text, raw: l, idx: i, auto: /^(创建项目|进入「.+」阶段)$/.test(text) });
+    });
+    return out.sort((a, b) => (b.date + (b.time || '')).localeCompare(a.date + (a.time || '')) || b.idx - a.idx);
+  }
+  async addProjectProgress(p, text) {
+    const d = new Date();
+    const line = '- ' + today() + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ' ' + String(text).replace(/\s+/g, ' ').trim();
+    await this.app.vault.process(p.file, (data) => {
+      const b = this.progressBlock(data);
+      if (!b) {
+        const sec = '\n## 📌 进展日志\n' + line + '\n';
+        const t = data.search(/\n## [^\n]*待办/);
+        return t >= 0 ? data.slice(0, t) + '\n' + sec + data.slice(t) : data.replace(/\s*$/, '') + '\n' + sec;
+      }
+      const block = data.slice(b.start, b.end).replace(/\s+$/, '');
+      const at = b.start + block.length;
+      return data.slice(0, at) + (block ? '\n' : '') + line + data.slice(at);
+    });
+    this.refreshViews();
+  }
+  async editProjectProgress(p, it, text) {
+    await this.app.vault.process(p.file, (data) => {
+      const b = this.progressBlock(data);
+      if (!b) return data;
+      const lines = data.slice(b.start, b.end).split('\n');
+      let i = lines[it.idx] === it.raw ? it.idx : lines.indexOf(it.raw);
+      if (i < 0) return data;
+      if (text == null || !String(text).trim()) lines.splice(i, 1);
+      else lines[i] = '- ' + it.date + (it.time ? ' ' + it.time : '') + ' ' + String(text).replace(/\s+/g, ' ').trim();
+      return data.slice(0, b.start) + lines.join('\n') + data.slice(b.end);
+    });
+    this.refreshViews();
   }
 
   async setProjectStage(p, stageId) {

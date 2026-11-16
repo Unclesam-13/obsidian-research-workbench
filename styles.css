@@ -699,11 +699,11 @@
 .rw-dash { flex: 1; min-height: 600px; display: grid; gap: 12px;
   grid-template-columns: minmax(270px, 1fr) minmax(440px, 2.3fr) minmax(260px, 1.05fr);
   grid-template-rows: minmax(0, 1.2fr) minmax(0, 1fr);
-  grid-template-areas: "log board cal" "log chart list"; }
+  grid-template-areas: "log board cal" "log list chart"; }
 .rw-p-log { grid-area: log; } .rw-p-board { grid-area: board; } .rw-p-chart { grid-area: chart; } .rw-p-cal { grid-area: cal; } .rw-p-list { grid-area: list; }
 @media (max-width: 1150px) {
   .rw-dash { grid-template-columns: minmax(260px, 1fr) minmax(360px, 1.8fr); grid-template-rows: minmax(300px, 1.2fr) minmax(260px, 1fr) minmax(300px, 1fr);
-    grid-template-areas: "log board" "log chart" "cal list"; }
+    grid-template-areas: "log board" "log list" "cal chart"; }
 }
 @media (max-width: 760px) {
   .rw-root.rw-dash-mode { display: block; }
@@ -897,7 +897,7 @@
 .rw-narrow .rw-dash-btns .rw-btn { flex: 1; justify-content: center; }
 .rw-narrow .rw-dash { display: flex; flex-direction: column; gap: 12px; }
 .rw-narrow .rw-dash .rw-panel { height: auto; }
-.rw-narrow .rw-p-log { order: 1; } .rw-narrow .rw-p-list { order: 2; } .rw-narrow .rw-p-cal { order: 3; } .rw-narrow .rw-p-board { order: 4; } .rw-narrow .rw-p-chart { order: 5; }
+.rw-narrow .rw-p-log { order: 1; } .rw-narrow .rw-p-list { order: 2; } .rw-narrow .rw-p-board { order: 3; } .rw-narrow .rw-p-cal { order: 4; } .rw-narrow .rw-p-chart { order: 5; }
 .rw-narrow .rw-p-log .rw-panel-body { max-height: 62vh; }
 .rw-narrow .rw-p-board .rw-panel-body { max-height: 70vh; }
 .rw-narrow .rw-p-list .rw-panel-body { max-height: 46vh; }
@@ -4793,3 +4793,25 @@ input.rw-lw-extra { width: 100%; }
 .rw-name-warn { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; padding: 8px 12px; border-radius: 10px; background: color-mix(in srgb, #f08c00 12%, transparent); border: 1px solid color-mix(in srgb, #f08c00 40%, transparent); font-size: 13px; }
 .rw-name-warn > .rw-icon svg { color: #e67700; width: 16px; height: 16px; }
 .rw-name-warn-text { flex: 1; min-width: 220px; display: flex; flex-direction: column; gap: 2px; }
+
+/* ======== v0.27.0 首页：项目时间树 ======== */
+.rw-ptree-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; align-items: start; }
+.rw-ptree { border: 1px solid var(--rw-border); border-top: 3px solid var(--pc); border-radius: 12px; padding: 8px 10px 6px; background: var(--rw-surface, var(--background-primary)); display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.rw-ptree-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.rw-ptree-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--pc); flex: none; }
+.rw-ptree-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; font-size: 13.5px; }
+.rw-ptree-title:hover { text-decoration: underline; }
+.rw-ptree-stage { flex: none; font-size: 11px; padding: 0 6px; border-radius: 8px; background: color-mix(in srgb, var(--pc) 14%, transparent); color: var(--text-muted); }
+.rw-root input.rw-ptree-input { width: 100%; height: 28px; font-size: 12.5px; border-radius: 8px; }
+.rw-ptree-list { position: relative; display: flex; flex-direction: column; padding-left: 14px; }
+.rw-ptree-list::before { content: ''; position: absolute; left: 4px; top: 6px; bottom: 6px; width: 2px; background: color-mix(in srgb, var(--pc) 35%, var(--rw-border)); border-radius: 1px; }
+.rw-ptree-item { position: relative; display: flex; gap: 6px; align-items: baseline; padding: 3px 4px; border-radius: 6px; cursor: pointer; font-size: 12.5px; line-height: 1.45; }
+.rw-ptree-item:hover { background: var(--background-modifier-hover); }
+.rw-ptree-node { position: absolute; left: -14px; top: 8px; width: 8px; height: 8px; border-radius: 50%; background: var(--pc); box-shadow: 0 0 0 2px var(--rw-surface, var(--background-primary)); }
+.rw-ptree-item.is-auto .rw-ptree-node { background: var(--background-modifier-border); }
+.rw-ptree-item.is-auto .rw-ptree-text { color: var(--text-muted); font-style: italic; }
+.rw-ptree-when { flex: none; font-size: 11px; color: var(--text-muted); min-width: 34px; font-variant-numeric: tabular-nums; }
+.rw-ptree-text { flex: 1; min-width: 0; word-break: break-word; }
+.rw-ptree-empty { font-size: 12px; padding: 2px 0 4px; }
+.rw-ptree-more { font-size: 12px; align-self: flex-start; margin: 2px 0 0 4px; }
+.rw-ptree-text { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
