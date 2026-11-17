@@ -245,7 +245,6 @@ const TABS = [
   { id: 'files', label: '文件', icon: 'paperclip' },
   { id: 'kb', label: '知识库', icon: 'library-big' },
   { id: 'plan', label: '计划', icon: 'calendar-check' },
-  { id: 'tempwork', label: '暂时工作', icon: 'monitor' },
   { id: 'activity', label: '全局记录', icon: 'activity' },
   { id: 'assistant', label: 'AI 助手', icon: 'bot' },
   { id: 'mindflow', label: 'Mindflow', icon: 'git-fork' },
@@ -840,6 +839,7 @@ class WorkbenchView extends ItemView {
     this.plugin = plugin;
     this.tab = plugin.settings.appMode === 'life' ? (plugin.settings.lastLifeTab || 'life') : (plugin.settings.lastTab || plugin.settings.defaultTab || 'home');
     if (plugin.settings.appMode === 'life' && !LIFE_TABS.some((t) => t.id === this.tab)) this.tab = 'life';
+    if (this.tab === 'tempwork') this.tab = 'home';
     this.filters = {};
     this.dragging = false;
     this.searchSel = -1;
@@ -1959,7 +1959,7 @@ class WorkbenchView extends ItemView {
       h(lg, 'span', { cls: 'rw-pdfchip is-zotero', text: 'PDF · Zotero' });
       h(lg, 'span', { text: '在 Zotero 里' });
     }
-    this.segmented(bar, (type === 'meeting' ? [['meet', '按会议']] : []).concat([['board', '看板'], ['list', '列表']]), view, (v) => { st.noteViews[type] = v; this.plugin.saveSettingsSoon(); this.render(); });
+    this.segmented(bar, (type === 'meeting' ? [['meet', '按会议']] : []).concat([['board', type === 'idea' ? '卡片' : '看板'], ['list', '列表']]), view, (v) => { st.noteViews[type] = v; this.plugin.saveSettingsSoon(); this.render(); });
 
     if (type === 'literature') { this.litList(Object.assign({}, f, { cat: '' })); this.litCatChips(el, f); }
     const content = h(el, 'div', { cls: 'rw-notes-content' });
@@ -2166,26 +2166,54 @@ class WorkbenchView extends ItemView {
   }
 
   renderNoteBoard(parent, list, def) {
+    const pl = this.plugin, st = pl.settings;
+    // 灵感：不分状态，直接按时间排成卡片墙
+    if (def === NOTE_TYPES.idea) {
+      const grid = h(parent, 'div', { cls: 'rw-cardgrid' });
+      const sorted = list.slice().sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.file.stat.mtime - a.file.stat.mtime);
+      for (const n of sorted) this.noteCard(grid, n);
+      if (!sorted.length) h(grid, 'div', { cls: 'rw-empty-sm', text: '还没有灵感，点右上角新建' });
+      return;
+    }
+    // 其他：上面一排状态（点一下只看这个状态，卡片拖上去改状态），下面按状态分组、每组铺满整行
     const statuses = def.statuses.slice();
     const colOf = (n) => (def === EXP_TAB_DEF && EXP_STATUS_ALIAS[n.status]) || n.status;
     const other = list.filter((n) => !statuses.includes(colOf(n)));
-    const board = h(parent, 'div', { cls: 'rw-board rw-nboard' });
     const cols = statuses.map((s) => [s, list.filter((n) => colOf(n) === s)]);
     if (other.length) cols.unshift(['未设置状态', other]);
-    for (const [s, items] of cols) {
-      const col = h(board, 'div', { cls: 'rw-col' });
-      const hd = h(col, 'div', { cls: 'rw-col-head' });
-      h(hd, 'span', { cls: 'rw-col-name', text: s });
+    const key = def.label || 'x';
+    this._boardFocus = this._boardFocus || {};
+    let focus = this._boardFocus[key] || '';
+    if (focus && !cols.some(([s2]) => s2 === focus)) focus = '';
+    const wrap = h(parent, 'div', { cls: 'rw-gboard' });
+    const chips = h(wrap, 'div', { cls: 'rw-gb-chips' });
+    const chip = (label, cnt, val) => {
+      const c = h(chips, 'button', { cls: 'rw-gb-chip' + (focus === val ? ' is-active' : '') + (cnt ? '' : ' is-zero'), title: val ? '只看「' + label + '」；把卡片拖到这里 = 改成这个状态' : '显示全部' });
+      h(c, 'span', { text: label }); h(c, 'b', { text: String(cnt) });
+      c.addEventListener('click', () => { this._boardFocus[key] = focus === val ? '' : val; this.render(); });
+      if (val && val !== '未设置状态') this.makeDropZone(c, async (path) => { const n = this.index.notes.find((x) => x.file.path === path); if (n && n.status !== val) await pl.setField(n.file, 'status', val); });
+      return c;
+    };
+    chip('全部', list.length, '');
+    for (const [s2, items] of cols) chip(s2, items.length, s2);
+    h(chips, 'span', { cls: 'rw-muted rw-gb-tip', text: TOUCH ? '长按卡片可改状态' : '拖卡片到上面的状态上可改状态' });
+    this._boardOpen = this._boardOpen || new Set();
+    const shown = cols.filter(([s2, items]) => items.length && (!focus || focus === s2));
+    if (!shown.length) h(wrap, 'div', { cls: 'rw-empty-sm', text: focus ? '「' + focus + '」里没有卡片' : '还没有内容' });
+    for (const [s2, items] of shown) {
+      const g = h(wrap, 'div', { cls: 'rw-gb-group' });
+      const hd = h(g, 'div', { cls: 'rw-gb-head' });
+      h(hd, 'span', { cls: 'rw-col-name', text: s2 });
       h(hd, 'span', { cls: 'rw-col-count', text: items.length });
-      const body = h(col, 'div', { cls: 'rw-col-body' });
-      for (const n of items) this.noteCard(body, n);
-      if (!items.length) h(body, 'div', { cls: 'rw-col-empty', text: TOUCH ? '长按卡片改状态' : '拖动卡片到这里' });
-      if (s !== '未设置状态') {
-        this.makeDropZone(col, async (path) => {
-          const n = this.index.notes.find((x) => x.file.path === path);
-          if (n && n.status !== s) await this.plugin.setField(n.file, 'status', s);
-        });
+      const grid = h(g, 'div', { cls: 'rw-cardgrid' });
+      const LIM = 8, gk = key + '|' + s2;
+      const all = focus || items.length <= LIM + 2 || this._boardOpen.has(gk);
+      for (const n of all ? items : items.slice(0, LIM)) this.noteCard(grid, n);
+      if (items.length > LIM + 2 && !focus) {
+        const mb = h(g, 'button', { cls: 'rw-linkbtn rw-gb-more', text: all ? '收起' : '展开全部 ' + items.length + ' 张' });
+        mb.addEventListener('click', () => { if (all) this._boardOpen.delete(gk); else this._boardOpen.add(gk); this.render(); });
       }
+      if (s2 !== '未设置状态') this.makeDropZone(g, async (path) => { const n = this.index.notes.find((x) => x.file.path === path); if (n && n.status !== s2) await pl.setField(n.file, 'status', s2); });
     }
   }
 
