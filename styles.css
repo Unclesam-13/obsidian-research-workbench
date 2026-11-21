@@ -4903,3 +4903,7 @@ input.rw-lw-extra { width: 100%; }
 .dh-ex-row .dh-muted { font-size: var(--font-ui-smaller); color: var(--text-faint); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dh-is-mobile .dh-quick-actions button.dh-qbtn.is-main { flex: 1 1 100%; }
 .dh-is-mobile .dh-quick-actions button.dh-qbtn:not(.is-main) { flex: 1 1 0; min-width: 0; padding: 0 6px; gap: 4px; font-size: var(--font-ui-small); }
+/* 右侧卡片四个标签放不下：没选中的只显示图标（鼠标移上去有名字） */
+.dh-memo-card .dh-tab:not(.is-active) { flex: 0 0 auto; padding: 0 10px; }
+.dh-memo-card .dh-tab:not(.is-active) .dh-tab-label { display: none; }
+.dh-memo-card .dh-tab.is-active { flex: 1 1 auto; }
