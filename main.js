@@ -1911,6 +1911,7 @@ class WorkbenchView extends ItemView {
     }
     const inferredList = this.index.notes.filter((n) => ofType(n) && n.inferred);
     if (inferredList.length) this.btn(right, '补全属性（' + inferredList.length + '）', 'wand', () => this.plugin.fillProps(inferredList), 'rw-btn-warn');
+    if (type === 'idea') this.btn(right, '梳理想法（画布）', 'brain', () => this.plugin.thought.start(), '');
     if (type === 'draft') {
       this.btn(right, '自己写（写作工作台）', 'pen-tool', () => this.plugin.pickWritingNote({ project: curProject }), 'mod-cta');
       this.btn(right, 'AI 文献综合', 'quote', () => this.plugin.litWriteModal({ project: curProject }), '');
@@ -18637,6 +18638,337 @@ module.exports._classes = { DailyHubPlugin, DailyHubView, DailyHubSettingTab, VI
 }
 /* ======== DAILY-HUB-END ======== */
 
+/* ───────────────────────── 梳理想法：悬浮输入框 → 画布节点 ───────────────────────── */
+
+const TD_W = 260, TD_WIDE = 360, TD_GAP = 40, TD_COLS = 4;
+function tdId() { let s = ''; for (let i = 0; i < 16; i++) s += Math.floor(Math.random() * 16).toString(16); return s; }
+function tdHeight(text, w) {
+  const per = Math.max(8, Math.floor((w - 28) / 15));
+  let lines = 0;
+  for (const ln of String(text).split('\n')) {
+    let v = 0;
+    for (const ch of ln) v += /[\u0000-ÿ]/.test(ch) ? 0.55 : 1;
+    lines += Math.max(1, Math.ceil(v / per));
+  }
+  return Math.max(60, Math.round(26 + lines * 25));
+}
+function tdOverlap(a, b, pad) { return a.x < b.x + b.width + pad && b.x < a.x + a.width + pad && a.y < b.y + b.height + pad && b.y < a.y + a.height + pad; }
+
+class ThoughtDump {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.file = null;
+    this.el = null;
+    this.added = [];      // 这次加的节点 id（撤销用）
+    this.cursor = null;   // 自由排列时下一个节点的位置
+    this.chain = false;   // 接在上一条后面
+    this.min = false;
+  }
+
+  folder() { return normalizePath((this.plugin.settings.rootFolder || '科研') + '/思路梳理'); }
+  isOurs(f) { return !!f && f.extension === 'canvas' && f.path.startsWith(this.folder() + '/'); }
+
+  recent() {
+    return this.app.vault.getFiles().filter((f) => this.isOurs(f)).sort((a, b) => b.stat.mtime - a.stat.mtime);
+  }
+
+  start() { new ThoughtStartModal(this.app, this).open(); }
+
+  async create(topic) {
+    const d = new Date();
+    const p2 = (n) => String(n).padStart(2, '0');
+    const stamp = `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}${p2(d.getMinutes())}`;
+    const safe = (topic || '').replace(/[\\/:*?"<>|#^[\]]/g, ' ').trim().slice(0, 40);
+    const dir = this.folder();
+    if (!this.app.vault.getAbstractFileByPath(dir)) await this.app.vault.createFolder(dir).catch(() => {});
+    let path = normalizePath(`${dir}/${stamp} ${safe || '想法梳理'}.canvas`);
+    for (let i = 2; this.app.vault.getAbstractFileByPath(path); i++) path = normalizePath(`${dir}/${stamp} ${safe || '想法梳理'} ${i}.canvas`);
+    const nodes = [];
+    if (topic) nodes.push({ id: tdId(), type: 'text', text: '## ' + topic, x: 0, y: 0, width: 420, height: 90, color: '6' });
+    const f = await this.app.vault.create(path, JSON.stringify({ nodes, edges: [] }, null, '\t'));
+    await this.open(f);
+  }
+
+  async open(f) {
+    let leaf = this.app.workspace.getLeavesOfType('canvas').find((l) => l.view && l.view.file && l.view.file.path === f.path);
+    if (!leaf) { leaf = this.app.workspace.getLeaf('tab'); await leaf.openFile(f); }
+    this.app.workspace.setActiveLeaf(leaf, { focus: false });
+    this.attach(f);
+  }
+
+  attach(f) {
+    if (!this.file || this.file.path !== f.path) { this.file = f; this.added = []; this.cursor = null; }
+    this.show();
+    setTimeout(() => this.ta && this.ta.focus(), 80);
+  }
+
+  liveCanvas() {
+    if (!this.file) return null;
+    const l = this.app.workspace.getLeavesOfType('canvas').find((x) => x.view && x.view.file && x.view.file.path === this.file.path);
+    return (l && l.view && l.view.canvas) || null;
+  }
+
+  async readData() {
+    const c = this.liveCanvas();
+    if (c && c.getData) { const d = c.getData(); return { nodes: (d.nodes || []).slice(), edges: (d.edges || []).slice() }; }
+    try { const d = JSON.parse((await this.app.vault.read(this.file)) || '{}'); return { nodes: d.nodes || [], edges: d.edges || [] }; } catch (e) { return { nodes: [], edges: [] }; }
+  }
+
+  selectedNode(data) {
+    const c = this.liveCanvas();
+    if (!c || !c.selection || c.selection.size !== 1) return null;
+    const n = [...c.selection][0];
+    if (!n || !n.id || n.from) return null; // 选中的是连线
+    const d = data && data.nodes.find((x) => x.id === n.id);
+    if (d && d.type === 'group') return null;
+    return d || { id: n.id, x: n.x, y: n.y, width: n.width, height: n.height, text: n.text };
+  }
+
+  free(data, r) {
+    const box = Object.assign({}, r);
+    for (let i = 0; i < 400; i++) {
+      const hit = data.nodes.find((n) => n.type !== 'group' && tdOverlap(box, n, 16));
+      if (!hit) return box;
+      box.y = hit.y + hit.height + 24;
+    }
+    return box;
+  }
+
+  place(data, text, parent) {
+    const w = text.length > 70 ? TD_WIDE : TD_W;
+    const hgt = tdHeight(text, w);
+    if (parent) {
+      const kids = data.edges.filter((e) => e.fromNode === parent.id).map((e) => data.nodes.find((n) => n.id === e.toNode)).filter(Boolean);
+      const x = parent.x + parent.width + 90;
+      const y = kids.length ? Math.max(...kids.map((k) => k.y + k.height)) + 24 : parent.y;
+      return this.free(data, { x, y, width: w, height: hgt });
+    }
+    if (!this.cursor) {
+      const ns = data.nodes;
+      const minX = ns.length ? Math.min(...ns.map((n) => n.x)) : 0;
+      const maxY = ns.length ? Math.max(...ns.map((n) => n.y + n.height)) + 60 : 0;
+      this.cursor = { x0: minX, x: minX, y: maxY, col: 0, rowH: 0 };
+    }
+    const cu = this.cursor;
+    if (cu.col >= TD_COLS) { cu.col = 0; cu.x = cu.x0; cu.y += cu.rowH + TD_GAP; cu.rowH = 0; }
+    const box = this.free(data, { x: cu.x, y: cu.y, width: w, height: hgt });
+    cu.x = box.x + w + TD_GAP; cu.col++;
+    cu.rowH = Math.max(cu.rowH, box.y - cu.y + hgt);
+    return box;
+  }
+
+  async add(raw) {
+    const text = String(raw || '').replace(/\s+$/, '').replace(/^\s*\n/, '');
+    if (!text.trim() || !this.file) return false;
+    const data = await this.readData();
+    let parent = this.selectedNode(data);
+    const fromSel = !!parent;
+    if (!parent && this.chain && this.added.length) parent = data.nodes.find((n) => n.id === this.added[this.added.length - 1]) || null;
+    const box = this.place(data, text, parent);
+    const node = { id: tdId(), type: 'text', text, x: Math.round(box.x), y: Math.round(box.y), width: box.width, height: box.height };
+    const edge = parent ? { id: tdId(), fromNode: parent.id, fromSide: 'right', toNode: node.id, toSide: 'left' } : null;
+    const c = this.liveCanvas();
+    if (c && (c.importData || c.setData)) {
+      if (c.importData) c.importData({ nodes: [node], edges: edge ? [edge] : [] });
+      else { const d = c.getData(); d.nodes.push(node); if (edge) d.edges.push(edge); c.setData(d); }
+      try { if (c.deselectAll) c.deselectAll(); } catch (e) { /* ignore */ }
+      if (fromSel && c.nodes && c.nodes.get(parent.id) && c.select) try { c.select(c.nodes.get(parent.id)); } catch (e) { /* ignore */ }
+      if (c.requestSave) c.requestSave();
+      this.reveal(c, node);
+    } else {
+      await this.app.vault.process(this.file, (s) => {
+        let d; try { d = JSON.parse(s || '{}'); } catch (e) { d = {}; }
+        d.nodes = d.nodes || []; d.edges = d.edges || [];
+        d.nodes.push(node); if (edge) d.edges.push(edge);
+        return JSON.stringify(d, null, '\t');
+      });
+    }
+    this.added.push(node.id);
+    this.lastText = text;
+    return true;
+  }
+
+  reveal(c, node) {
+    try {
+      const vb = c.getViewportBBox && c.getViewportBBox();
+      const inside = vb && node.x >= vb.minX && node.y >= vb.minY && node.x + node.width <= vb.maxX && node.y + node.height <= vb.maxY;
+      if (inside) return;
+      if (c.zoomToFit) c.zoomToFit();
+    } catch (e) { /* ignore */ }
+  }
+
+  async undo() {
+    const id = this.added.pop();
+    if (!id) return false;
+    const c = this.liveCanvas();
+    const n = c && c.nodes && c.nodes.get(id);
+    if (n && c.removeNode) { c.removeNode(n); if (c.requestSave) c.requestSave(); }
+    else {
+      await this.app.vault.process(this.file, (s) => {
+        let d; try { d = JSON.parse(s || '{}'); } catch (e) { return s; }
+        d.nodes = (d.nodes || []).filter((x) => x.id !== id);
+        d.edges = (d.edges || []).filter((e) => e.fromNode !== id && e.toNode !== id);
+        return JSON.stringify(d, null, '\t');
+      });
+    }
+    this.cursor = null;
+    return true;
+  }
+
+  /* ----- 悬浮窗口 ----- */
+
+  show() {
+    if (!this.el) this.build();
+    this.el.style.display = '';
+    this.el.classList.toggle('is-min', this.min);
+    this.refreshHead();
+  }
+  hide() { if (this.el) this.el.style.display = 'none'; }
+  close() { if (this.el) { this.el.remove(); this.el = null; } this.file = null; }
+
+  refreshHead() {
+    if (!this.el || !this.file) return;
+    this.nameEl.textContent = this.file.basename.replace(/^\d{4}-\d{2}-\d{2} \d{4} /, '');
+    this.nameEl.title = this.file.path;
+    this.countEl.textContent = this.added.length ? `这次已放 ${this.added.length} 条` : '回车 = 放一个节点';
+    this.undoBtn.disabled = !this.added.length;
+    this.chainBtn.classList.toggle('is-on', this.chain);
+    this.updateTarget();
+  }
+
+  updateTarget() {
+    if (!this.el) return;
+    const c = this.liveCanvas();
+    let t = '';
+    if (c && c.selection && c.selection.size === 1) {
+      const n = [...c.selection][0];
+      if (n && !n.from && n.text != null) t = '接在「' + String(n.text).replace(/^#+\s*/, '').replace(/\s+/g, ' ').slice(0, 14) + '」后面';
+    }
+    if (!t && this.chain && this.added.length) t = '接在上一条后面';
+    this.targetEl.textContent = t || '自由排列';
+    this.targetEl.classList.toggle('is-link', !!t);
+  }
+
+  build() {
+    const el = (this.el = h(document.body, 'div', { cls: 'rw-td' + (IS_MOBILE ? ' is-mobile' : '') }));
+    const pos = this.plugin.settings.tdPos;
+    if (!IS_MOBILE && pos && pos.x != null) { el.style.left = Math.max(0, Math.min(window.innerWidth - 200, pos.x)) + 'px'; el.style.top = Math.max(0, Math.min(window.innerHeight - 80, pos.y)) + 'px'; el.style.right = 'auto'; el.style.bottom = 'auto'; }
+
+    const head = h(el, 'div', { cls: 'rw-td-head' });
+    ic(h(head, 'span', { cls: 'rw-td-badge' }), 'brain');
+    const tt = h(head, 'div', { cls: 'rw-td-title' });
+    h(tt, 'div', { cls: 'rw-td-t1', text: '梳理想法' });
+    this.nameEl = h(tt, 'div', { cls: 'rw-td-t2' });
+    this.nameEl.addEventListener('click', () => { const f = this.file; if (f) this.open(f); });
+    const hb = (icon, tip, fn) => { const b = h(head, 'button', { cls: 'rw-td-hbtn', attr: { 'aria-label': tip } }); ic(b, icon); b.addEventListener('click', (e) => { e.stopPropagation(); fn(); }); return b; };
+    hb('minus', '收起 / 展开', () => { this.min = !this.min; el.classList.toggle('is-min', this.min); if (!this.min) this.ta.focus(); });
+    hb('x', '关闭输入窗口（画布保留）', () => this.close());
+
+    const body = h(el, 'div', { cls: 'rw-td-body' });
+    const ta = (this.ta = h(body, 'textarea', { cls: 'rw-td-input', attr: { rows: '2', placeholder: '心里想到什么就打什么，回车变成一个节点…' } }));
+    const grow = () => { ta.style.height = 'auto'; ta.style.height = Math.min(180, ta.scrollHeight) + 'px'; };
+    ta.addEventListener('input', grow);
+    ta.addEventListener('focus', () => this.updateTarget());
+    let busy = false;
+    const submit = async () => {
+      if (busy) return;
+      const v = ta.value;
+      if (!v.trim()) return;
+      busy = true;
+      try {
+        if (await this.add(v)) { ta.value = ''; grow(); this.flash(); }
+      } catch (e) { console.error('[科研工作台] 梳理想法：添加节点失败', e); new Notice('添加失败：' + (e.message || e)); }
+      busy = false;
+      this.refreshHead();
+      ta.focus();
+    };
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); submit(); }
+      else if (e.key === 'Escape') { e.preventDefault(); this.min = true; el.classList.add('is-min'); ta.blur(); }
+      else if (e.key === 'z' && (e.ctrlKey || e.metaKey) && !ta.value) { e.preventDefault(); this.undo().then(() => this.refreshHead()); }
+    });
+
+    const row = h(body, 'div', { cls: 'rw-td-row' });
+    this.targetEl = h(row, 'span', { cls: 'rw-td-target', title: '在画布里点选一个节点，新内容就接在它后面（连线）；不选就自由排列' });
+    this.chainBtn = h(row, 'button', { cls: 'rw-td-chip', text: '接着上一条', title: '打开后：每条都连在上一条后面，形成一串' });
+    this.chainBtn.addEventListener('click', () => { this.chain = !this.chain; this.refreshHead(); ta.focus(); });
+    if (IS_MOBILE) { const go = h(row, 'button', { cls: 'rw-td-chip is-go', text: '放进去' }); go.addEventListener('click', submit); }
+
+    const foot = h(body, 'div', { cls: 'rw-td-foot' });
+    this.countEl = h(foot, 'span', { cls: 'rw-td-count' });
+    h(foot, 'span', { cls: 'rw-td-sp' });
+    this.undoBtn = h(foot, 'button', { cls: 'rw-td-link', text: '撤销上一条' });
+    this.undoBtn.addEventListener('click', async () => { await this.undo(); this.refreshHead(); ta.focus(); });
+    const fit = h(foot, 'button', { cls: 'rw-td-link', text: '看全部' });
+    fit.addEventListener('click', () => { const c = this.liveCanvas(); if (c && c.zoomToFit) c.zoomToFit(); });
+    const hint = h(body, 'div', { cls: 'rw-td-hint', text: IS_MOBILE ? '换行用键盘上的换行；点「放进去」放一个节点' : 'Enter 放一个节点 · Shift+Enter 换行 · 先在画布里点选节点 = 接在它后面 · Esc 收起' });
+    hint.style.display = this.plugin.settings.tdHint === false ? 'none' : '';
+
+    // 拖动标题栏移动窗口（电脑）
+    if (!IS_MOBILE) {
+      head.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('button') || e.target === this.nameEl) return;
+        const r = el.getBoundingClientRect();
+        const ox = e.clientX - r.left, oy = e.clientY - r.top;
+        head.setPointerCapture(e.pointerId);
+        const mv = (ev) => { el.style.left = Math.max(0, Math.min(window.innerWidth - 120, ev.clientX - ox)) + 'px'; el.style.top = Math.max(0, Math.min(window.innerHeight - 40, ev.clientY - oy)) + 'px'; el.style.right = 'auto'; el.style.bottom = 'auto'; };
+        const up = () => { head.removeEventListener('pointermove', mv); head.removeEventListener('pointerup', up); this.plugin.settings.tdPos = { x: parseInt(el.style.left, 10), y: parseInt(el.style.top, 10) }; this.plugin.saveSettingsSoon(); };
+        head.addEventListener('pointermove', mv); head.addEventListener('pointerup', up);
+      });
+    }
+    // 画布里点选节点时，更新「接在哪里」
+    this._selT = window.setInterval(() => { if (this.el && this.el.style.display !== 'none' && !this.min) this.updateTarget(); }, 600);
+    this.plugin.register(() => window.clearInterval(this._selT));
+    grow();
+  }
+
+  flash() { if (!this.el) return; this.el.classList.remove('is-flash'); void this.el.offsetWidth; this.el.classList.add('is-flash'); }
+
+  onLeafChange() {
+    if (!this.file && !this.el) {
+      return;
+    }
+    const leaf = this.app.workspace.activeLeaf;
+    const view = leaf && leaf.view;
+    const f = view && view.getViewType && view.getViewType() === 'canvas' ? view.file : null;
+    if (f && this.file && f.path === this.file.path) { this.show(); return; }
+    if (f && this.isOurs(f)) { this.attach(f); return; }
+    // 画布还开着但切到了别的标签：先藏起来，切回来再出现
+    if (this.el) this.hide();
+    if (this.file && !this.app.workspace.getLeavesOfType('canvas').some((l) => l.view && l.view.file && l.view.file.path === this.file.path)) this.close();
+  }
+}
+
+class ThoughtStartModal extends Modal {
+  constructor(app, td) { super(app); this.td = td; }
+  onOpen() {
+    const { contentEl } = this;
+    this.modalEl.addClass('rw-td-modal');
+    this.titleEl.setText('梳理想法');
+    h(contentEl, 'div', { cls: 'rw-muted', text: '打开一张画布和一个悬浮输入框：心里想到什么就打什么，回车就变成画布上的一个节点，接着打，直到全部倒出来。' });
+    const inp = h(contentEl, 'input', { cls: 'rw-td-topic', attr: { type: 'text', placeholder: '想梳理什么？（可不填，例如：CA1 之后的研究方向）' } });
+    const go = async () => { this.close(); try { await this.td.create(inp.value.trim()); } catch (e) { new Notice('新建画布失败：' + (e.message || e)); } };
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) go(); });
+    const btns = h(contentEl, 'div', { cls: 'rw-td-mbtns' });
+    const b = h(btns, 'button', { cls: 'mod-cta', text: '开始' });
+    b.addEventListener('click', go);
+    const rec = this.td.recent().slice(0, 8);
+    if (rec.length) {
+      h(contentEl, 'div', { cls: 'rw-td-mlabel', text: '或者接着之前的' });
+      const list = h(contentEl, 'div', { cls: 'rw-td-recent' });
+      for (const f of rec) {
+        const it = h(list, 'button', { cls: 'rw-td-ritem' });
+        ic(it, 'layout-dashboard');
+        h(it, 'span', { cls: 'rw-td-rname', text: f.basename });
+        it.addEventListener('click', () => { this.close(); this.td.open(f); });
+      }
+    }
+    setTimeout(() => inp.focus(), 30);
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
 module.exports = class ResearchWorkbenchPlugin extends Plugin {
   /* 移动端：量出底部悬浮工具栏挡住的高度，写进 --rw-nav-inset，输入框等据此让开 */
   /* ---------- Mindflow（合并进来的划线追问对话） ---------- */
@@ -18929,6 +19261,14 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       if (c && c.note) this.activateReader(false);
     }));
     this.addSettingTab(new WorkbenchSettingTab(this.app, this));
+    // 梳理想法：悬浮输入框，回车一条变成画布上的一个节点
+    this.thought = new ThoughtDump(this);
+    this.addRibbonIcon('brain', '梳理想法（画布）', () => this.thought.start());
+    this.addCommand({ id: 'thought-dump', name: '梳理想法：新建 / 继续一张画布（悬浮输入框）', callback: () => this.thought.start() });
+    this.addCommand({ id: 'thought-attach', name: '梳理想法：在当前画布打开悬浮输入框', checkCallback: (chk) => { const v = this.app.workspace.activeLeaf && this.app.workspace.activeLeaf.view; const f = v && v.getViewType && v.getViewType() === 'canvas' && v.file; if (!f) return false; if (!chk) this.thought.attach(f); return true; } });
+    this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.thought.onLeafChange()));
+    this.registerEvent(this.app.workspace.on('layout-change', () => this.thought.onLeafChange()));
+    this.register(() => this.thought.close());
     this.app.workspace.onLayoutReady(() => { if (this.settings.openOnStartup) this.activateView(true); });
   }
 
