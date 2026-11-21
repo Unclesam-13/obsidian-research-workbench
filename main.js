@@ -15451,6 +15451,7 @@ const {
   normalizePath,
   requestUrl,
   setIcon,
+  TFile,
 } = require("obsidian");
 
 const VIEW_TYPE = "rw-daily-hub-view";
@@ -16093,7 +16094,7 @@ class DailyHubView extends ItemView {
     for (const b of this.els.mnav?.querySelectorAll(".dh-mnav-btn") || []) b.toggleClass("is-active", b.dataset.page === id);
     if (silent) return;
     if ((id === "todo" || id === "memo") && this.s.sideTab !== id) {
-      if (!(id === "memo" && this.s.sideTab === "links")) {
+      if (!(id === "memo" && (this.s.sideTab === "links" || this.s.sideTab === "excerpt"))) {
         this.s.sideTab = id;
         await this.plugin.saveData(this.plugin.settings);
         this.renderMemo();
@@ -16202,6 +16203,12 @@ class DailyHubView extends ItemView {
     note.setAttr("aria-label", "存为知识库里的一篇新笔记（没写内容就新建空白笔记）");
     note.addEventListener("click", () => this.quickNote(ta.value, () => { ta.value = ""; this._quickDraft = ""; }));
 
+    const ex = row.createEl("button", { cls: "dh-qbtn" });
+    setIcon(ex.createSpan({ cls: "dh-qbtn-icon" }), "book-marked");
+    ex.createSpan({ text: "摘抄" });
+    ex.setAttr("aria-label", "记一段别人的话 / 书里的句子到摘抄本（输入框里的文字会带进去）");
+    ex.addEventListener("click", () => this.openExcerpt(ta.value, () => { ta.value = ""; this._quickDraft = ""; }));
+
     const projects = this.projects().filter((p) => !p.archived && !p.isRecord && !p.research);
     if (projects.length) {
       const dest = el.createDiv({ cls: "dh-quick-dest" });
@@ -16251,6 +16258,118 @@ class DailyHubView extends ItemView {
       console.error("[daily-hub] quick note failed", err);
       new Notice(`新建笔记失败：${err.message || err}`);
     }
+  }
+
+  /* ----- 摘抄本：别人的话、书里的句子，按时间倒序存在「生活/摘抄本.md」 ----- */
+
+  excerptPath() {
+    const host = __dh.__host;
+    return normalizePath(`${(host && host.settings.lifeFolder) || "生活"}/摘抄本.md`);
+  }
+
+  async readExcerpts() {
+    const f = this.app.vault.getAbstractFileByPath(this.excerptPath());
+    if (!f || !(f instanceof TFile)) return [];
+    return parseExcerpts(await this.app.vault.cachedRead(f));
+  }
+
+  openExcerpt(prefill, clear, entry) {
+    new ExcerptModal(this.app, this, { text: prefill || "", entry, onDone: () => { clear?.(); if (this.s.sideTab === "excerpt") this.renderMemo(); } }).open();
+  }
+
+  async saveExcerpt({ text, source, note }, old) {
+    const path = this.excerptPath();
+    const block = excerptBlock({ when: old?.when || nowStamp(), text, source, note });
+    let f = this.app.vault.getAbstractFileByPath(path);
+    if (!f) {
+      const dir = path.split("/").slice(0, -1).join("/");
+      if (dir && !this.app.vault.getAbstractFileByPath(dir)) await this.app.vault.createFolder(dir).catch(() => {});
+      await this.app.vault.create(path, `# 摘抄本\n\n随手记下别人的好句子、观点和书里的段落，新的在最上面。\n\n${block}`);
+      return;
+    }
+    await this.app.vault.process(f, (raw) => {
+      if (old) return replaceExcerpt(raw, old, block);
+      const lines = raw.split("\n");
+      const i = lines.findIndex((l) => /^## \d{4}-\d{2}-\d{2}/.test(l));
+      if (i < 0) return raw.replace(/\s*$/, "\n\n") + block;
+      lines.splice(i, 0, block.replace(/\n$/, ""));
+      return lines.join("\n");
+    });
+  }
+
+  async deleteExcerpt(entry) {
+    const f = this.app.vault.getAbstractFileByPath(this.excerptPath());
+    if (!f) return;
+    await this.app.vault.process(f, (raw) => replaceExcerpt(raw, entry, ""));
+  }
+
+  async renderExcerptTab(body) {
+    const bar = body.createDiv({ cls: "dh-side-bar" });
+    const add = bar.createEl("button", { cls: "dh-btn dh-btn-soft dh-ex-add" });
+    setIcon(add.createSpan(), "plus");
+    add.createSpan({ text: "摘抄一段" });
+    add.addEventListener("click", () => this.openExcerpt(""));
+    const tools = bar.createDiv({ cls: "dh-ex-tools" });
+    const rnd = tools.createEl("button", { cls: "dh-btn dh-btn-icon-only", attr: { "aria-label": "随机翻一条" } });
+    setIcon(rnd, "shuffle");
+    const open = tools.createEl("button", { cls: "dh-btn dh-btn-icon-only", attr: { "aria-label": "打开摘抄本" } });
+    setIcon(open, "file-text");
+    open.addEventListener("click", async () => {
+      const f = this.app.vault.getAbstractFileByPath(this.excerptPath());
+      if (f instanceof TFile) await this.app.workspace.getLeaf(Platform.isMobile ? false : "tab").openFile(f);
+      else new Notice("还没有摘抄，先记一段吧");
+    });
+
+    const token = (this.exToken = (this.exToken || 0) + 1);
+    const all = await this.readExcerpts();
+    if (token !== this.exToken) return;
+    if (!all.length) {
+      body.createDiv({ cls: "dh-side-empty", text: "还没有摘抄。看到喜欢的句子、别人的观点，点「摘抄一段」或在上面的随手记里写好再点「摘抄」。" });
+      return;
+    }
+    let q = "";
+    if (all.length > 4) {
+      const search = body.createEl("input", { cls: "dh-ex-search", attr: { type: "text", placeholder: `在 ${all.length} 条摘抄里搜索内容或出处…` } });
+      search.addEventListener("input", () => { q = search.value.trim().toLowerCase(); draw(); });
+    }
+    const list = body.createDiv({ cls: "dh-ex-list" });
+    let showAll = false;
+    const card = (parent, e, hl) => {
+      const c = parent.createDiv({ cls: "dh-ex-card" + (hl ? " is-pick" : "") });
+      c.createDiv({ cls: "dh-ex-text", text: e.text });
+      if (e.note) c.createDiv({ cls: "dh-ex-note", text: e.note });
+      const meta = c.createDiv({ cls: "dh-ex-meta" });
+      if (e.source) {
+        const m = e.source.match(/https?:\/\/\S+/);
+        const src = meta.createSpan({ cls: "dh-ex-src", text: `—— ${e.source}` });
+        if (m) { src.addClass("is-link"); src.addEventListener("click", () => window.open(m[0])); }
+      }
+      meta.createSpan({ cls: "dh-ex-date", text: e.when.slice(0, 10) });
+      const acts = meta.createDiv({ cls: "dh-ex-acts" });
+      const mk = (icon, label, fn) => { const b = acts.createEl("button", { cls: "dh-ex-act", attr: { "aria-label": label } }); setIcon(b, icon); b.addEventListener("click", (ev) => { ev.stopPropagation(); fn(); }); };
+      mk("copy", "复制", async () => { await navigator.clipboard.writeText(e.text + (e.source ? `\n—— ${e.source}` : "")); new Notice("已复制"); });
+      mk("pencil", "编辑", () => this.openExcerpt("", null, e));
+      mk("trash-2", "删除", async () => {
+        if (!confirm(`删除这条摘抄？\n\n${e.text.slice(0, 60)}${e.text.length > 60 ? "…" : ""}`)) return;
+        await this.deleteExcerpt(e);
+        new Notice("已删除这条摘抄");
+        this.renderMemo();
+      });
+    };
+    const draw = (pick) => {
+      list.empty();
+      if (pick) { card(list, pick, true); return; }
+      const hit = q ? all.filter((e) => `${e.text}\n${e.source}\n${e.note}`.toLowerCase().includes(q)) : all;
+      if (!hit.length) { list.createDiv({ cls: "dh-side-empty", text: "没有找到相关摘抄" }); return; }
+      const LIM = 12;
+      for (const e of showAll || q ? hit : hit.slice(0, LIM)) card(list, e);
+      if (!q && !showAll && hit.length > LIM) {
+        const more = list.createEl("button", { cls: "dh-btn dh-ex-more", text: `展开全部 ${hit.length} 条` });
+        more.addEventListener("click", () => { showAll = true; draw(); });
+      }
+    };
+    rnd.addEventListener("click", () => draw(all[Math.floor(Math.random() * all.length)]));
+    draw();
   }
 
   refresh() {
@@ -16657,7 +16776,7 @@ class DailyHubView extends ItemView {
     if (!this.s.showMemo) return;
     this.disposeComponent("memoComponent");
     this.memoComponent = this.addChild(new Component());
-    const tab = ["memo", "todo", "links"].includes(this.s.sideTab) ? this.s.sideTab : "memo";
+    const tab = ["memo", "todo", "links", "excerpt"].includes(this.s.sideTab) ? this.s.sideTab : "memo";
     card.dataset.tab = tab;
 
     const tabs = card.createDiv({ cls: "dh-tabs" });
@@ -16665,6 +16784,7 @@ class DailyHubView extends ItemView {
       ["memo", "quote", "写给自己"],
       ["todo", "list-checks", "待办"],
       ["links", "link", "链接"],
+      ["excerpt", "book-marked", "摘抄"],
     ];
     for (const [id, icon, label] of tabDefs) {
       const b = tabs.createEl("button", { cls: "dh-tab", attr: { "aria-label": label } });
@@ -16683,6 +16803,7 @@ class DailyHubView extends ItemView {
     const body = card.createDiv({ cls: "dh-side-body" });
     if (tab === "memo") this.renderMemoTab(body);
     else if (tab === "todo") this.renderTodoTab(body);
+    else if (tab === "excerpt") this.renderExcerptTab(body);
     else this.renderLinksTab(body);
     if (tab !== "todo") this.updateTodoBadge();
   }
@@ -17188,6 +17309,124 @@ class DailyHubView extends ItemView {
 }
 
 /* ---------- modals ---------- */
+
+function nowStamp() {
+  const d = new Date();
+  return `${keyOf(d)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function excerptBlock({ when, text, source, note }) {
+  const q = text.replace(/\s+$/, "").split("\n").map((l) => (l.trim() ? `> ${l}` : ">")).join("\n");
+  const src = (source || "").replace(/\s+/g, " ").trim();
+  let out = `## ${when}${src ? ` · ${src}` : ""}\n${q}\n`;
+  if ((note || "").trim()) out += `\n${note.trim()}\n`;
+  return out + "\n";
+}
+
+function parseExcerpts(raw) {
+  const lines = raw.split("\n");
+  const out = [];
+  let cur = null;
+  const flush = () => {
+    if (!cur) return;
+    const q = [], n = [];
+    for (const l of cur.body) {
+      if (/^>/.test(l) && !n.length) q.push(l.replace(/^> ?/, ""));
+      else n.push(l);
+    }
+    cur.text = q.join("\n").trim();
+    cur.note = n.join("\n").replace(/^---\s*$/gm, "").trim();
+    cur.end = cur.endLine;
+    delete cur.body;
+    if (cur.text || cur.note) out.push(cur);
+    cur = null;
+  };
+  lines.forEach((l, i) => {
+    const m = l.match(/^## (\d{4}-\d{2}-\d{2}(?: \d{1,2}:\d{2})?)(?:\s*·\s*(.*))?\s*$/);
+    if (m) { flush(); cur = { when: m[1], source: (m[2] || "").trim(), heading: l, start: i, body: [], endLine: i }; return; }
+    if (/^#{1,2} /.test(l)) { flush(); return; }
+    if (cur) { cur.body.push(l); cur.endLine = i; }
+  });
+  flush();
+  return out;
+}
+
+// 用标题行 + 正文定位那一条，替换成 block（空串即删除）
+function replaceExcerpt(raw, entry, block) {
+  const lines = raw.split("\n");
+  let start = lines.findIndex((l, i) => l === entry.heading && i === entry.start);
+  if (start < 0) start = lines.indexOf(entry.heading);
+  if (start < 0) throw new Error("找不到这条摘抄，可能已被改动，请刷新后再试");
+  let end = start + 1;
+  while (end < lines.length && !/^#{1,2} /.test(lines[end])) end++;
+  const rep = block ? block.replace(/\n$/, "").split("\n") : [];
+  if (block) rep.push("");
+  lines.splice(start, end - start, ...rep);
+  return lines.join("\n");
+}
+
+class ExcerptModal extends Modal {
+  constructor(app, view, { text, entry, onDone }) {
+    super(app);
+    this.view = view;
+    this.text = entry ? entry.text : text;
+    this.entry = entry || null;
+    this.onDone = onDone;
+  }
+
+  async onOpen() {
+    const { contentEl } = this;
+    this.modalEl.addClass("dh-modal", "dh-ex-modal");
+    const title = this.entry ? "编辑摘抄" : "摘抄一段";
+    if (this.setTitle) this.setTitle(title); else contentEl.createEl("h3", { text: title });
+
+    contentEl.createDiv({ cls: "dh-ex-label", text: "内容" });
+    const ta = contentEl.createEl("textarea", { cls: "dh-ex-input", attr: { rows: "5", placeholder: "别人说的话、书里的句子、看到的好观点……" } });
+    ta.value = this.text || "";
+
+    contentEl.createDiv({ cls: "dh-ex-label", text: "出处（谁说的 / 哪本书 / 链接，可不填）" });
+    const src = contentEl.createEl("input", { cls: "dh-ex-field", attr: { type: "text", placeholder: "例如：吴老师 组会 / 《原则》瑞·达利欧 / https://…" } });
+    src.value = this.entry?.source || "";
+    const known = [...new Set((await this.view.readExcerpts()).map((e) => e.source).filter(Boolean))].slice(0, 30);
+    if (known.length) {
+      const chips = contentEl.createDiv({ cls: "dh-ex-srcchips" });
+      for (const k of known.slice(0, 8)) {
+        const b = chips.createEl("button", { cls: "dh-ex-srcchip", text: k.length > 18 ? k.slice(0, 18) + "…" : k, attr: { title: k } });
+        b.addEventListener("click", () => { src.value = k; });
+      }
+    }
+
+    contentEl.createDiv({ cls: "dh-ex-label", text: "我的想法（可不填）" });
+    const note = contentEl.createEl("textarea", { cls: "dh-ex-input dh-ex-noteinput", attr: { rows: "2", placeholder: "为什么记下它、对自己有什么启发" } });
+    note.value = this.entry?.note || "";
+
+    const row = contentEl.createDiv({ cls: "dh-ex-row" });
+    row.createSpan({ cls: "dh-muted", text: `存到「${this.view.excerptPath()}」 · Ctrl+Enter 保存` });
+    const save = row.createEl("button", { cls: "mod-cta", text: "保存" });
+    const go = async () => {
+      const text = ta.value.trim();
+      if (!text) { ta.focus(); new Notice("先写下要摘抄的内容"); return; }
+      save.disabled = true;
+      try {
+        await this.view.saveExcerpt({ text, source: src.value, note: note.value }, this.entry);
+        new Notice(this.entry ? "已更新摘抄" : "已记到摘抄本");
+        this.onDone?.();
+        this.close();
+      } catch (err) {
+        console.error("[daily-hub] excerpt save failed", err);
+        new Notice(`保存失败：${err.message || err}`);
+        save.disabled = false;
+      }
+    };
+    save.addEventListener("click", go);
+    for (const el of [ta, src, note]) el.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); go(); }
+    });
+    setTimeout(() => (ta.value ? src : ta).focus(), 30);
+  }
+
+  onClose() { this.contentEl.empty(); }
+}
 
 class RecordModal extends Modal {
   constructor(app, plugin, { date, project, entry = null, preset = null, onDone }) {
