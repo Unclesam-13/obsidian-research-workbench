@@ -4989,3 +4989,11 @@ input.rw-lw-extra { width: 100%; }
 .rw-pd-list { max-height: 66vh; overflow-y: auto; margin: 0 -4px; padding: 0 4px; }
 .rw-pd-row { padding-top: 7px; padding-bottom: 7px; }
 .rw-pd-remark { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 首页科研日志：记录 / 灵感 二选一 */
+.rw-log-modes { gap: 6px; }
+.rw-root button.rw-log-mode { height: 34px; padding: 0 14px; display: inline-flex; align-items: center; gap: 6px; }
+.rw-root button.rw-log-mode:not(.is-on) { background: transparent; color: var(--text-muted); box-shadow: none; border: 1px solid var(--rw-border, var(--background-modifier-border)); font-weight: 500; }
+.rw-root button.rw-log-mode:not(.is-on):hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.rw-root button.rw-log-mode.is-on { font-weight: 650; }
+.rw-log.is-idea-mode .rw-log-tags, .rw-log.is-idea-mode .rw-log-time { opacity: .35; pointer-events: none; }
+.rw-log.is-idea-mode .rw-log-input { border-color: color-mix(in srgb, #f59e0b 55%, var(--background-modifier-border)); }

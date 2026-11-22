@@ -4043,25 +4043,45 @@ class WorkbenchView extends ItemView {
     tick();
     clearInterval(this._logT);
     this._logT = setInterval(() => { if (!clock.isConnected) return clearInterval(this._logT); tick(); }, 15000);
-    const ta = h(row1, 'textarea', { cls: 'rw-log-input', attr: { rows: '1', placeholder: '刚刚做了什么？例如：给导师发邮件确认 CA1 时间 / 学习了 MUSIC 算法推导' + (IS_MOBILE ? '' : '（Ctrl+Enter 记录）') } });
+    const ta = h(row1, 'textarea', { cls: 'rw-log-input', attr: { rows: '1' } });
     ta.value = this.logDraft || '';
     const grow = () => { ta.style.height = 'auto'; ta.style.height = Math.min(160, ta.scrollHeight) + 'px'; };
     ta.addEventListener('input', () => { this.logDraft = ta.value; grow(); });
     setTimeout(grow, 0);
-    const btnCol = h(row1, 'div', { cls: 'rw-log-btncol' });
-    const btn = h(btnCol, 'button', { cls: 'rw-btn mod-cta rw-log-btn' });
+    // 记录 / 灵感 二选一：选中哪个，按回车就存成哪个
+    const btnCol = h(row1, 'div', { cls: 'rw-log-btncol rw-log-modes' });
+    const btn = h(btnCol, 'button', { cls: 'rw-btn rw-log-btn rw-log-mode', title: '选这个：回车记进科研日志（带时间）' });
     ic(btn, 'stamp');
     h(btn, 'span', { text: '记录' });
-    const ib = h(btnCol, 'button', { cls: 'rw-btn rw-btn-sm rw-log-idea', title: '不记日志，而是把这句话存进灵感池' });
+    const ib = h(btnCol, 'button', { cls: 'rw-btn rw-log-btn rw-log-mode', title: '选这个：回车存进灵感池' });
     ic(ib, 'lightbulb');
-    h(ib, 'span', { text: '存为灵感' });
-    ib.addEventListener('click', async () => {
+    h(ib, 'span', { text: '灵感' });
+    let mode = st.logMode === 'idea' ? 'idea' : 'log';
+    const enter = IS_MOBILE ? '' : '（回车保存，Shift+回车换行）';
+    const applyMode = () => {
+      btn.classList.toggle('mod-cta', mode === 'log'); btn.classList.toggle('is-on', mode === 'log');
+      ib.classList.toggle('mod-cta', mode === 'idea'); ib.classList.toggle('is-on', mode === 'idea');
+      box.classList.toggle('is-idea-mode', mode === 'idea');
+      ta.setAttribute('placeholder', mode === 'idea'
+        ? '想到什么点子？例如：用对抗样本测试 DOA 模型的鲁棒性' + enter
+        : '刚刚做了什么？例如：给导师发邮件确认 CA1 时间 / 学习了 MUSIC 算法推导' + enter);
+    };
+    const saveIdea = async () => {
       const text = ta.value.trim();
       if (!text) { ta.focus(); return; }
-      await this.plugin.createNote({ type: 'idea', title: text.length > 40 ? text.slice(0, 40) : text, content: text, project: ps.value, open: false, silent: true });
-      this.logDraft = '';
-      new Notice('💡 已存入灵感池');
-    });
+      ib.disabled = true;
+      try {
+        await this.plugin.createNote({ type: 'idea', title: text.length > 40 ? text.slice(0, 40) : text, content: text, project: ps.value, open: false, silent: true });
+        this.logDraft = ''; ta.value = ''; grow();
+        new Notice('💡 已存入灵感池');
+      } finally { ib.disabled = false; }
+    };
+    const pick = (m) => {
+      if (mode === m) { (m === 'idea' ? saveIdea : submit)(); return; } // 已选中再点 = 保存
+      mode = m; st.logMode = m; this.plugin.saveSettingsSoon(); applyMode(); ta.focus();
+    };
+    btn.addEventListener('click', () => pick('log'));
+    ib.addEventListener('click', () => pick('idea'));
     const row2 = h(form, 'div', { cls: 'rw-log-row2' });
     const sel = this.logSel || (this.logSel = new Set());
     const tagBox = h(row2, 'div', { cls: 'rw-log-tags' });
@@ -4090,8 +4110,13 @@ class WorkbenchView extends ItemView {
         new Notice('🕒 已记录 ' + pad(when.getHours()) + ':' + pad(when.getMinutes()));
       } finally { btn.disabled = false; }
     };
-    btn.addEventListener('click', submit);
-    ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); submit(); } });
+    applyMode();
+    ta.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' || e.shiftKey || e.isComposing || e.keyCode === 229) return;
+      if (IS_MOBILE && !(e.ctrlKey || e.metaKey)) return; // 手机键盘的回车用来换行，点按钮保存
+      e.preventDefault();
+      if (mode === 'idea') saveIdea(); else submit();
+    });
 
     // 时间线
     const days = this.logDays || 7;
