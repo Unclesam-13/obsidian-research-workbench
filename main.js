@@ -3102,9 +3102,23 @@ class WorkbenchView extends ItemView {
     this.btn(right, '新建笔记', 'file-plus', (e) => this.newNoteMenu(e, p.name), 'mod-cta');
 
     // 概况卡
-    const top = h(el, 'div', { cls: 'rw-detail-top' });
+    const top = h(el, 'div', { cls: 'rw-detail-top rw-pd-top' });
     top.style.setProperty('--pc', projectColor(p.name));
-    const chips = h(top, 'div', { cls: 'rw-chips' });
+    // 一行概要：状态 · 下一步 · 展开更多（类型、流程、优先级、截止、阶段进度）
+    const infoOpen = !!this.plugin.settings.detailInfoOpen;
+    const line = h(top, 'div', { cls: 'rw-pd-line' });
+    h(line, 'span', { cls: 'rw-status st-' + p.status, text: p.status });
+    if (p.stage) h(line, 'span', { cls: 'rw-pd-stage', text: p.stage });
+    if (p.deadline && parseDate(p.deadline)) h(line, 'span', { cls: 'rw-deadline ' + deadlineCls(p.deadline), text: '截止 ' + p.deadline });
+    const nx0 = h(line, 'span', { cls: 'rw-pd-next', title: '点击修改下一步' });
+    ic(nx0, 'arrow-right-circle');
+    h(nx0, 'span', { text: p.next ? p.next : '设置下一步…' });
+    nx0.addEventListener('click', () => this.plugin.promptText('下一步要做什么？', p.next, (v) => this.plugin.setField(p.file, 'next', v)));
+    const tg = h(line, 'button', { cls: 'rw-linkbtn rw-pd-more', text: infoOpen ? '收起 ▴' : '阶段与属性 ▾' });
+    tg.addEventListener('click', () => { this.plugin.settings.detailInfoOpen = !infoOpen; this.plugin.saveSettingsSoon(); this.render(); });
+    const info = h(top, 'div', { cls: 'rw-pd-info' });
+    if (!infoOpen) info.style.display = 'none';
+    const chips = h(info, 'div', { cls: 'rw-chips' });
     const kc = h(chips, 'span', { cls: 'rw-kind-chip is-clickable', text: KINDS[p.pkind].label, title: '点击修改项目类型' });
     kc.style.setProperty('--kc', KINDS[p.pkind].color);
     kc.addEventListener('click', (e) => {
@@ -3125,7 +3139,7 @@ class WorkbenchView extends ItemView {
     }
     if (p.deadline && parseDate(p.deadline)) h(chips, 'span', { cls: 'rw-deadline ' + deadlineCls(p.deadline), text: '截止 ' + p.deadline + ' · ' + deadlineText(p.deadline) });
     h(chips, 'span', { cls: 'rw-muted', text: '最近活动 ' + relTime(p.lastActivity) });
-    this.stepper(top, p);
+    this.stepper(info, p);
     // 名字不一致 / 笔记属性里还是旧名 → 提示一键统一
     const stale = this.index.notes.filter((n) => n.projectName === p.name && n.staleProject);
     if ((p.folderName && p.folderName !== p.name) || stale.length) {
@@ -3146,51 +3160,15 @@ class WorkbenchView extends ItemView {
         b3.addEventListener('click', async () => { for (const o of olds) await this.plugin.syncProjectRefs(o, p.name); new Notice('已更新 ' + stale.length + ' 篇笔记的项目属性'); this.plugin.refreshViews(); });
       }
     }
-    const nx = h(top, 'div', { cls: 'rw-next rw-next-lg is-clickable', title: '点击修改下一步' });
-    ic(nx, 'arrow-right-circle');
-    h(nx, 'span', { text: p.next ? '下一步：' + p.next : '点击设置下一步要做什么…' });
-    nx.addEventListener('click', () => this.plugin.promptText('下一步要做什么？', p.next, (v) => this.plugin.setField(p.file, 'next', v)));
-
-    // ① 项目文件夹：主界面，放在最上面
-    const files = this.index.files.filter((x) => x.projectName === p.name);
-    const fview = this.plugin.settings.detailFileView || 'folder';
-    const fsec = this.section(el, fview === 'folder' ? '项目文件夹' : '项目文件 · ' + files.length, fview === 'folder' ? 'folder-tree' : 'paperclip');
+    // 主体：左边项目文件夹，右边分类（点进分类再看里面的东西）
+    const grid = h(el, 'div', { cls: 'rw-pd-grid' });
+    const lcol = h(grid, 'div', { cls: 'rw-pd-left' });
+    const rcol = h(grid, 'div', { cls: 'rw-pd-right' });
+    const fsec = this.section(lcol, '项目文件夹', 'folder-tree');
     fsec.el.classList.add('rw-dsec', 'rw-proj-main');
     fsec.el.style.setProperty('--pc', projectColor(p.name));
-    this.seg(fsec.right, [['folder', '文件夹'], ['cat', '分类']], fview, (v) => { this.plugin.settings.detailFileView = v; this.plugin.saveSettingsSoon(); this.render(); });
-    if (fview === 'folder') this.renderFolderBrowser(fsec.body, p);
-    else if (!files.length) h(fsec.body, 'div', { cls: 'rw-empty-sm', text: '还没有文件。把实验数据、PPT、PDF 等拖到本页任意位置即可。' });
-    for (const k of fview === 'folder' ? [] : Object.keys(FILE_CATS)) {
-      const fl = files.filter((x) => x.cat === k).sort((a, b) => b.mtime - a.mtime);
-      if (!fl.length) continue;
-      const g = h(fsec.body, 'div', { cls: 'rw-fgroup' });
-      const gh = h(g, 'div', { cls: 'rw-fgroup-head' });
-      ic(gh, FILE_CATS[k].icon);
-      h(gh, 'span', { text: FILE_CATS[k].label });
-      h(gh, 'span', { cls: 'rw-tab-count', text: fl.length });
-      for (const x of fl.slice(0, 4)) {
-        const r = h(g, 'div', { cls: 'rw-row rw-frow' });
-        const iw = h(r, 'span', { cls: 'rw-ficon cat-' + x.cat });
-        ic(iw, fileIcon(x.ext));
-        const mid = h(r, 'div', { cls: 'rw-row-mid' });
-        h(mid, 'div', { cls: 'rw-row-title', text: x.name, title: x.kind === 'link' ? x.extPath : x.file.path });
-        h(mid, 'div', { cls: 'rw-row-sub', text: [fmtSize(x.size), relTime(x.mtime), x.kind === 'link' ? '库外链接' : ''].filter(Boolean).join(' · ') });
-        const b = h(r, 'button', { cls: 'rw-iconbtn', title: '在文件夹中显示' });
-        ic(b, 'folder-open');
-        b.addEventListener('click', (e) => { e.stopPropagation(); this.plugin.revealEntry(x); });
-        this.trashBtn(r, x.kind === 'link' ? '删除链接记录' : '删除文件', () => this.plugin.deleteEntry(x));
-        r.addEventListener('click', () => this.plugin.previewEntries(fl, fl.indexOf(x)));
-        r.addEventListener('dblclick', () => this.plugin.openEntry(x));
-        r.addEventListener('contextmenu', (e) => this.fileMenu(e, x));
-      }
-      if (fl.length > 4) {
-        const more = h(g, 'button', { cls: 'rw-linkbtn rw-fgroup-more', text: '还有 ' + (fl.length - 4) + ' 个，查看全部 →' });
-        more.addEventListener('click', () => this.switchTab('files', { project: p.name, cat: k }));
-      }
-    }
-
-
-    this.dropArea(el, '把这个项目的任何文件拖到这里：数据、PPT、PDF、录音、文稿…', () => ({ project: p.name }));
+    this.renderFolderBrowser(fsec.body, p);
+    this.renderDetailCats(rcol, p);
 
     if (p.pkind === 'direction' || (p.children && p.children.length)) {
       const cs = this.section(el, '下属项目 · ' + p.children.length, 'git-branch');
@@ -3204,101 +3182,124 @@ class WorkbenchView extends ItemView {
         for (const c of p.children) this.projectCard(g, c, false);
       }
     }
+  }
 
-    const grid = h(el, 'div', { cls: 'rw-detail-grid' });
-    const left = h(grid, 'div');
-    const rightCol = h(grid, 'div');
-
-    // 笔记（按流程）
+  /* 项目详情右栏：先列分类（带数量），点一个分类再显示里面的笔记 / 文件，只显示名字和备注 */
+  detailRemark(x) {
+    let fm = x.fm;
+    if (!fm && x.file && x.file.extension === 'md') { const c = this.app.metadataCache.getFileCache(x.file); fm = c && c.frontmatter; }
+    if (!fm) return '';
+    const v = fm['备注'] || fm.remark || fm.note || fm.description || fm.summary || fm.desc || '';
+    return Array.isArray(v) ? v.join('，') : typeof v === 'string' ? v : String(v || '');
+  }
+  renderDetailCats(rcol, p) {
     const notes = this.index.notes.filter((n) => n.projectName === p.name);
+    const pfiles = this.index.files.filter((x) => x.projectName === p.name);
+    const byDate = (a, b) => (b.date || '').localeCompare(a.date || '') || b.file.stat.mtime - a.file.stat.mtime;
+    const cats = [];
     const empties = [];
     for (const type of Object.keys(NOTE_TYPES).filter((t) => t !== 'data')) {
       const def = type === 'experiment' ? EXP_TAB_DEF : NOTE_TYPES[type];
-      const list = notes.filter((n) => n.type === type || (type === 'experiment' && n.type === 'data')).sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.file.stat.mtime - a.file.stat.mtime);
+      const list = notes.filter((n) => n.type === type || (type === 'experiment' && n.type === 'data')).sort(byDate);
       if (!list.length) { empties.push(type); continue; }
-      const sec = this.section(left, def.label + ' · ' + list.length, def.icon);
-      sec.el.classList.add('rw-dsec');
-      const add = h(sec.right, 'button', { cls: 'rw-iconbtn', title: '新建' + def.label });
-      ic(add, 'plus');
-      add.addEventListener('click', () => this.plugin.newNoteModal({ type, project: p.name }));
-      if (list.length > 6) {
-        const more = h(sec.right, 'button', { cls: 'rw-linkbtn', text: '全部 →' });
-        more.addEventListener('click', () => this.switchTab(type, { project: p.name }));
-      }
-      for (const n of list.slice(0, 6)) {
-        const r = h(sec.body, 'div', { cls: 'rw-row' });
-        ic(r, NOTE_TYPES[n.type].icon, 'rw-row-icon');
-        const mid = h(r, 'div', { cls: 'rw-row-mid' });
-        const rt = h(mid, 'div', { cls: 'rw-row-title rw-row-title-pdf' });
-        h(rt, 'span', { cls: 'rw-row-title-text', text: n.title });
-        this.pdfChip(rt, n);
-        const sub = h(mid, 'div', { cls: 'rw-row-sub' });
-        h(sub, 'span', { text: [n.status, n.date].filter(Boolean).join(' · ') });
-        this.attachButtons(r, n);
-        this.trashBtn(r, '删除笔记', () => this.plugin.deleteNote(n));
-        r.addEventListener('click', () => this.openNoteTitle(n));
-        r.addEventListener('contextmenu', (e) => this.noteMenu(e, n));
-      }
+      cats.push({ key: 'n:' + type, label: def.label, icon: def.icon, list, noteType: type });
     }
-    // 其他内容：没写 type 的 md 笔记，以及 PPT、PDF、文稿、图片、代码、HTML 等文件（按类型分组）
-    {
-      const pfiles = this.index.files.filter((x) => x.projectName === p.name);
-      this._detailMore = this._detailMore || new Set();
-      const groups = [['__md', '其他笔记', 'file-text', pfiles.filter((x) => x.looseMd)]];
-      for (const k of Object.keys(FILE_CATS)) groups.push([k, k === 'literature' ? '文献原文（PDF 等）' : k === 'other' ? '其他文件' : FILE_CATS[k].label, FILE_CATS[k].icon, pfiles.filter((x) => !x.looseMd && x.cat === k)]);
-      for (const [key, label, icon, list0] of groups) {
-        if (!list0.length) continue;
-        const list = list0.slice().sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
-        const sec = this.section(left, label + ' · ' + list.length, icon);
-        sec.el.classList.add('rw-dsec');
-        const moreKey = p.name + '|' + key;
-        const showAll = this._detailMore.has(moreKey);
-        if (list.length > 6) {
-          const more = h(sec.right, 'button', { cls: 'rw-linkbtn', text: showAll ? '收起' : '全部 ' + list.length + ' →' });
-          more.addEventListener('click', () => { if (showAll) this._detailMore.delete(moreKey); else this._detailMore.add(moreKey); this.render(); });
+    const loose = pfiles.filter((x) => x.looseMd).sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+    if (loose.length) cats.push({ key: 'md', label: '其他笔记', icon: 'file-text', list: loose });
+    for (const k of Object.keys(FILE_CATS)) {
+      const list = pfiles.filter((x) => !x.looseMd && x.cat === k).sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+      if (list.length) cats.push({ key: 'f:' + k, label: k === 'literature' ? '文献原文' : k === 'other' ? '其他文件' : FILE_CATS[k].label, icon: FILE_CATS[k].icon, list });
+    }
+    cats.push({ key: 'tasks', label: '待办', icon: 'check-square', list: null });
+
+    this._pdCat = this._pdCat || {};
+    let cur = cats.find((c) => c.key === this._pdCat[p.name]) || null;
+    const box = h(rcol, 'div', { cls: 'rw-pd-cats rw-section' });
+    box.style.setProperty('--pc', projectColor(p.name));
+    const go = (key) => { this._pdCat[p.name] = key; this.render(); };
+
+    if (!cur) {
+      const hd = h(box, 'div', { cls: 'rw-section-head' });
+      const t = h(hd, 'div', { cls: 'rw-section-title' }); ic(t, 'layout-grid'); h(t, 'span', { text: '分类' });
+      const grid = h(box, 'div', { cls: 'rw-pd-tiles' });
+      for (const c of cats) {
+        const tile = h(grid, 'button', { cls: 'rw-pd-tile' });
+        ic(tile, c.icon, 'rw-pd-tile-ic');
+        h(tile, 'span', { cls: 'rw-pd-tile-label', text: c.label });
+        const cnt = h(tile, 'span', { cls: 'rw-pd-tile-n', text: c.list ? String(c.list.length) : '' });
+        if (c.key === 'tasks') {
+          const sub = { projects: [p], notes, byName: this.index.byName };
+          this.plugin.collectTasks(sub).then((ts) => { cnt.textContent = String(ts.filter((x) => !x.done).length || ''); });
         }
-        const shown = showAll ? list : list.slice(0, 6);
-        shown.forEach((x) => {
-          const r = h(sec.body, 'div', { cls: 'rw-row' });
-          ic(r, x.looseMd ? 'file-text' : FILE_CATS[x.cat] ? FILE_CATS[x.cat].icon : 'paperclip', 'rw-row-icon');
-          const mid = h(r, 'div', { cls: 'rw-row-mid' });
-          h(mid, 'div', { cls: 'rw-row-title', text: x.looseMd ? x.file.basename : x.name, title: x.kind === 'link' ? x.extPath : x.file.path });
-          const dir = x.file && x.file.parent ? x.file.parent.path : '';
-          const rel = dir.startsWith(this.plugin.projectDir(p.name)) ? dir.slice(this.plugin.projectDir(p.name).length + 1) : dir;
-          h(mid, 'div', { cls: 'rw-row-sub', text: [rel, x.looseMd ? '' : fmtSize(x.size), relTime(x.mtime)].filter(Boolean).join(' · ') });
-          if (x.looseMd) {
-            const tag = h(r, 'button', { cls: 'rw-iconbtn', title: '设成工作台笔记（补上类型等属性，之后会出现在对应的分类里）' });
-            ic(tag, 'tag');
-            tag.addEventListener('click', (e) => { e.stopPropagation(); const m = new Menu(); for (const t of Object.keys(NOTE_TYPES)) m.addItem((i) => i.setTitle('设为 ' + NOTE_TYPES[t].label).setIcon(NOTE_TYPES[t].icon).onClick(async () => { await this.app.fileManager.processFrontMatter(x.file, (fm) => { fm.type = t; if (!fm.project) fm.project = '[[' + p.name + ']]'; if (!fm.status) fm.status = this.plugin.defaultStatusFor(t); if (!fm.date) fm.date = fmtDate(new Date(x.file.stat.ctime || x.file.stat.mtime || Date.now())); }); this.plugin.refreshViews(); })); m.showAtMouseEvent(e); });
-            r.addEventListener('click', () => this.plugin.openFile(x.file));
-          } else {
-            r.addEventListener('click', () => this.plugin.previewEntries(shown, shown.indexOf(x)));
-            r.addEventListener('dblclick', () => this.plugin.openEntry(x));
-          }
-          this.trashBtn(r, x.kind === 'link' ? '删除链接记录' : '删除文件', () => this.plugin.deleteEntry(x));
-          r.addEventListener('contextmenu', (e) => this.fileMenu(e, x));
-        });
+        tile.addEventListener('click', () => go(c.key));
       }
-    }
-    if (empties.length) {
-      const q2 = h(left, 'div', { cls: 'rw-quickadd' });
-      h(q2, 'span', { cls: 'rw-muted', text: '新建：' });
-      for (const type of empties) {
-        const b = h(q2, 'button', { cls: 'rw-catchip' });
-        ic(b, NOTE_TYPES[type].icon);
-        h(b, 'span', { text: type === 'experiment' ? '实验与数据' : type === 'meeting' ? '会议纪要' : NOTE_TYPES[type].label });
-        b.addEventListener('click', () => this.plugin.newNoteModal({ type, project: p.name }));
+      if (empties.length) {
+        const q2 = h(box, 'div', { cls: 'rw-quickadd rw-pd-new' });
+        h(q2, 'span', { cls: 'rw-muted', text: '新建：' });
+        for (const type of empties) {
+          const b = h(q2, 'button', { cls: 'rw-catchip' });
+          ic(b, NOTE_TYPES[type].icon);
+          h(b, 'span', { text: type === 'experiment' ? '实验与数据' : type === 'meeting' ? '会议纪要' : NOTE_TYPES[type].label });
+          b.addEventListener('click', () => this.plugin.newNoteModal({ type, project: p.name }));
+        }
       }
+      return;
     }
 
-    // 待办
-    const tsec = this.section(rightCol, '待办', 'check-square');
-    tsec.el.classList.add('rw-dsec');
-    const sub = { projects: [p], notes, byName: this.index.byName };
-    this.plugin.collectTasks(sub).then((tasks) => {
-      if (!tasks.length) { h(tsec.body, 'div', { cls: 'rw-empty-sm', text: '没有未完成的待办' }); return; }
-      this.taskTree(tsec.body, tasks);
-    });
+    // 某个分类里面
+    const hd = h(box, 'div', { cls: 'rw-section-head rw-pd-cathead' });
+    const back = h(hd, 'button', { cls: 'rw-btn rw-btn-sm rw-pd-back', title: '回到全部分类' });
+    ic(back, 'chevron-left'); h(back, 'span', { text: '分类' });
+    back.addEventListener('click', () => go(''));
+    const t = h(hd, 'div', { cls: 'rw-section-title' }); ic(t, cur.icon); h(t, 'span', { text: cur.label + (cur.list ? ' · ' + cur.list.length : '') });
+    const hr = h(hd, 'div', { cls: 'rw-section-right' });
+    if (cur.noteType) {
+      const add = h(hr, 'button', { cls: 'rw-iconbtn', title: '新建' + NOTE_TYPES[cur.noteType].label });
+      ic(add, 'plus');
+      add.addEventListener('click', () => this.plugin.newNoteModal({ type: cur.noteType, project: p.name }));
+      const all = h(hr, 'button', { cls: 'rw-linkbtn', text: '到「' + cur.label + '」页 →' });
+      all.addEventListener('click', () => this.switchTab(cur.noteType, { project: p.name }));
+    }
+    // 分类之间快速切换
+    const strip = h(box, 'div', { cls: 'rw-pd-strip' });
+    for (const c of cats) {
+      const b = h(strip, 'button', { cls: 'rw-pd-chip' + (c.key === cur.key ? ' is-active' : ''), title: c.label });
+      ic(b, c.icon); h(b, 'span', { text: c.label });
+      b.addEventListener('click', () => go(c.key));
+    }
+    const body = h(box, 'div', { cls: 'rw-pd-list' });
+    if (cur.key === 'tasks') {
+      const sub = { projects: [p], notes, byName: this.index.byName };
+      this.plugin.collectTasks(sub).then((tasks) => {
+        if (!tasks.length) { h(body, 'div', { cls: 'rw-empty-sm', text: '没有未完成的待办' }); return; }
+        this.taskTree(body, tasks);
+      });
+      return;
+    }
+    const list = cur.list;
+    for (const x of list) {
+      const r = h(body, 'div', { cls: 'rw-row rw-pd-row' });
+      const isNote = x.kind === 'note';
+      ic(r, isNote ? NOTE_TYPES[x.type].icon : x.looseMd ? 'file-text' : fileIcon(x.ext), 'rw-row-icon');
+      const mid = h(r, 'div', { cls: 'rw-row-mid' });
+      const name = isNote ? x.title : x.looseMd ? x.file.basename : x.name;
+      h(mid, 'div', { cls: 'rw-row-title', text: name, title: x.kind === 'link' ? x.extPath : x.file.path });
+      const rm = this.detailRemark(x);
+      if (rm) h(mid, 'div', { cls: 'rw-row-sub rw-pd-remark', text: rm });
+      if (isNote) {
+        this.trashBtn(r, '删除笔记', () => this.plugin.deleteNote(x));
+        r.addEventListener('click', () => this.openNoteTitle(x));
+        r.addEventListener('contextmenu', (e) => this.noteMenu(e, x));
+      } else {
+        if (x.looseMd) r.addEventListener('click', () => this.plugin.openFile(x.file));
+        else {
+          r.addEventListener('click', () => this.plugin.previewEntries(list, list.indexOf(x)));
+          r.addEventListener('dblclick', () => this.plugin.openEntry(x));
+        }
+        this.trashBtn(r, x.kind === 'link' ? '删除链接记录' : '删除文件', () => this.plugin.deleteEntry(x));
+        r.addEventListener('contextmenu', (e) => this.fileMenu(e, x));
+      }
+    }
   }
 
   /* 待办列表：大点在上，小步骤缩进跟在下面 */
