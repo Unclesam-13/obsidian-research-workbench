@@ -5283,3 +5283,9 @@ input.rw-lw-extra { width: 100%; }
 .rw-modal.rw-fields-modal input.rw-fm-input, .rw-modal.rw-fields-modal textarea.rw-fm-input { width: 100%; }
 .rw-modal .rw-field-label { font-size: var(--font-ui-small); color: var(--text-muted); }
 .rw-modal .rw-tp-sp { flex: 1; }
+.rw-td-ritem { cursor: pointer; }
+.rw-td-rtime { flex: none; margin-left: auto; font-size: var(--font-ui-smaller); color: var(--text-faint); }
+.rw-td-modal button.rw-td-rdel { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: none; background: transparent; box-shadow: none; color: var(--text-faint); border-radius: 6px; cursor: pointer; opacity: .55; }
+.rw-td-ritem:hover .rw-td-rdel { opacity: 1; }
+.rw-td-modal button.rw-td-rdel:hover { color: var(--text-error, #e5484d); background: color-mix(in srgb, #e5484d 12%, transparent); }
+.rw-td-rdel svg { width: 14px; height: 14px; }

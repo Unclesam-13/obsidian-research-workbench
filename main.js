@@ -20220,17 +20220,36 @@ class ThoughtStartModal extends Modal {
     const btns = h(contentEl, 'div', { cls: 'rw-td-mbtns' });
     const b = h(btns, 'button', { cls: 'mod-cta', text: '开始' });
     b.addEventListener('click', go);
-    const rec = this.td.recent().slice(0, 8);
-    if (rec.length) {
-      h(contentEl, 'div', { cls: 'rw-td-mlabel', text: '或者接着之前的' });
-      const list = h(contentEl, 'div', { cls: 'rw-td-recent' });
+    const recBox = h(contentEl, 'div');
+    const drawRecent = () => {
+      recBox.empty();
+      const rec = this.td.recent();
+      if (!rec.length) return;
+      h(recBox, 'div', { cls: 'rw-td-mlabel', text: '或者接着之前的（' + rec.length + ' 张）' });
+      const list = h(recBox, 'div', { cls: 'rw-td-recent' });
       for (const f of rec) {
-        const it = h(list, 'button', { cls: 'rw-td-ritem' });
+        const it = h(list, 'div', { cls: 'rw-td-ritem', attr: { role: 'button', tabindex: '0' } });
         ic(it, 'layout-dashboard');
-        h(it, 'span', { cls: 'rw-td-rname', text: f.basename });
+        h(it, 'span', { cls: 'rw-td-rname', text: f.basename, title: f.path });
+        h(it, 'span', { cls: 'rw-td-rtime', text: relTime(f.stat.mtime) });
+        const del = h(it, 'button', { cls: 'rw-td-rdel', attr: { 'aria-label': '删除这张画布' } });
+        ic(del, 'trash-2');
+        const remove = async () => {
+          const ok = await this.td.plugin.confirmDelete({ title: '删除画布', lines: ['删除「' + f.basename + '」这张画布？', '画布上的节点会一起删掉。'], confirmText: '删除' });
+          if (!ok) return;
+          if (this.td.file && this.td.file.path === f.path) this.td.close();
+          for (const l of this.app.workspace.getLeavesOfType('canvas')) if (l.view && l.view.file && l.view.file.path === f.path) l.detach();
+          await this.td.plugin.trash(f);
+          new Notice('🗑 已删除画布：' + f.basename);
+          drawRecent();
+        };
+        del.addEventListener('click', (e) => { e.stopPropagation(); remove(); });
         it.addEventListener('click', () => { this.close(); this.td.open(f); });
+        it.addEventListener('keydown', (e) => { if (e.key === 'Enter') { this.close(); this.td.open(f); } });
+        it.addEventListener('contextmenu', (e) => { e.preventDefault(); const m = new Menu(); m.addItem((i) => i.setTitle('打开').setIcon('layout-dashboard').onClick(() => { this.close(); this.td.open(f); })); addDeleteItem(m, '删除这张画布…', remove); m.showAtMouseEvent(e); });
       }
-    }
+    };
+    drawRecent();
     setTimeout(() => inp.focus(), 30);
   }
   onClose() { this.contentEl.empty(); }
