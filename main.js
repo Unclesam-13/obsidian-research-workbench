@@ -191,6 +191,7 @@ const NOTE_TYPES = {
 };
 const TYPE_ALIASES = {
   project: 'project', 项目: 'project',
+  folder: 'project', 文件夹: 'project', 资料夹: 'project',
   idea: 'idea', 灵感: 'idea',
   literature: 'literature', paper: 'literature', 文献: 'literature',
   experiment: 'experiment', 实验: 'experiment',
@@ -201,6 +202,282 @@ const TYPE_ALIASES = {
   resource: 'resource', 资源: 'resource', 链接文件: 'resource',
   log: 'log', 日志: 'log',
 };
+
+/* ───────────────────────── 稿件驾驶舱：解析 Markdown / LaTeX 稿件的章节、字数、图、引用 ───────────────────────── */
+const MS_STATUS = ['待开始', '提纲', '初稿', '修改中', '完成'];
+const MS_WEIGHT = { 待开始: 0, 提纲: 0.25, 初稿: 0.6, 修改中: 0.8, 完成: 1, 未标记: 0.5 };
+const MS_FIG_EXT = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'pdf', 'eps', 'tif', 'tiff'];
+function msCountWords(text) {
+  const t = String(text || '');
+  const cjk = (t.match(/[㐀-鿿぀-ヿ]/g) || []).length;
+  const lat = (t.replace(/[㐀-鿿぀-ヿ]/g, ' ').match(/[A-Za-z0-9][A-Za-z0-9'’\-]*/g) || []).length;
+  return cjk + lat;
+}
+/* 从 { 后面开始找配对的 }，返回花括号里的内容和结束位置 */
+function msBrace(s, open) {
+  let depth = 0;
+  for (let i = open; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '\\') { i++; continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) return { text: s.slice(open + 1, i), end: i + 1 }; }
+  }
+  return { text: s.slice(open + 1), end: s.length };
+}
+function msTexPlain(t) {
+  return String(t || '')
+    .replace(/\\begin\{(equation|align|gather|multline|eqnarray|figure|table|algorithm|algorithmic|tikzpicture|tabular|lstlisting|verbatim|IEEEeqnarray|displaymath|math)\*?\}[\s\S]*?\\end\{\1\*?\}/g, ' ')
+    .replace(/\$\$[\s\S]*?\$\$/g, ' ').replace(/\\\[[\s\S]*?\\\]/g, ' ').replace(/\$[^$\n]*\$/g, ' ')
+    .replace(/\\(?:cite[a-zA-Z]*|ref|eqref|autoref|cref|Cref|label|url|input|include|bibliography|bibliographystyle|vspace|hspace|includegraphics)\*?\s*(?:\[[^\]]*\]\s*)*\{[^}]*\}/g, ' ')
+    .replace(/\\(?:begin|end)\{[^}]*\}(?:\[[^\]]*\])?/g, ' ')
+    .replace(/\\[a-zA-Z@]+\*?(?:\[[^\]]*\])*/g, ' ').replace(/\\./g, ' ').replace(/[{}~]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function msTexTitle(t) { return String(t || '').replace(/\\label\{[^}]*\}/g, '').replace(/\$([^$]*)\$/g, '$1').replace(/\\[a-zA-Z@]+\*?(?:\[[^\]]*\])*/g, ' ').replace(/[{}~]/g, ' ').replace(/\s+/g, ' ').trim(); }
+function msKeys(secs) {
+  const stack = [], seen = new Map();
+  for (const s of secs) {
+    while (stack.length && stack[stack.length - 1].level >= s.level) stack.pop();
+    s.parent = stack.length ? stack[stack.length - 1] : null;
+    let key = stack.map((x) => x.title).concat(s.title).join(' › ');
+    const n = (seen.get(key) || 0) + 1; seen.set(key, n);
+    if (n > 1) key += ' #' + n;
+    s.key = key; s.kids = [];
+    if (s.parent) s.parent.kids.push(s);
+    stack.push(s);
+  }
+  const total = (s) => { s.total = s.words + s.kids.reduce((a, k) => a + total(k), 0); return s.total; };
+  for (const s of secs) if (!s.parent) total(s);
+  // 编号：1 / 1.1 / 1.1.1
+  const cnt = [0, 0, 0];
+  for (const s of secs) { if (s.unnumbered) { s.num = ''; continue; } cnt[s.level - 1]++; for (let i = s.level; i < 3; i++) cnt[i] = 0; s.num = cnt.slice(0, s.level).join('.'); }
+  // 标题里自己带了编号（「1 引言」「Ⅱ. 系统模型」「A. 背景」）就不再重复显示
+  for (const s of secs) if (/^(\d+(\.\d+)*[\s.、．]|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+[\s.、．]|[IVX]+\.\s|[A-Z][.、．]\s|第[一二三四五六七八九十\d]+[章节])/.test(s.title)) s.num = '';
+  return secs;
+}
+function msParseTex(src) {
+  let s = String(src || '').replace(/\r/g, '').replace(/(^|[^\\])%.*$/gm, '$1');
+  const title = (() => { const m = s.match(/\\title\s*(?:\[[^\]]*\])?\s*\{/); return m ? msTexTitle(msBrace(s, m.index + m[0].length - 1).text) : ''; })();
+  const bibs = [];
+  s.replace(/\\(?:bibliography|addbibresource)\s*\{([^}]*)\}/g, (x, v) => { for (const b of v.split(',')) if (b.trim()) bibs.push(b.trim().replace(/\.bib$/i, '')); return x; });
+  const b0 = s.indexOf('\\begin{document}');
+  if (b0 >= 0) s = s.slice(b0 + 16);
+  const cut = s.search(/\\bibliography\s*\{|\\begin\{thebibliography\}|\\printbibliography|\\end\{document\}/);
+  if (cut >= 0) s = s.slice(0, cut);
+  const heads = [];
+  const ab = s.match(/\\begin\{abstract\}/);
+  if (ab) { const e = s.indexOf('\\end{abstract}', ab.index); heads.push({ at: ab.index, bodyFrom: ab.index + ab[0].length, bodyTo: e >= 0 ? e : undefined, title: 'Abstract', level: 1, unnumbered: true }); }
+  const re = /\\(section|subsection|subsubsection)(\*?)\s*(?:\[[^\]]*\])?\s*\{/g;
+  let m;
+  while ((m = re.exec(s))) {
+    const br = msBrace(s, m.index + m[0].length - 1);
+    heads.push({ at: m.index, bodyFrom: br.end, title: msTexTitle(br.text) || '（无标题）', level: m[1] === 'section' ? 1 : m[1] === 'subsection' ? 2 : 3, unnumbered: !!m[2] });
+    re.lastIndex = br.end;
+  }
+  heads.sort((a, b) => a.at - b.at);
+  const secs = heads.map((hd, i) => {
+    const to = hd.bodyTo != null ? hd.bodyTo : i + 1 < heads.length ? heads[i + 1].at : s.length;
+    const body = s.slice(hd.bodyFrom, to);
+    const figs = [], cites = [];
+    body.replace(/\\includegraphics\*?\s*(?:\[[^\]]*\])?\s*\{([^}]+)\}/g, (x, v) => { figs.push(v.trim()); return x; });
+    body.replace(/\\(?:cite[a-zA-Z]*|parencite|textcite|autocite|footcite)\*?\s*(?:\[[^\]]*\]\s*)*\{([^}]+)\}/g, (x, v) => { for (const k of v.split(',')) if (k.trim() && !cites.includes(k.trim())) cites.push(k.trim()); return x; });
+    return { title: hd.title, level: hd.level, unnumbered: hd.unnumbered, words: msCountWords(msTexPlain(body)), figs: [...new Set(figs)], cites, tables: (body.match(/\\begin\{table\*?\}/g) || []).length };
+  });
+  return { kind: 'tex', title, bibs, sections: msKeys(secs) };
+}
+function msMdPlain(t) {
+  return String(t || '').replace(/```[\s\S]*?```/g, ' ').replace(/\$\$[\s\S]*?\$\$/g, ' ').replace(/\$[^$\n]*\$/g, ' ')
+    .replace(/!\[\[[^\]]*\]\]/g, ' ').replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+    .replace(/\[\[[^\]|]*\|\[\d+\]\]\]/g, ' ').replace(/\[\[([^\]|]*)\|([^\]]*)\]\]/g, '$2').replace(/\[\[([^\]]*)\]\]/g, '$1').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/<[^>]+>/g, ' ').replace(/^\s*\|?[\s:|-]+\|?\s*$/gm, ' ').replace(/[#>*_`|~]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function msParseMd(src) {
+  const lines = String(src || '').replace(/\r/g, '').split('\n');
+  let i0 = 0;
+  if (lines[0] === '---') { const e = lines.indexOf('---', 1); if (e > 0) i0 = e + 1; }
+  const heads = [];
+  let fence = false;
+  for (let i = i0; i < lines.length; i++) {
+    if (/^\s*(```|~~~)/.test(lines[i])) { fence = !fence; continue; }
+    if (fence) continue;
+    const m = lines[i].match(/^(#{1,6})\s+(.*?)\s*#*\s*$/);
+    if (m) heads.push({ line: i, lv: m[1].length, title: m[2].replace(/\*\*|__|`/g, '').replace(/\$([^$]*)\$/g, '$1').trim() || '（无标题）' });
+  }
+  let title = '';
+  let base = heads.length ? Math.min(...heads.map((x) => x.lv)) : 1;
+  const tops = heads.filter((x) => x.lv === base);
+  if (tops.length === 1 && heads[0] === tops[0] && heads.length > 1) { title = tops[0].title; heads.shift(); base = heads.length ? Math.min(...heads.map((x) => x.lv)) : base + 1; }
+  const use = heads.filter((x) => x.lv - base < 3);
+  const secs = use.map((hd, i) => {
+    const to = i + 1 < use.length ? use[i + 1].line : lines.length;
+    const body = lines.slice(hd.line + 1, to).join('\n');
+    const figs = [], links = [], keys = [];
+    body.replace(/!\[\[([^\]|#]+)[^\]]*\]\]/g, (x, v) => { if (MS_FIG_EXT.includes(v.split('.').pop().toLowerCase())) figs.push(v.trim()); return x; });
+    body.replace(/!\[[^\]]*\]\(([^)\s]+)[^)]*\)/g, (x, v) => { if (MS_FIG_EXT.includes(v.split('.').pop().toLowerCase())) figs.push(decodeURIComponent(v.trim())); return x; });
+    body.replace(/(^|[^!])\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*(?:\]\])?)?\]\]/g, (x, a, v) => { if (!links.includes(v.trim())) links.push(v.trim()); return x; });
+    body.replace(/\[@([A-Za-z0-9_:.\-]+)/g, (x, v) => { if (!keys.includes(v)) keys.push(v); return x; });
+    return { title: hd.title, level: hd.lv - base + 1, line: hd.line, unnumbered: /^(参考文献|references|致谢|acknowledg|附录|appendix|摘要|abstract|符号表|nomenclature)/i.test(hd.title), words: msCountWords(msMdPlain(body)), figs: [...new Set(figs)], links, cites: keys, tables: (body.match(/^\s*\|?\s*:?-{3,}/gm) || []).length };
+  });
+  return { kind: 'md', title, bibs: [], sections: msKeys(secs) };
+}
+function msParseBib(src) {
+  const out = new Map();
+  const s = String(src || '');
+  const re = /@([a-zA-Z]+)\s*\{\s*([^,\s]+)\s*,/g;
+  let m;
+  while ((m = re.exec(s))) {
+    if (/^(comment|string|preamble)$/i.test(m[1])) continue;
+    const br = msBrace(s, s.indexOf('{', m.index));
+    const body = br.text;
+    const field = (name) => {
+      const fm = body.match(new RegExp('(?:^|[,\\s])' + name + '\\s*=\\s*', 'i'));
+      if (!fm) return '';
+      let i = fm.index + fm[0].length;
+      if (body[i] === '{') return msBrace(body, i).text.replace(/[{}]/g, '').replace(/\s+/g, ' ').trim();
+      if (body[i] === '"') { const e = body.indexOf('"', i + 1); return body.slice(i + 1, e < 0 ? undefined : e).replace(/[{}]/g, '').trim(); }
+      return (body.slice(i).match(/^[^,\n]*/) || [''])[0].trim();
+    };
+    const au = field('author');
+    out.set(m[2], { key: m[2], title: field('title'), year: field('year'), journal: field('journal') || field('booktitle'), author: au ? au.split(/\s+and\s+/i)[0].split(',')[0].trim() + (/\sand\s/i.test(au) ? ' 等' : '') : '' });
+    re.lastIndex = br.end;
+  }
+  return out;
+}
+/* 批量粘贴 / 从笔记导入修改意见：每个列表项一条，标题行当作来源 */
+function msParseComments(text) {
+  const out = [];
+  let src = '', cur = null;
+  for (const raw of String(text || '').replace(/\r/g, '').split('\n')) {
+    const l = raw.replace(/\s+$/, '');
+    if (!l.trim() || /^---+$/.test(l.trim()) || /^\s*\|/.test(l)) { if (!l.trim()) cur = null; continue; }
+    let m = l.match(/^#{1,6}\s+(.*)$/);
+    if (m) { src = m[1].replace(/[*_`]/g, '').trim(); cur = null; continue; }
+    m = l.match(/^(\s*)(?:[-*+]|\d+[.)、])\s+(?:\[.\]\s+)?(.*)$/);
+    if (m) {
+      if (m[1].replace(/\t/g, '    ').length >= 2 && cur) { cur.d = (cur.d ? cur.d + '\n' : '') + m[2].trim(); continue; }
+      cur = { t: m[2].replace(/\*\*/g, '').trim(), src, st: '待处理', d: '' };
+      if (cur.t) out.push(cur);
+      continue;
+    }
+    if (cur) cur.d = (cur.d ? cur.d + '\n' : '') + l.trim();
+    else if (!src && out.length === 0 && !/^[>#]/.test(l)) { cur = { t: l.trim(), src, st: '待处理', d: '' }; out.push(cur); }
+  }
+  return out;
+}
+
+/* ───────────────────────── 项目主页里的小节：研究问题 / 里程碑 / 结论与证据 / 卡点与决定 ─────────────────────────
+   都写在项目主页笔记里（普通 Markdown 列表），在 Obsidian 里直接改也可以 */
+const HN_SECS = {
+  question: { re: /关键问题|研究问题/, head: '## ❓ 研究问题', label: '研究问题', icon: 'circle-help' },
+  milestone: { re: /里程碑/, head: '## 🚩 里程碑', label: '里程碑', icon: 'flag' },
+  claim: { re: /结论与证据|研究结论|论点/, head: '## 💡 结论与证据', label: '结论与证据', icon: 'scale' },
+  issue: { re: /卡点|阻塞|决策日志|待决定/, head: '## 🚧 卡点与决定', label: '卡点与决定', icon: 'construction' },
+};
+function hnBlock(data, key) {
+  const def = HN_SECS[key];
+  const lines = String(data).split('\n');
+  let s = -1, e = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^(#{1,6})\s+(.*)$/);
+    if (!m) continue;
+    if (s < 0) { if (m[1].length === 2 && def.re.test(m[2])) s = i; }
+    else if (m[1].length <= 2) { e = i; break; }
+  }
+  return s < 0 ? null : { lines, start: s + 1, end: e };
+}
+function hnParseItem(key, body) {
+  let t = String(body);
+  if (key === 'question') {
+    let done = false;
+    const m = t.match(/^\[(.)\]\s+(.*)$/);
+    if (m) { done = m[1] !== ' '; t = m[2]; }
+    if (/^✅\s*/.test(t)) { done = true; t = t.replace(/^✅\s*/, ''); }
+    return { text: t.trim(), done };
+  }
+  if (key === 'milestone') {
+    let done = false, date = '', doneDate = '';
+    const m = t.match(/^\[(.)\]\s+(.*)$/);
+    if (m) { done = /[xX]/.test(m[1]); t = m[2]; }
+    t = t.replace(/\s*✅\s*(\d{4}-\d{2}-\d{2})/, (x, d) => { doneDate = d; return ''; }).replace(/\s*📅\s*(\d{4}-\d{2}-\d{2})/, (x, d) => { date = d; return ''; }).replace(/\s*⏰\s*\d{1,2}:\d{2}/, '');
+    const m2 = !date && t.match(/^(\d{4}-\d{2}-\d{2})\s+(.*)$/);
+    if (m2) { date = m2[1]; t = m2[2]; }
+    return { text: t.trim(), date, done, doneDate };
+  }
+  if (key === 'claim') {
+    const links = [];
+    const re = /!?\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
+    let x;
+    while ((x = re.exec(t))) links.push(x[1].trim());
+    const written = /✍/.test(t);
+    let text = t.includes('←') ? t.split('←')[0] : t.replace(re, '');
+    text = text.replace(/✍\S*/g, '').trim();
+    return { text, links, written };
+  }
+  // issue
+  let done = false, kind = 'block', date = '', result = '';
+  if (/^✅/.test(t)) {
+    done = true; t = t.replace(/^✅\s*/, '');
+    const m = t.match(/^(\d{4}-\d{2}-\d{2})\s+(.*)$/);
+    if (m) { date = m[1]; t = m[2]; }
+  }
+  if (/^❓/.test(t)) { kind = 'decide'; t = t.replace(/^❓\s*/, ''); } else t = t.replace(/^🚧\s*/, '');
+  const i = t.indexOf('→');
+  if (i >= 0) { result = t.slice(i + 1).trim(); t = t.slice(0, i); }
+  return { text: t.trim(), done, kind, date, result };
+}
+function hnLine(key, it) {
+  const one = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+  if (key === 'question') return '- ' + (it.done ? '✅ ' : '') + one(it.text);
+  if (key === 'milestone') return '- [' + (it.done ? 'x' : ' ') + '] ' + one(it.text) + (it.date ? ' 📅 ' + it.date : '') + (it.done ? ' ✅ ' + (it.doneDate || today()) : '');
+  if (key === 'claim') return '- ' + one(it.text) + ((it.links || []).length ? ' ← ' + it.links.map((l) => '[[' + l + ']]').join(' ') : '') + (it.written ? ' ✍已写入' : '');
+  return '- ' + (it.done ? '✅ ' + (it.date || today()) + ' ' : '') + (it.kind === 'decide' ? '❓ ' : '🚧 ') + one(it.text) + (it.result ? ' → ' + one(it.result) : '');
+}
+function hnParse(data) {
+  const out = {};
+  for (const key of Object.keys(HN_SECS)) {
+    out[key] = [];
+    const b = hnBlock(data, key);
+    if (!b) continue;
+    for (let i = b.start; i < b.end; i++) {
+      const m = b.lines[i].match(/^[-*+]\s+(.*)$/);
+      if (!m || !m[1].trim()) continue;
+      const it = hnParseItem(key, m[1]);
+      if (!it.text) continue;
+      it.raw = b.lines[i]; it.idx = i - b.start; it.key = key;
+      out[key].push(it);
+    }
+  }
+  return out;
+}
+/* 往某个小节末尾加一行；小节不存在就建在「进展日志」前面 */
+function hnInsert(data, key, line) {
+  const b = hnBlock(data, key);
+  if (!b) {
+    const sec = HN_SECS[key].head + '\n' + line + '\n';
+    const t = data.search(/\n## [^\n]*(进展日志|待办)/);
+    return t >= 0 ? data.slice(0, t).replace(/\s*$/, '') + '\n\n' + sec + data.slice(t) : data.replace(/\s*$/, '') + '\n\n' + sec;
+  }
+  let at = b.end;
+  while (at > b.start && !b.lines[at - 1].trim()) at--;
+  b.lines.splice(at, 0, line);
+  if (at === b.start && b.lines[at + 1] !== undefined && b.lines[at + 1].trim()) b.lines.splice(at + 1, 0, '');
+  return b.lines.join('\n');
+}
+/* 改 / 删某一行（按原文定位，位置变了就全小节里找） */
+function hnReplace(data, key, it, line) {
+  const b = hnBlock(data, key);
+  if (!b) return data;
+  let i = b.start + it.idx;
+  if (b.lines[i] !== it.raw) { i = -1; for (let k = b.start; k < b.end; k++) if (b.lines[k] === it.raw) { i = k; break; } }
+  if (i < 0) return data;
+  if (line == null) {
+    let n = 1;
+    while (i + n < b.end && /^\s+\S/.test(b.lines[i + n])) n++; // 缩进的续行一起删
+    b.lines.splice(i, n);
+  } else b.lines[i] = line;
+  return b.lines.join('\n');
+}
+function dayStart(v) { const d = v instanceof Date ? v : parseDate(v); return d ? new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() : NaN; }
+function weekStartOf(t) { const d = new Date(t); return new Date(d.getFullYear(), d.getMonth(), d.getDate() - ((d.getDay() + 6) % 7)).getTime(); }
 
 /* 文件分类：拖入的文件按扩展名自动归类，存到 项目/<项目名>/<folder>/ */
 const FILE_CATS = {
@@ -350,6 +627,7 @@ function h(parent, tag, o) {
   return el;
 }
 const ICON_FALLBACK = {
+  'circle-help': 'help-circle', 'check-circle-2': 'circle-check', 'git-commit-horizontal': 'git-commit', 'circle-alert': 'alert-circle', 'folders': 'folder', 'construction': 'triangle-alert', 'scale': 'gavel', 'list-tree': 'list', 'unlink': 'link-2-off', 'file-check-2': 'file-check', 'messages-square': 'message-square', 'layout-list': 'list', 'route': 'map',
   'bar-chart-3': 'chart-column', 'kanban-square': 'square-kanban', 'check-square': 'square-check',
   'more-horizontal': 'ellipsis', 'arrow-right-circle': 'circle-arrow-right', 'file-cog': 'settings',
   'folder-kanban': 'folder', 'flask-conical': 'beaker', 'file-spreadsheet': 'sheet',
@@ -423,6 +701,17 @@ function normStage(v) {
   return STAGE_ALIASES[s] || STAGE_ALIASES[s.toLowerCase()] || null;
 }
 function stageIndex(id) { return STAGES.findIndex((s) => s.id === id); }
+/* 文件夹（只放文件，不算项目）：主页笔记写 type: folder；旧的「资料库」类型项目也算文件夹 */
+function isFolderFm(fm) {
+  if (!fm) return false;
+  const t = String(Array.isArray(fm.type) ? fm.type[0] : fm.type == null ? '' : fm.type).trim();
+  if (/^(folder|文件夹|资料夹)$/i.test(t)) return true;
+  const k = String(Array.isArray(fm.kind) ? fm.kind[0] : fm.kind == null ? '' : fm.kind).trim();
+  return /^(project|项目)$/i.test(t) && KIND_ALIASES[k] === 'collection';
+}
+function linkNames(v) { return (Array.isArray(v) ? v : v == null || v === '' ? [] : [v]).map((x) => parseLinkName(x)).filter(Boolean); }
+/* 新建项目 / 改类型时可选的类型（资料库已改成「文件夹」，不再作为项目类型） */
+function projectKinds() { return KIND_ORDER.filter((k) => k !== 'collection'); }
 /* 路径属于哪个项目：<根>/项目/<项目名>/… */
 function projectOfPathIn(path, root) {
   const pre = normalizePath((root || '科研') + '/项目') + '/';
@@ -650,7 +939,7 @@ const AGENT_GUIDE = `# 科研工作台 · AI 协作约定
 ## 项目主页 frontmatter
 \`\`\`yaml
 type: project
-kind: 论文 | 研究方向 | 研读他人工作 | 基金 / 申报 | 资料库   # 不写则视为「论文」
+kind: 论文 | 研究方向 | 研读他人工作 | 基金 / 申报   # 不写则视为「论文」
 stage: 见下表（取决于 kind；资料库留空）
 parent: "[[研究方向项目名]]"   # 可选：所属研究方向
 status: 进行中 | 卡住 | 暂停 | 已完成
@@ -668,7 +957,32 @@ description: "一句话描述"
 | 研究方向 | 长期方向 / 课题，可挂多个下属项目 | 入门调研 → 系统梳理 → 形成选题 → 持续跟踪 |
 | 研读他人工作 | 精读 / 复现某篇论文、某个团队的工作 | 收集资料 → 精读理解 → 复现验证 → 总结汇报 |
 | 基金 / 申报 | 基金、开题、中期等申报材料 | 选题论证 → 材料准备 → 撰写 → 修改定稿 → 提交答辩 |
-| 资料库 | 只存文件，没有流程 | （留空） |
+
+### 文件夹（不是项目）
+只用来放文件的地方（课程资料、讲解 PPT、别人发来的材料）不算项目，主页笔记写 \`type: folder\`（旧的 \`kind: 资料库\` 项目也按文件夹处理）。位置同样是 \`科研/项目/<名字>/<名字>.md\`。文件夹不进看板和时间轴；用 \`projects: ["[[项目A]]", "[[项目B]]"]\` 挂到相关项目上。
+
+### 项目主页里的小节（项目总览会读写这些）
+\`\`\`markdown
+## ❓ 研究问题
+- 这个项目要回答的问题
+- ✅ 已经回答了的问题
+
+## 🚩 里程碑
+- [ ] 要拿到的成果 📅 2026-12-10
+- [x] 已完成的成果 📅 2026-11-02 ✅ 2026-11-02
+
+## 💡 结论与证据
+- 一句话结论 ← [[实验或数据笔记]] [[图.png]] [[文献笔记]]
+
+## 🚧 卡点与决定
+- 🚧 现在卡住的地方
+- ❓ 等着决定的事
+- ✅ 2026-11-10 ❓ 已经决定的事 → 决定是什么
+
+## 📌 进展日志
+- 2026-11-23 14:30 推进了什么
+\`\`\`
+结论只有同时挂了实验 / 数据笔记和图，才算「证据齐了」，可以往论文里写。
 
 类型和流程可以在工作台里自定义（设置 → 项目类型与流程），以用户设置为准。单个项目可以用 \`stages: [阶段1, 阶段2, …]\` 属性设自己的流程，\`stages: [无]\` 表示没有流程。
 
@@ -727,6 +1041,8 @@ size: 123456789
 - 待办统一写成 \`- [ ] 任务内容 📅 YYYY-MM-DD\`，工作台「计划」页会自动汇总
 - 引用其他笔记用 \`[[笔记名]]\` 双链
 - 推进项目阶段时，修改项目主页的 \`stage\` 和 \`next\`，并在「进展日志」追加一行
+- 做完一组实验得出结论时，在项目主页「结论与证据」加一行，并链接对应的实验 / 数据笔记和图
+- 稿件（main.tex 或 Markdown）不要改名搬家：稿件驾驶舱按路径记章节计划，数据在 \`科研/工作台数据/稿件计划/\`（不要手动改）
 - 不要删除或重命名用户已有文件，除非用户明确要求
 `;
 
@@ -851,7 +1167,8 @@ class WorkbenchView extends ItemView {
   async onOpen() {
     this.buildShell();
     const refresh = () => this.requestRefresh();
-    this.registerEvent(this.app.metadataCache.on('changed', refresh));
+    // 工作台自己的数据文件（稿件计划、对话…）变了不用整页重画，各自的界面会自己更新
+    this.registerEvent(this.app.metadataCache.on('changed', (file) => { if (file && file.path && file.path.startsWith(this.plugin.dataDir() + '/')) return; refresh(); }));
     this.registerEvent(this.app.vault.on('create', refresh));
     this.registerEvent(this.app.vault.on('delete', refresh));
     this.registerEvent(this.app.vault.on('rename', refresh));
@@ -1181,6 +1498,13 @@ class WorkbenchView extends ItemView {
     if (sameView) this.bodyEl.style.minHeight = this.bodyEl.offsetHeight + 'px';
     else this.bodyEl.style.minHeight = '';
     const token = (this._renderTok = (this._renderTok || 0) + 1);
+    {
+      const ae = this.contentEl.ownerDocument.activeElement;
+      const kf = this._keepFocus, fresh = kf && Date.now() - kf.at < 1500;
+      if (kf && kf.force && fresh) { /* 刚点了「添加」或刚回车保存：光标去指定的输入框 */ }
+      else if (ae && ae.dataset && ae.dataset.rwKeep && this.bodyEl.contains(ae)) this._keepFocus = { key: ae.dataset.rwKeep, s: ae.selectionStart, e: ae.selectionEnd, at: Date.now() };
+      else if (!fresh) this._keepFocus = null;
+    }
     this.index = this.plugin.buildIndex();
     if (this.tab === 'detail' && !this.index.byName.has(this.detailProject)) this.tab = 'home';
     this.contentEl.classList.toggle('rw-dash-mode', this.tab === 'home');
@@ -1204,7 +1528,7 @@ class WorkbenchView extends ItemView {
       else if (NOTE_TYPES[this.tab]) this.renderNotesTab(el, this.tab === 'data' ? 'experiment' : this.tab);
       else if (this.tab === 'files') this.renderFiles(el);
       else if (this.tab === 'kb') this.renderKb(el);
-      else if (this.tab === 'detail' && this.detailProject && this.index.byName.has(this.detailProject)) this.renderDetail(el, this.index.byName.get(this.detailProject));
+      else if (this.tab === 'detail' && this.detailProject && this.index.byName.has(this.detailProject)) { const dp = this.index.byName.get(this.detailProject); if (dp.isFolder) this.renderFolderPage(el, dp); else this.renderDetail(el, dp); }
       else if (this.tab === 'plan') this.renderPlan(el);
       else if (this.tab === 'tempwork') this.renderTempWork(el);
       else if (this.tab === 'assistant') this.renderAssistant(el);
@@ -1764,9 +2088,10 @@ class WorkbenchView extends ItemView {
     }
     m.addItem((i) => i.setTitle('编辑这个项目的流程…').setIcon('route').onClick(() => new ProjectFlowModal(this.app, this.plugin, p).open()));
     m.addSeparator();
-    for (const k of KIND_ORDER) {
+    for (const k of projectKinds()) {
       m.addItem((i) => i.setTitle('类型 → ' + KINDS[k].label).setIcon(KINDS[k].icon).setChecked(p.pkind === k).onClick(async () => { await this.plugin.setProjectKind(p, k); this.render(); }));
     }
+    m.addItem((i) => i.setTitle('转为文件夹（只放文件，不算项目）').setIcon('folder').onClick(() => this.plugin.convertToFolder(p)));
     const dirs = this.index.projects.filter((x) => x.pkind === 'direction' && x.name !== p.name);
     if (dirs.length && p.pkind !== 'direction') {
       m.addSeparator();
@@ -1874,6 +2199,81 @@ class WorkbenchView extends ItemView {
     const grid = h(el, 'div', { cls: 'rw-grid' });
     for (const p of list) this.projectCard(grid, p, true);
     if (!list.length) h(el, 'div', { cls: 'rw-empty', text: '没有符合条件的项目' });
+    this.renderFolderStrip(el, { title: '文件夹（不算项目）', hint: '只用来放文件的地方放在这里，不占项目的位置。完整的文件夹列表在「文件」页。', compact: true });
+  }
+
+  /* ---------- 文件夹：只放文件，不算项目 ---------- */
+  renderFolderStrip(el, o) {
+    const folders = this.index.folders || [];
+    if (o.compact && !folders.length) return;
+    const sec = this.section(el, o.title + ' · ' + folders.length, 'folders');
+    sec.el.classList.add('rw-fstrip');
+    if (o.compact) { const nb = h(sec.right, 'button', { cls: 'rw-btn rw-btn-sm' }); ic(nb, 'folder-plus'); h(nb, 'span', { text: '新建文件夹' }); nb.addEventListener('click', () => this.plugin.newFolderModal()); }
+    if (o.hint) h(sec.body, 'div', { cls: 'rw-muted rw-fstrip-hint', text: o.hint });
+    if (!folders.length) { h(sec.body, 'div', { cls: 'rw-empty-sm', text: '还没有文件夹。点右上角「新建文件夹」；已有的项目如果只是用来放文件，右键它 →「转为文件夹」。' }); return; }
+    const grid = h(sec.body, 'div', { cls: 'rw-fgrid' });
+    for (const f of folders) this.folderCard(grid, f);
+  }
+  folderCard(parent, f) {
+    const card = h(parent, 'div', { cls: 'rw-fcard' });
+    const top = h(card, 'div', { cls: 'rw-fcard-top' });
+    ic(top, 'folder', 'rw-fcard-ic');
+    h(top, 'span', { cls: 'rw-fcard-title', text: f.title });
+    h(top, 'span', { cls: 'rw-fcard-n', text: (f.fileCount || 0) + ' 个文件' });
+    if (f.description) h(card, 'div', { cls: 'rw-fcard-desc', text: f.description });
+    const meta = h(card, 'div', { cls: 'rw-fcard-meta' });
+    for (const n of f.links || []) { const c = this.projectChip(meta, n); c.classList.add('is-clickable'); c.title = '挂在项目「' + n + '」上，点击打开项目'; c.addEventListener('click', (e) => { e.stopPropagation(); this.openProject(n); }); }
+    if (!(f.links || []).length) h(meta, 'span', { cls: 'rw-muted', text: '没有挂到项目' });
+    h(meta, 'span', { cls: 'rw-tp-sp' });
+    h(meta, 'span', { cls: 'rw-muted', text: relTime(f.lastActivity) });
+    card.addEventListener('click', () => this.openProject(f.name));
+    card.addEventListener('contextmenu', (e) => this.folderEntityMenu(e, f));
+    // 把文件拖到卡片上 = 放进这个文件夹
+    card.addEventListener('dragover', (e) => { if (hasFiles(e)) card.classList.add('is-file-target'); });
+    card.addEventListener('dragleave', (e) => { if (!card.contains(e.relatedTarget)) card.classList.remove('is-file-target'); });
+    card.addEventListener('drop', (e) => { card.classList.remove('is-file-target'); if (hasFiles(e)) e.rwContext = { project: f.name }; });
+    return card;
+  }
+  pickFolderLinks(f) {
+    const items = this.index.projects.map((p) => ({ key: p.name, label: p.title, sub: p.status === '已完成' ? '已完成' : p.stage || '', checked: (f.links || []).includes(p.name) }));
+    new PickManyModal(this.app, { title: '「' + f.title + '」挂到哪些项目上', desc: '挂上以后，在项目的总览里能直接看到并打开这个文件夹。文件不会移动。', items, empty: '还没有项目', onDone: (keys) => this.plugin.setFolderLinks(f, keys) }).open();
+  }
+  folderEntityMenu(e, f) {
+    e.preventDefault(); e.stopPropagation();
+    const m = new Menu();
+    m.addItem((i) => i.setTitle('打开文件夹').setIcon('folder-open').onClick(() => this.openProject(f.name)));
+    m.addItem((i) => i.setTitle('挂到项目上…').setIcon('link').onClick(() => this.pickFolderLinks(f)));
+    m.addItem((i) => i.setTitle('导入文件到这里…').setIcon('upload').onClick(() => this.plugin.pickFiles({ project: f.name })));
+    m.addItem((i) => i.setTitle('修改备注…').setIcon('pencil-line').onClick(() => this.plugin.promptText('备注（放什么、从哪来）', f.description, (v) => this.plugin.setField(f.file, 'description', v))));
+    m.addItem((i) => i.setTitle('打开说明页（笔记）').setIcon('file-text').onClick(() => this.plugin.openFile(f.file)));
+    m.addSeparator();
+    m.addItem((i) => i.setTitle('重命名…').setIcon('pencil').onClick(() => this.plugin.renameProjectPrompt(f)));
+    m.addItem((i) => i.setTitle('转为项目（有阶段、有生命线）').setIcon('folder-kanban').onClick(() => this.plugin.convertToProject(f)));
+    addDeleteItem(m, '删除文件夹…', () => this.plugin.deleteProject(f));
+    m.showAtMouseEvent(e);
+  }
+  renderFolderPage(el, f) {
+    const right = this.header(el, f.title, f.description || '文件夹：只放文件，不算项目', 'folder');
+    this.btn(right, '挂到项目', 'link', () => this.pickFolderLinks(f));
+    this.btn(right, '导入文件', 'upload', () => this.plugin.pickFiles({ project: f.name }), 'mod-cta');
+    const more = this.btn(right, '更多', 'more-horizontal', (e) => this.folderEntityMenu(e, f));
+    more.classList.add('rw-btn-more');
+    const bar = h(el, 'div', { cls: 'rw-folder-bar' });
+    bar.style.setProperty('--pc', projectColor(f.name));
+    ic(bar, 'link');
+    h(bar, 'span', { cls: 'rw-muted', text: (f.links || []).length ? '挂在项目：' : '还没有挂到任何项目' });
+    for (const n of f.links || []) {
+      const c = this.projectChip(bar, n); c.classList.add('is-clickable'); c.title = '打开项目';
+      c.addEventListener('click', () => this.openProject(n));
+    }
+    const add = h(bar, 'button', { cls: 'rw-linkbtn', text: (f.links || []).length ? '修改' : '＋ 挂到项目' });
+    add.addEventListener('click', () => this.pickFolderLinks(f));
+    h(bar, 'span', { cls: 'rw-tp-sp' });
+    h(bar, 'span', { cls: 'rw-muted', text: (f.fileCount || 0) + ' 个文件 · 最近改动 ' + relTime(f.lastActivity) });
+    const fsec = this.section(el, '里面的文件', 'folder-tree');
+    fsec.el.classList.add('rw-dsec', 'rw-proj-main', 'rw-folder-main');
+    fsec.el.style.setProperty('--pc', projectColor(f.name));
+    this.renderFolderBrowser(fsec.body, f);
   }
 
   /* ---------- 笔记类标签页（灵感/文献/实验/数据/写作/投稿/会议） ---------- */
@@ -1883,7 +2283,8 @@ class WorkbenchView extends ItemView {
     const f = (this.filters[type] = this.filters[type] || {});
     const st = this.plugin.settings;
     if (type === 'meeting' && !st.meetViewV2) { st.noteViews.meeting = 'meet'; st.meetViewV2 = true; this.plugin.saveSettingsSoon(); }
-    const view = st.noteViews[type] || (type === 'meeting' ? 'meet' : 'board');
+    if (type === 'draft' && !st.msViewV1) { st.noteViews.draft = 'ms'; st.msViewV1 = true; this.plugin.saveSettingsSoon(); }
+    const view = st.noteViews[type] || (type === 'meeting' ? 'meet' : type === 'draft' ? 'ms' : 'board');
 
     const right = this.header(el, def.label, def.desc, def.icon);
     const curProject = f.project && f.project !== '__none' ? f.project : '';
@@ -1926,6 +2327,7 @@ class WorkbenchView extends ItemView {
       // 当前阶段正需要这类笔记的项目（各类型项目的阶段都会映射到某类笔记）
       const inStage = this.index.projects.filter((p) => p.status !== '已完成' && stageDefOf(p) && (stageDefOf(p).noteType === type || (type === 'experiment' && stageDefOf(p).noteType === 'data')));
       const strip = h(el, 'div', { cls: 'rw-strip' });
+      if (type === 'draft' && view === 'ms') strip.style.display = 'none';
       const sc = (def.stage && STAGES[stageIndex(def.stage)]) || { color: '#8b5cf6', icon: def.icon };
       strip.style.setProperty('--sc', sc.color);
       const lab = h(strip, 'span', { cls: 'rw-strip-label' });
@@ -1960,12 +2362,13 @@ class WorkbenchView extends ItemView {
       h(lg, 'span', { cls: 'rw-pdfchip is-zotero', text: 'PDF · Zotero' });
       h(lg, 'span', { text: '在 Zotero 里' });
     }
-    this.segmented(bar, (type === 'meeting' ? [['meet', '按会议']] : []).concat([['board', type === 'idea' ? '卡片' : '看板'], ['list', '列表']]), view, (v) => { st.noteViews[type] = v; this.plugin.saveSettingsSoon(); this.render(); });
+    this.segmented(bar, (type === 'meeting' ? [['meet', '按会议']] : type === 'draft' ? [['ms', '稿件驾驶舱']] : []).concat([['board', type === 'idea' ? '卡片' : '看板'], ['list', '列表']]), view, (v) => { st.noteViews[type] = v; this.plugin.saveSettingsSoon(); this.render(); });
 
     if (type === 'literature') { this.litList(Object.assign({}, f, { cat: '' })); this.litCatChips(el, f); }
     const content = h(el, 'div', { cls: 'rw-notes-content' });
     const drawContent = () => {
       clear(content);
+      if (type === 'draft' && view === 'ms') { this.renderManuscripts(content, f); return; }
       let list = this.index.notes.filter(ofType);
       if (type === 'literature' && f.cat && f.cat !== 'all') list = list.filter((n) => this.litTags(n).has(f.cat));
       if (type === 'literature' && f.coll) list = list.filter((n) => (f.coll === '__none' ? !this.plugin.collOf(n).length : this.plugin.inColl(n, f.coll)));
@@ -2351,15 +2754,18 @@ class WorkbenchView extends ItemView {
     if (!f.cat) f.cat = 'all';
     const right = this.header(el, '文件', 'PDF 和图片在 Obsidian 里打开；PPT、Excel、Word、数据文件等用电脑上的默认程序打开', 'paperclip');
     this.btn(right, '从 Zotero 导入', 'library', () => this.plugin.zoteroImportModal({ project: this.dropContext().project }));
+    this.btn(right, '新建文件夹', 'folder-plus', () => this.plugin.newFolderModal());
     this.btn(right, '选择文件导入', 'upload', () => this.plugin.pickFiles(this.dropContext()), 'mod-cta');
+    this.renderFolderStrip(el, { title: '文件夹', hint: '只放文件、不算项目的地方。点开看里面的文件；右键可以挂到项目上、改名、转为项目。' });
     this.dropArea(el, '把文件从电脑拖到这里（可一次拖多个），会按类型自动归档到项目文件夹');
 
     const bar = h(el, 'div', { cls: 'rw-filterbar' });
     const sel = h(bar, 'select', { cls: 'dropdown rw-select' });
     const addOpt = (v, t) => { const o = h(sel, 'option', { text: t }); o.value = v; };
-    addOpt('', '全部项目');
-    addOpt('__none', '未归属项目');
+    addOpt('', '全部项目和文件夹');
+    addOpt('__none', '未归属');
     for (const p of this.index.projects) addOpt(p.name, p.title);
+    for (const p of this.index.folders) addOpt(p.name, '📁 ' + p.title);
     sel.value = f.project || '';
     const fi = h(bar, 'input', { cls: 'rw-filter-input', attr: { type: 'text', placeholder: '筛选文件名…' } });
     fi.value = f.text || '';
@@ -2474,6 +2880,9 @@ class WorkbenchView extends ItemView {
     m.addItem((i) => i.setTitle('移到 → 未归属项目').setChecked(!x.projectName).onClick(() => pl.moveEntry(x, '', x.cat)));
     for (const p of this.index.projects.filter((pp) => pp.status !== '已完成' || pp.name === x.projectName)) {
       m.addItem((i) => i.setTitle('移到 → ' + p.title).setChecked(x.projectName === p.name).onClick(() => pl.moveEntry(x, p.name, x.cat)));
+    }
+    for (const p of this.index.folders) {
+      m.addItem((i) => i.setTitle('移到 → 📁 ' + p.title).setIcon('folder').setChecked(x.projectName === p.name).onClick(() => pl.moveEntry(x, p.name, x.cat)));
     }
     m.addSeparator();
     for (const k of Object.keys(FILE_CATS)) {
@@ -3094,12 +3503,13 @@ class WorkbenchView extends ItemView {
   /* ---------- 项目详情页 ---------- */
   renderDetail(el, p) {
     const right = this.header(el, p.title, p.description || '项目详情：笔记、文件、文献、待办都在这里', 'folder-open');
-    this.btn(right, '删除项目', 'trash-2', () => this.plugin.deleteProject(p), 'rw-btn-danger');
-    this.btn(right, '重命名', 'pencil', () => this.plugin.renameProjectPrompt(p));
-    this.btn(right, '项目主页笔记', 'file-text', () => this.plugin.openFile(p.file));
-    this.btn(right, 'Zotero 导入', 'library', () => this.plugin.zoteroImportModal({ project: p.name }));
+    this._pdTab = this._pdTab || {};
+    const dtab = this._pdTab[p.name] === 'files' ? 'files' : 'overview';
+    const tabsEl = h(right, 'div', { cls: 'rw-pd-tabs' });
+    this.seg(tabsEl, [['overview', '总览'], ['files', '文件']], dtab, (v) => { this._pdTab[p.name] = v; this.render(); });
     this.btn(right, '导入文件', 'upload', () => this.plugin.pickFiles({ project: p.name }));
     this.btn(right, '新建笔记', 'file-plus', (e) => this.newNoteMenu(e, p.name), 'mod-cta');
+    this.btn(right, '更多', 'more-horizontal', (e) => this.projectMenu(e, p)).classList.add('rw-btn-more');
 
     // 概况卡
     const top = h(el, 'div', { cls: 'rw-detail-top rw-pd-top' });
@@ -3123,7 +3533,7 @@ class WorkbenchView extends ItemView {
     kc.style.setProperty('--kc', KINDS[p.pkind].color);
     kc.addEventListener('click', (e) => {
       const m = new Menu();
-      for (const k of KIND_ORDER) m.addItem((i) => i.setTitle(KINDS[k].label).setIcon(KINDS[k].icon).setChecked(p.pkind === k).onClick(async () => { await this.plugin.setProjectKind(p, k); this.render(); }));
+      for (const k of projectKinds()) m.addItem((i) => i.setTitle(KINDS[k].label).setIcon(KINDS[k].icon).setChecked(p.pkind === k).onClick(async () => { await this.plugin.setProjectKind(p, k); this.render(); }));
       m.addSeparator();
       m.addItem((i) => i.setTitle('管理项目类型和流程…').setIcon('settings-2').onClick(() => new KindsEditorModal(this.app, this.plugin, p.pkind).open()));
       m.showAtMouseEvent(e);
@@ -3160,15 +3570,21 @@ class WorkbenchView extends ItemView {
         b3.addEventListener('click', async () => { for (const o of olds) await this.plugin.syncProjectRefs(o, p.name); new Notice('已更新 ' + stale.length + ' 篇笔记的项目属性'); this.plugin.refreshViews(); });
       }
     }
-    // 主体：左边项目文件夹，右边分类（点进分类再看里面的东西）
-    const grid = h(el, 'div', { cls: 'rw-pd-grid' });
-    const lcol = h(grid, 'div', { cls: 'rw-pd-left' });
-    const rcol = h(grid, 'div', { cls: 'rw-pd-right' });
-    const fsec = this.section(lcol, '项目文件夹', 'folder-tree');
-    fsec.el.classList.add('rw-dsec', 'rw-proj-main');
-    fsec.el.style.setProperty('--pc', projectColor(p.name));
-    this.renderFolderBrowser(fsec.body, p);
-    this.renderDetailCats(rcol, p);
+    if (dtab === 'overview') {
+      top.classList.add('is-ov');
+      if (!infoOpen && !top.querySelector('.rw-name-warn')) top.style.display = 'none';
+      this.renderProjectOverview(el, p);
+    } else {
+      // 文件：左边项目文件夹，右边分类（点进分类再看里面的东西）
+      const grid = h(el, 'div', { cls: 'rw-pd-grid' });
+      const lcol = h(grid, 'div', { cls: 'rw-pd-left' });
+      const rcol = h(grid, 'div', { cls: 'rw-pd-right' });
+      const fsec = this.section(lcol, '项目文件夹', 'folder-tree');
+      fsec.el.classList.add('rw-dsec', 'rw-proj-main');
+      fsec.el.style.setProperty('--pc', projectColor(p.name));
+      this.renderFolderBrowser(fsec.body, p);
+      this.renderDetailCats(rcol, p);
+    }
 
     if (p.pkind === 'direction' || (p.children && p.children.length)) {
       const cs = this.section(el, '下属项目 · ' + p.children.length, 'git-branch');
@@ -3181,6 +3597,687 @@ class WorkbenchView extends ItemView {
         const g = h(cs.body, 'div', { cls: 'rw-grid' });
         for (const c of p.children) this.projectCard(g, c, false);
       }
+    }
+  }
+
+  /* ---------- 写作 · 稿件驾驶舱：章节进度 / 本节目标 / 段落提纲 / 证据检查 / 修改意见 ---------- */
+  renderManuscripts(parent, f) {
+    const pl = this.plugin;
+    const box = h(parent, 'div', { cls: 'rw-ms' });
+    const tok = (this._msTok = (this._msTok || 0) + 1);
+    const alive = () => tok === this._msTok && box.isConnected;
+    (async () => {
+      let list = await pl.msList();
+      if (!alive()) return;
+      if (f.project === '__none') list = list.filter((m) => !m.project);
+      else if (f.project) list = list.filter((m) => m.project === f.project);
+      if (f.text) { const q2 = f.text.toLowerCase(); list = list.filter((m) => m.title.toLowerCase().includes(q2) || m.path.toLowerCase().includes(q2)); }
+      const cur = list.find((m) => m.path === this._msSel) || list.find((m) => m.path === pl.settings.msLast) || list[0] || null;
+      const bar = h(box, 'div', { cls: 'rw-ms-bar' });
+      h(bar, 'span', { cls: 'rw-muted rw-ms-bar-label', text: '稿件' });
+      for (const m of list) {
+        const c = h(bar, 'button', { cls: 'rw-ms-chip' + (cur && m.path === cur.path ? ' is-active' : ''), title: m.path });
+        ic(c, /\.(tex|ltx)$/i.test(m.path) ? 'file-code-2' : 'file-text');
+        h(c, 'span', { text: trunc(m.title, 24) });
+        if (m.project && !f.project) h(c, 'span', { cls: 'rw-ms-chip-p', text: m.project });
+        c.addEventListener('click', () => { this._msSel = m.path; this._msSec = ''; pl.settings.msLast = m.path; pl.saveSettingsSoon(); this.render(); });
+      }
+      const add = h(bar, 'button', { cls: 'rw-ms-chip is-add', text: '＋ 添加稿件' });
+      add.addEventListener('click', (e) => this.msAddMenu(e, f.project && f.project !== '__none' ? f.project : ''));
+      if (!cur) {
+        const em = h(box, 'div', { cls: 'rw-ms-empty' });
+        h(em, 'b', { text: '还没有稿件' });
+        h(em, 'p', { text: '把正在写的论文加进来（Overleaf 导出的 main.tex，或库里的 Markdown 稿都行）。驾驶舱会读出章节、字数、每一节用了哪些图和引用，并顺着图找到产生它的实验笔记——哪一节还缺证据、缺图、没写完，一眼能看到。' });
+        const b = h(em, 'button', { cls: 'rw-btn mod-cta', text: '＋ 添加稿件' });
+        b.addEventListener('click', (e) => this.msAddMenu(e, f.project && f.project !== '__none' ? f.project : ''));
+        return;
+      }
+      this._msSel = cur.path;
+      const M = await pl.msParse(cur.file);
+      if (!alive()) return;
+      let claims = [];
+      const proj = cur.project ? this.index.byName.get(cur.project) : null;
+      if (proj && !proj.isFolder) { try { claims = (await pl.hnRead(proj)).claim; } catch (e) { /* ignore */ } }
+      if (!alive()) return;
+      const body = h(box, 'div', { cls: 'rw-ms-body' });
+      const draw = () => { const sc = [...body.querySelectorAll('.rw-ms-scroll')].map((x) => x.scrollTop); clear(body); this.msDraw(body, cur, M, { redraw: draw, claims, proj }); [...body.querySelectorAll('.rw-ms-scroll')].forEach((x, i) => { if (sc[i]) x.scrollTop = sc[i]; }); };
+      draw();
+    })().catch((e) => { console.error('[科研工作台] 稿件驾驶舱', e); h(box, 'div', { cls: 'rw-empty-sm', text: '稿件驾驶舱出错：' + (e.message || e) }); });
+  }
+  msAddMenu(e, project) {
+    const pl = this.plugin, m = new Menu();
+    m.addItem((i) => i.setTitle('从库里选一个稿件文件（.tex / .md）…').setIcon('file-search').onClick(() => new MsPickModal(this.app, pl, project, async (file) => { await pl.msRegister(file); this._msSel = file.path; this._msSec = ''; pl.settings.msLast = file.path; pl.saveSettingsSoon(); this.render(); }).open()));
+    m.addItem((i) => i.setTitle('新建一篇写作笔记…').setIcon('file-plus').onClick(() => pl.newNoteModal({ type: 'draft', project })));
+    m.showAtMouseEvent(e);
+  }
+  msDraw(body, cur, M, ctx) {
+    const pl = this.plugin;
+    const isTex = M.kind === 'tex';
+    const P = () => { const p = pl.msEnsure(cur.path); cur.plan = p; return p; };
+    const save = () => { pl.msSaveSoon(cur.path); ctx.redraw(); };
+    const secs = M.sections, tops = secs.filter((s) => !s.parent);
+    const stOf = (s) => pl.msStatusOf(cur.plan, s);
+    if (!secs.some((s) => s.key === this._msSec)) this._msSec = (tops.find((s) => stOf(s) !== '完成' && !s.unnumbered) || tops[0] || {}).key || '';
+    const sel = secs.find((s) => s.key === this._msSec) || null;
+    const fam = (s) => [s].concat(...s.kids.map(fam));
+    const allFigs = [], allCites = new Map();
+    for (const s of secs) {
+      for (const fi of s.figInfo) allFigs.push({ fi, s });
+      for (const c of s.citeInfo) { if (!allCites.has(c.key)) allCites.set(c.key, { c, secs: [] }); allCites.get(c.key).secs.push(s); }
+    }
+    const plan = cur.plan;
+    const cnt = (k) => (plan ? Object.values(plan.sections || {}).reduce((a, s) => a + (Array.isArray(s[k]) ? s[k].filter((x) => !x.done).length : 0), 0) : 0);
+    const comments = (plan && plan.comments) || [];
+    const cOpen = comments.filter((c) => c.st === '待处理').length;
+    const figMissing = allFigs.filter((x) => !x.fi.file).length, figNoExp = allFigs.filter((x) => !x.fi.sources.some((y) => y.note && (y.note.type === 'experiment' || y.note.type === 'data'))).length;
+    const citeUnknown = [...allCites.values()].filter((x) => !x.c.known).length;
+    const numbered = tops.filter((s) => !s.unnumbered);
+    const prog = numbered.length ? Math.round((numbered.reduce((a, s) => a + MS_WEIGHT[stOf(s)], 0) / numbered.length) * 100) : 0;
+    const setTab = (t, sec) => { this._msTab = t; if (sec) this._msSec = sec; ctx.redraw(); };
+    const tab = ['desk', 'figs', 'refs', 'rev'].includes(this._msTab) ? this._msTab : 'desk';
+
+    // 头部：标题 + 目标期刊 / 截止 / 字数 / 进度 + 还缺什么
+    const head = h(body, 'div', { cls: 'rw-ms-head' });
+    if (ctx.proj) head.style.setProperty('--pc', projectColor(ctx.proj.name));
+    const hl = h(head, 'div', { cls: 'rw-ms-head-l' });
+    h(hl, 'div', { cls: 'rw-ms-title', text: M.title, title: cur.path });
+    const meta = h(hl, 'div', { cls: 'rw-ms-meta' });
+    if (cur.project) { const pc = this.projectChip(meta, cur.project); pc.classList.add('is-clickable'); pc.addEventListener('click', () => this.openProject(cur.project)); }
+    const mf = (label, val, ph, fn) => { const x = h(meta, 'button', { cls: 'rw-ms-mf' + (val ? '' : ' is-empty') }); h(x, 'span', { cls: 'rw-muted', text: label }); h(x, 'b', { text: val || ph }); x.addEventListener('click', fn); return x; };
+    mf('目标期刊', (plan && plan.journal) || (cur.note && str(cur.note.fm.target)) || '', '点击填写', () => pl.promptText('目标期刊 / 会议', (plan && plan.journal) || '', (v) => { P().journal = v || ''; save(); }));
+    const dlv = (plan && plan.deadline) || '';
+    const dle = mf('投稿截止', dlv ? dlv + (parseDate(dlv) ? ' · ' + deadlineText(dlv) : '') : '', '点击填写', () => new FieldsModal(this.app, { title: '投稿截止日期', fields: [{ key: 'd', label: '日期', type: 'date', value: dlv }], onDone: (v) => { P().deadline = v.d || ''; save(); } }).open());
+    if (dlv && parseDate(dlv)) dle.classList.add(deadlineCls(dlv));
+    h(meta, 'span', { cls: 'rw-ms-words', text: '约 ' + M.words.toLocaleString() + (isTex ? ' 词' : ' 字') + ' · ' + allFigs.length + ' 张图 · ' + allCites.size + ' 篇引用' });
+    const hr = h(head, 'div', { cls: 'rw-ms-head-r' });
+    const pg = h(hr, 'div', { cls: 'rw-ms-prog', title: '按各章状态估算：待开始 0 · 提纲 25% · 初稿 60% · 修改中 80% · 完成 100%' });
+    h(pg, 'b', { text: prog + '%' }); const pb = h(pg, 'div', { cls: 'rw-ms-progbar' }); h(pb, 'i').style.width = prog + '%';
+    this.btn(hr, isTex ? '看稿件' : '打开稿件', 'file-text', () => (isTex ? pl.previewEntries([{ kind: 'file', file: cur.file, name: cur.file.name, ext: (cur.file.extension || '').toLowerCase(), cat: 'writing', size: cur.file.stat.size, mtime: cur.file.stat.mtime }], 0) : pl.openFile(cur.file)), 'rw-btn-sm');
+    if (!isTex) this.btn(hr, '写作工作台', 'pen-tool', () => pl.openWriteStudio(cur.file), 'rw-btn-sm');
+    else this.btn(hr, '用编辑器打开', 'external-link', () => pl.openWithDefault(cur.file), 'rw-btn-sm');
+    this.btn(hr, '更多', 'more-horizontal', (e) => {
+      const m = new Menu();
+      m.addItem((i) => i.setTitle('重新读取稿件').setIcon('refresh-ccw').onClick(() => { if (pl._msCache) pl._msCache.delete(cur.path); this.render(); }));
+      m.addItem((i) => i.setTitle('在文件夹中显示').setIcon('folder-open').onClick(() => pl.revealEntry({ kind: 'file', file: cur.file })));
+      m.addItem((i) => i.setTitle('换成新版本的稿件文件（章节计划、意见都保留）…').setIcon('replace').onClick(() => new MsPickModal(this.app, pl, cur.project, async (file) => {
+        if (file.path === cur.path) return;
+        if (pl._ms && pl._ms.has(file.path)) { new Notice('「' + file.name + '」已经在驾驶舱里了'); return; }
+        pl.msEnsure(cur.path);
+        await pl.msRename(cur.path, file.path);
+        this._msSel = file.path; pl.settings.msLast = file.path; pl.saveSettingsSoon();
+        new Notice('已换成 ' + file.name + '，章节计划按标题对应过来');
+        this.render();
+      }).open()));
+      if (cur.plan) addDeleteItem(m, '从驾驶舱移除（稿件文件不动）…', async () => { if (await pl.confirmDelete({ title: '从驾驶舱移除', lines: ['移除「' + M.title + '」的章节计划、提纲和修改意见？', '稿件文件本身不会动。计划数据会进回收站。'], confirmText: '移除' })) { this._msSel = ''; await pl.msRemove(cur.path); } });
+      m.showAtMouseEvent(e);
+    }, 'rw-btn-sm rw-btn-more');
+    // 还缺什么
+    const lack = h(body, 'div', { cls: 'rw-ms-lack' });
+    h(lack, 'span', { cls: 'rw-ms-lack-label', text: '这篇稿子还缺：' });
+    const lk = (n, text, cls, fn) => { if (!n) return; const b = h(lack, 'button', { cls: 'rw-ov-flag is-' + cls }); h(b, 'span', { text: n + ' ' + text }); b.addEventListener('click', fn); };
+    const notStarted = numbered.filter((s) => stOf(s) === '待开始').length, unmarked = numbered.filter((s) => stOf(s) === '未标记').length;
+    lk(notStarted, '章还没开始', 'warn', () => setTab('desk', (numbered.find((s) => stOf(s) === '待开始') || {}).key));
+    lk(unmarked, '章没标状态', 'ask', () => setTab('desk', (numbered.find((s) => stOf(s) === '未标记') || {}).key));
+    lk(cnt('need'), '处待补证据', 'bad', () => setTab('desk', (secs.find((s) => plan && plan.sections[s.key] && (plan.sections[s.key].need || []).some((x) => !x.done)) || {}).key));
+    lk(cnt('issues'), '个待解决问题', 'warn', () => setTab('desk', (secs.find((s) => plan && plan.sections[s.key] && (plan.sections[s.key].issues || []).some((x) => !x.done)) || {}).key));
+    lk(cOpen, '条修改意见没处理', 'bad', () => setTab('rev'));
+    lk(figMissing, '张图在库里找不到', 'warn', () => setTab('figs'));
+    lk(figNoExp, '张图没对上实验笔记', 'ask', () => setTab('figs'));
+    lk(citeUnknown, '条引用不在 bib 里', 'bad', () => setTab('refs'));
+    if (lack.children.length === 1) h(lack, 'span', { cls: 'rw-ov-flag is-ok', text: '暂时没发现缺口' });
+
+    // 章节进度条
+    const strip = h(body, 'div', { cls: 'rw-ms-strip' });
+    for (const s of tops) {
+      const st = stOf(s);
+      const c = h(strip, 'button', { cls: 'rw-ms-step st-' + st + (sel && (sel === s || sel.key.startsWith(s.key + ' › ')) ? ' is-active' : ''), title: s.title + ' · ' + st + ' · ' + s.total + (isTex ? ' 词' : ' 字') });
+      h(c, 'span', { cls: 'rw-ms-step-no', text: s.num || '·' });
+      h(c, 'span', { cls: 'rw-ms-step-t', text: s.title });
+      h(c, 'small', { text: st + ' · ' + s.total });
+      c.addEventListener('click', () => setTab('desk', s.key));
+    }
+    const tabs = h(body, 'div', { cls: 'rw-ms-tabs' });
+    for (const [id, label] of [['desk', '写作台'], ['figs', '图表 ' + allFigs.length], ['refs', '文献 ' + allCites.size], ['rev', '修改意见 ' + (comments.length ? cOpen + ' / ' + comments.length : '')]]) {
+      const b = h(tabs, 'button', { cls: 'rw-ms-tab' + (tab === id ? ' is-active' : ''), text: label.trim() });
+      b.addEventListener('click', () => setTab(id));
+    }
+    const pane = h(body, 'div', { cls: 'rw-ms-pane' });
+    const statusMenu = (e, s) => { e.preventDefault(); e.stopPropagation(); const m = new Menu(); for (const st of MS_STATUS) m.addItem((i) => i.setTitle(st).setChecked(stOf(s) === st).onClick(() => { pl.msSec(P(), s.key).status = st; save(); })); m.showAtMouseEvent(e); };
+    const openFig = (fi) => { if (fi.file) pl.previewEntries([{ kind: 'file', file: fi.file, name: fi.file.name, ext: (fi.file.extension || '').toLowerCase(), cat: 'image', size: fi.file.stat.size, mtime: fi.file.stat.mtime }], 0); };
+    const srcChips = (parent, fi) => {
+      const exps = fi.sources.filter((x) => x.note && (x.note.type === 'experiment' || x.note.type === 'data'));
+      const use = exps.length ? exps : fi.sources.slice(0, 2);
+      for (const x of use.slice(0, 3)) { const c = h(parent, 'button', { cls: 'rw-hn-ev ' + (exps.length ? 'is-exp' : ''), title: '这张图出现在：' + x.path }); ic(c, exps.length ? 'flask-conical' : 'file-text'); h(c, 'span', { text: trunc(x.note ? x.note.title : x.file.basename, 22) }); c.addEventListener('click', (e) => { e.stopPropagation(); x.note ? this.openNoteTitle(x.note) : pl.openFile(x.file); }); }
+      if (!use.length) h(parent, 'span', { cls: 'rw-hn-lack', text: '没找到用过这张图的实验笔记' });
+    };
+
+    if (tab === 'desk') {
+      const grid = h(pane, 'div', { cls: 'rw-ms-grid' });
+      // 左：章节目录
+      const tree = h(grid, 'div', { cls: 'rw-ms-col rw-ms-tree' });
+      h(tree, 'div', { cls: 'rw-ms-col-head', text: '章节目录' });
+      const tl = h(tree, 'div', { cls: 'rw-ms-scroll' });
+      for (const s of secs) {
+        const st = stOf(s);
+        const r = h(tl, 'div', { cls: 'rw-ms-sec lv' + s.level + (sel === s ? ' is-active' : '') });
+        h(r, 'span', { cls: 'rw-ms-sec-no', text: s.num });
+        h(r, 'span', { cls: 'rw-ms-sec-t', text: s.title, title: s.title });
+        h(r, 'span', { cls: 'rw-ms-sec-w', text: s.total });
+        const sb = h(r, 'button', { cls: 'rw-ms-st st-' + st, text: st, title: '点击改状态' });
+        sb.addEventListener('click', (e) => statusMenu(e, s));
+        r.addEventListener('click', () => { this._msSec = s.key; ctx.redraw(); });
+        r.addEventListener('contextmenu', (e) => statusMenu(e, s));
+      }
+      if (!secs.length) h(tl, 'div', { cls: 'rw-hn-hint', text: isTex ? '没有读到 \\section。稿件里用 \\section / \\subsection 分章节后，这里会自动列出来。' : '稿件里还没有标题。用 ## 写章节标题，这里会自动列出来。' });
+      // 中：这一节的写作计划
+      const mid = h(grid, 'div', { cls: 'rw-ms-col rw-ms-mid' });
+      if (sel) {
+        const S = (plan && plan.sections[sel.key]) || {};
+        const mh = h(mid, 'div', { cls: 'rw-ms-col-head' });
+        h(mh, 'span', { cls: 'rw-ms-mid-title', text: (sel.num ? sel.num + ' ' : '') + sel.title });
+        const sb = h(mh, 'button', { cls: 'rw-ms-st st-' + stOf(sel), text: stOf(sel) + ' ▾' });
+        sb.addEventListener('click', (e) => statusMenu(e, sel));
+        h(mh, 'span', { cls: 'rw-tp-sp' });
+        h(mh, 'span', { cls: 'rw-muted', text: sel.total + (isTex ? ' 词' : ' 字') });
+        if (!isTex) { const ob = h(mh, 'button', { cls: 'rw-linkbtn', text: '到这一节写 →' }); ob.addEventListener('click', () => pl.openFile(cur.file, sel.line)); }
+        const ms = h(mid, 'div', { cls: 'rw-ms-scroll' });
+        const mk = (k) => pl.msSec(P(), sel.key)[k];
+        this.msItems(ms, { key: cur.path + '|' + sel.key + '|goals', title: '本节目标', icon: 'target', list: S.goals || [], hint: '这一节要让读者明白什么？一两句话。', ph: '＋ 写一条目标，回车', add: (t) => { mk('goals').push({ t }); save(); }, change: save, arr: () => mk('goals') });
+        this.msItems(ms, { key: cur.path + '|' + sel.key + '|outline', title: '段落提纲', icon: 'list-ordered', list: S.outline || [], numbered: true, check: true, checkTip: '这一段写完了', note: true, hint: '一段一句话，先把顺序排出来再写；写完一段勾一段。', ph: '＋ 加一段：这一段讲什么，回车', add: (t) => { mk('outline').push({ t }); save(); }, change: save, arr: () => mk('outline') });
+        this.msItems(ms, { key: cur.path + '|' + sel.key + '|issues', title: '待解决问题', icon: 'circle-help', list: S.issues || [], check: true, checkTip: '解决了', hint: '写这一节时卡住的地方、导师提的问题。', ph: '＋ 记一个问题，回车', add: (t) => { mk('issues').push({ t }); save(); }, change: save, arr: () => mk('issues') });
+        const mine = comments.filter((c) => c.sec === sel.key || (c.sec && c.sec.startsWith(sel.key + ' › ')));
+        if (mine.length) { const b = h(ms, 'button', { cls: 'rw-linkbtn rw-ms-revlink', text: '这一节有 ' + mine.filter((c) => c.st === '待处理').length + ' / ' + mine.length + ' 条修改意见没处理 →' }); b.addEventListener('click', () => { this._msRevSec = sel.key; setTab('rev'); }); }
+      } else h(mid, 'div', { cls: 'rw-hn-hint', text: '左边选一节。' });
+      // 右：章节证据检查器
+      const ev = h(grid, 'div', { cls: 'rw-ms-col rw-ms-ev' });
+      const eh = h(ev, 'div', { cls: 'rw-ms-col-head' }); h(eh, 'span', { text: '章节证据检查器' });
+      const es = h(ev, 'div', { cls: 'rw-ms-scroll' });
+      if (sel) {
+        const F = fam(sel);
+        const figs = F.flatMap((s) => s.figInfo), cites = [], exps = [];
+        for (const s of F) { for (const c of s.citeInfo) if (!cites.some((x) => x.key === c.key)) cites.push(c); for (const n of s.expNotes) if (!exps.includes(n)) exps.push(n); }
+        const blk = (icon, title, n) => { const b = h(es, 'div', { cls: 'rw-ms-blk' }); const hd = h(b, 'div', { cls: 'rw-ms-blk-head' }); ic(hd, icon); h(hd, 'b', { text: title }); if (n != null) h(hd, 'span', { cls: 'rw-tab-count', text: n }); return b; };
+        const fb = blk('image', '用到的图', figs.length);
+        if (!figs.length) h(fb, 'div', { cls: 'rw-hn-hint', text: '这一节没有图。结果类的小节通常至少要一张图或一张表' + (F.some((s) => s.tables) ? '（有 ' + F.reduce((a, s) => a + s.tables, 0) + ' 张表）。' : '。') });
+        for (const fi of figs) {
+          const r = h(fb, 'div', { cls: 'rw-ms-evrow' + (fi.file ? '' : ' is-missing') });
+          const top = h(r, 'div', { cls: 'rw-ms-evtop' });
+          h(top, 'span', { cls: 'rw-ms-evname', text: fi.name, title: fi.file ? fi.file.path : '稿件里写的是 ' + fi.raw });
+          h(top, 'span', { cls: 'rw-ms-evst ' + (fi.file ? 'is-ok' : 'is-bad'), text: fi.file ? '在库里' : '找不到文件' });
+          if (fi.file) top.addEventListener('click', () => openFig(fi));
+          const sr = h(r, 'div', { cls: 'rw-hn-evs' }); h(sr, 'span', { cls: 'rw-ms-arrow', text: '←' }); srcChips(sr, fi);
+        }
+        if (exps.length) { const xb = blk('flask-conical', '背后的实验 / 数据', exps.length); const xr = h(xb, 'div', { cls: 'rw-hn-evs' }); for (const n of exps) { const c = h(xr, 'button', { cls: 'rw-hn-ev is-exp', title: n.file.path }); ic(c, 'flask-conical'); h(c, 'span', { text: trunc(n.title, 26) }); c.addEventListener('click', () => this.openNoteTitle(n)); } }
+        // 结论：项目里写下的结论，哪几条用在这一节
+        if (ctx.proj) {
+          const used = (plan && plan.sections[sel.key] && plan.sections[sel.key].claims) || [];
+          const cb = blk('scale', '这一节支撑的结论', ctx.claims.filter((c) => used.includes(c.text)).length + ' / ' + ctx.claims.length);
+          if (!ctx.claims.length) { const hint = h(cb, 'div', { cls: 'rw-hn-hint' }); h(hint, 'span', { text: '项目里还没有写结论。到项目总览的「结论与证据」写下来，再回这里勾选哪一节用到。 ' }); const go = h(hint, 'button', { cls: 'rw-linkbtn', text: '去写 →' }); go.addEventListener('click', () => { this._pdTab = this._pdTab || {}; this._pdTab[ctx.proj.name] = 'overview'; this._ovAdd = { p: ctx.proj.name, key: 'claim', kind: '', v: '', date: '' }; this.openProject(ctx.proj.name); }); }
+          for (const c of ctx.claims) {
+            const cs = pl.claimState(c, ctx.proj, this.index);
+            const on = used.includes(c.text);
+            const r = h(cb, 'label', { cls: 'rw-ms-claim' + (on ? ' is-on' : '') });
+            const ck = h(r, 'input', { attr: { type: 'checkbox' } }); ck.checked = on;
+            ck.addEventListener('change', () => { const a = pl.msSec(P(), sel.key).claims; const i = a.indexOf(c.text); if (ck.checked && i < 0) a.push(c.text); else if (!ck.checked && i >= 0) a.splice(i, 1); save(); });
+            h(r, 'span', { cls: 'rw-ms-claim-t', text: c.text, title: c.text });
+            h(r, 'span', { cls: 'rw-hn-st is-' + cs.st, text: { obs: '没证据', part: '证据不全', ok: '证据齐', written: '已写入' }[cs.st], title: cs.lack.length ? '还缺：' + cs.lack.join('、') : '' });
+          }
+        }
+        const rb = blk('book-open', '引用的文献', cites.length);
+        if (!cites.length) h(rb, 'div', { cls: 'rw-hn-hint', text: '这一节没有引用。' });
+        const showAll = this._msCiteAll === sel.key;
+        for (const c of showAll ? cites : cites.slice(0, 6)) {
+          const r = h(rb, 'div', { cls: 'rw-ms-cite' + (c.known ? '' : ' is-missing') });
+          h(r, 'span', { cls: 'rw-ms-cite-t', text: c.title || c.key, title: c.key + (c.title ? ' · ' + c.title : '') });
+          if (c.meta) h(r, 'span', { cls: 'rw-ms-cite-m', text: c.meta });
+          if (c.note) { const nb = h(r, 'button', { cls: 'rw-ms-evst is-ok', text: '有笔记' }); nb.addEventListener('click', () => this.openNoteTitle(c.note)); }
+          else if (!c.known) h(r, 'span', { cls: 'rw-ms-evst is-bad', text: 'bib 里没有' });
+        }
+        if (cites.length > 6) { const mb = h(rb, 'button', { cls: 'rw-linkbtn', text: showAll ? '收起 ▴' : '还有 ' + (cites.length - 6) + ' 篇 ▾' }); mb.addEventListener('click', () => { this._msCiteAll = showAll ? '' : sel.key; ctx.redraw(); }); }
+        const S = (plan && plan.sections[sel.key]) || {};
+        this.msItems(es, { key: cur.path + '|' + sel.key + '|need', title: '待补充的证据', icon: 'circle-alert', list: S.need || [], check: true, checkTip: '补上了', hint: '这一节还差什么才站得住：一张图、一组对比、一个参数来源…', ph: '＋ 还缺什么，回车', add: (t) => { pl.msSec(P(), sel.key).need.push({ t }); save(); }, change: save, arr: () => pl.msSec(P(), sel.key).need });
+      }
+    } else if (tab === 'figs') {
+      const tb = h(pane, 'div', { cls: 'rw-ms-table rw-ms-scroll' });
+      if (!allFigs.length) h(tb, 'div', { cls: 'rw-hn-hint', text: '稿件里还没有图。' });
+      allFigs.forEach((x, i) => {
+        const r = h(tb, 'div', { cls: 'rw-ms-trow' + (x.fi.file ? '' : ' is-missing') });
+        h(r, 'span', { cls: 'rw-ms-no', text: i + 1 });
+        const nm = h(r, 'span', { cls: 'rw-ms-tname', text: x.fi.name, title: x.fi.file ? x.fi.file.path : x.fi.raw }); if (x.fi.file) nm.addEventListener('click', () => openFig(x.fi));
+        const sc = h(r, 'button', { cls: 'rw-ms-tsec', text: (x.s.num ? x.s.num + ' ' : '') + trunc(x.s.title, 26) }); sc.addEventListener('click', () => setTab('desk', x.s.key));
+        h(r, 'span', { cls: 'rw-ms-evst ' + (x.fi.file ? 'is-ok' : 'is-bad'), text: x.fi.file ? '在库里' : '找不到文件' });
+        const sr = h(r, 'span', { cls: 'rw-hn-evs rw-ms-tsrc' }); srcChips(sr, x.fi);
+      });
+    } else if (tab === 'refs') {
+      const tb = h(pane, 'div', { cls: 'rw-ms-table rw-ms-scroll' });
+      const withNote = [...allCites.values()].filter((x) => x.c.note).length;
+      h(tb, 'div', { cls: 'rw-muted rw-ms-tsum', text: '正文引用 ' + allCites.size + ' 篇' + (isTex ? ' · bib 文件里 ' + M.bibCount + ' 条' : '') + ' · 其中 ' + withNote + ' 篇在工作台里有文献笔记' + (citeUnknown ? ' · ' + citeUnknown + ' 条不在 bib 里' : '') });
+      [...allCites.values()].forEach((x, i) => {
+        const r = h(tb, 'div', { cls: 'rw-ms-trow' + (x.c.known ? '' : ' is-missing') });
+        h(r, 'span', { cls: 'rw-ms-no', text: i + 1 });
+        h(r, 'span', { cls: 'rw-ms-tname is-ref', text: x.c.title || x.c.key, title: x.c.key });
+        h(r, 'span', { cls: 'rw-ms-cite-m', text: x.c.meta });
+        const sc = h(r, 'span', { cls: 'rw-ms-tsecs' });
+        for (const s of x.secs.slice(0, 3)) { const b = h(sc, 'button', { cls: 'rw-ms-tsec', text: s.num || trunc(s.title, 8), title: s.title }); b.addEventListener('click', () => setTab('desk', s.key)); }
+        if (x.secs.length > 3) h(sc, 'span', { cls: 'rw-muted', text: '+' + (x.secs.length - 3) });
+        if (x.c.note) { const nb = h(r, 'button', { cls: 'rw-ms-evst is-ok', text: '有笔记' }); nb.addEventListener('click', () => this.openNoteTitle(x.c.note)); }
+        else h(r, 'span', { cls: 'rw-ms-evst ' + (x.c.known ? '' : 'is-bad'), text: x.c.known ? '没有笔记' : 'bib 里没有' });
+      });
+      if (!allCites.size) h(tb, 'div', { cls: 'rw-hn-hint', text: isTex ? '稿件里还没有 \\cite。' : '稿件里还没有引用。在写作工作台里输入 [@ 可以插入文献引用。' });
+    } else this.msRevTab(pane, cur, M, { P, save, comments, setTab });
+  }
+  /* 一个可勾选 / 可编辑的小清单，底下常驻一个输入框，回车加一条 */
+  msItems(parent, o) {
+    const pl = this.plugin;
+    const blk = h(parent, 'div', { cls: 'rw-ms-blk' });
+    const hd = h(blk, 'div', { cls: 'rw-ms-blk-head' });
+    ic(hd, o.icon); h(hd, 'b', { text: o.title });
+    if (o.list.length) h(hd, 'span', { cls: 'rw-tab-count', text: o.check ? o.list.filter((x) => !x.done).length + ' / ' + o.list.length : o.list.length });
+    const ul = h(blk, 'div', { cls: 'rw-ms-items' });
+    if (!o.list.length && o.hint) h(ul, 'div', { cls: 'rw-hn-hint', text: o.hint });
+    o.list.forEach((it, i) => {
+      const r = h(ul, 'div', { cls: 'rw-ms-item' + (it.done ? ' is-done' : '') });
+      if (o.numbered) h(r, 'span', { cls: 'rw-ms-no', text: i + 1 });
+      if (o.check) { const b = h(r, 'button', { cls: 'rw-hn-check is-sq' + (it.done ? ' is-on' : ''), title: it.done ? '改回未完成' : o.checkTip }); if (it.done) ic(b, 'check'); b.addEventListener('click', (e) => { e.stopPropagation(); o.arr()[i].done = !it.done; o.change(); }); }
+      const tx = h(r, 'div', { cls: 'rw-ms-itext' });
+      h(tx, 'span', { text: it.t });
+      if (it.n) h(tx, 'small', { text: it.n });
+      if (o.numbered && i > 0) { const up = h(r, 'button', { cls: 'rw-iconbtn rw-ms-up', title: '上移' }); ic(up, 'arrow-up'); up.addEventListener('click', (e) => { e.stopPropagation(); const a = o.arr(); const x = a[i]; a[i] = a[i - 1]; a[i - 1] = x; o.change(); }); }
+      r.addEventListener('click', () => new FieldsModal(this.app, { title: o.title, fields: [{ key: 't', label: '内容', type: 'textarea', rows: 2, value: it.t, required: true }].concat(o.note ? [{ key: 'n', label: '说明（这一段要用到的图、数据、引用…可不填）', type: 'textarea', rows: 2, value: it.n || '' }] : []), danger: { text: '删除', fn: async () => { if (await pl.confirmDelete({ title: '删除这条', lines: [it.t], noTrashNote: true })) { o.arr().splice(i, 1); o.change(); } } }, onDone: (v) => { const a = o.arr(); a[i].t = String(v.t).trim(); if (o.note) a[i].n = String(v.n || '').trim(); o.change(); } }).open());
+    });
+    const inp = h(blk, 'input', { cls: 'rw-ms-add', attr: { type: 'text', placeholder: o.ph } });
+    inp.addEventListener('keydown', (e) => { if (e.key !== 'Enter' || e.isComposing) return; e.preventDefault(); const v = inp.value.trim(); if (!v) return; this._keepFocus = { key: 'ms:' + o.key, at: Date.now(), force: true }; o.add(v); });
+    this.keepFocus(inp, 'ms:' + o.key);
+    return blk;
+  }
+  /* 修改意见：审稿人 / 导师的意见逐条跟踪 */
+  msRevTab(pane, cur, M, c) {
+    const pl = this.plugin;
+    const ST = ['待处理', '已改', '已回复', '不改'];
+    const list = c.comments;
+    const bar = h(pane, 'div', { cls: 'rw-ms-revbar' });
+    const filt = this._msRevF || '全部';
+    for (const s of ['全部'].concat(ST)) { const n = s === '全部' ? list.length : list.filter((x) => x.st === s).length; const b = h(bar, 'button', { cls: 'rw-catchip' + (filt === s ? ' is-active' : '') }); h(b, 'span', { text: s }); h(b, 'span', { cls: 'rw-tab-count', text: n }); b.addEventListener('click', () => { this._msRevF = s; c.setTab('rev'); }); }
+    if (this._msRevSec) { const s = M.sections.find((x) => x.key === this._msRevSec); const b = h(bar, 'button', { cls: 'rw-catchip is-active', text: '只看：' + (s ? trunc(s.title, 14) : '') + ' ✕' }); b.addEventListener('click', () => { this._msRevSec = ''; c.setTab('rev'); }); }
+    h(bar, 'span', { cls: 'rw-tp-sp' });
+    const newId = () => 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    const edit = (it) => new FieldsModal(this.app, { title: it ? '修改意见' : '加一条修改意见', fields: [{ key: 't', label: '意见（审稿人 / 导师说了什么）', type: 'textarea', rows: 3, value: it ? it.t : '', required: true }, { key: 'src', label: '来源（审稿人 1 / 导师 / 第 3 页…）', value: it ? it.src : this._msRevSrc || '' }, { key: 'reply', label: '怎么改的 / 怎么回复（可以后填）', type: 'textarea', rows: 3, value: it ? it.reply || '' : '' }], danger: it ? { text: '删除', fn: async () => { if (await pl.confirmDelete({ title: '删除这条意见', lines: [it.t], noTrashNote: true })) { const a = c.P().comments; const i = a.findIndex((x) => x.id === it.id); if (i >= 0) a.splice(i, 1); c.save(); } } } : null, onDone: (v) => { const a = c.P().comments; this._msRevSrc = v.src; if (it) { const x = a.find((y) => y.id === it.id); if (x) { x.t = v.t.trim(); x.src = v.src.trim(); x.reply = v.reply.trim(); } } else a.push({ id: newId(), t: v.t.trim(), src: v.src.trim(), reply: v.reply.trim(), st: '待处理', sec: this._msRevSec || '', d: '' }); c.save(); } }).open();
+    const imp = (text, src) => { const items = msParseComments(text); if (!items.length) { new Notice('没有读到意见：每条意见写成一个列表项（- 开头），或一行一条'); return; } const a = c.P().comments; for (const it of items) a.push({ id: newId(), t: it.t, d: it.d || '', src: it.src || src || '', st: '待处理', sec: '', reply: '' }); new Notice('已加入 ' + items.length + ' 条修改意见'); c.save(); };
+    this.btn(bar, '加一条', 'plus', () => edit(null), 'rw-btn-sm');
+    this.btn(bar, '批量粘贴', 'clipboard-list', () => new FieldsModal(this.app, { title: '批量粘贴修改意见', desc: '一行一条，或每条写成列表项（- 开头）；标题行（# 开头）会当作来源。', fields: [{ key: 'text', label: '意见', type: 'textarea', rows: 10, value: '', required: true }, { key: 'src', label: '来源（没有标题行时用这个）', value: this._msRevSrc || '' }], submitText: '加入', onDone: (v) => imp(/^\s*([-*+]|\d+[.)、]|#)/m.test(v.text) ? v.text : v.text.split('\n').filter((l) => l.trim()).map((l) => '- ' + l.trim()).join('\n'), v.src) }).open(), 'rw-btn-sm');
+    this.btn(bar, '从笔记导入', 'file-input', () => new MsPickModal(this.app, pl, cur.project, async (file) => imp(await this.app.vault.cachedRead(file), file.basename), { mdOnly: true, placeholder: '选一篇记着修改意见的笔记（每个列表项算一条）…' }).open(), 'rw-btn-sm');
+    const box = h(pane, 'div', { cls: 'rw-ms-revlist rw-ms-scroll' });
+    let shown = list.filter((x) => filt === '全部' || x.st === filt);
+    if (this._msRevSec) shown = shown.filter((x) => x.sec === this._msRevSec || (x.sec && x.sec.startsWith(this._msRevSec + ' › ')));
+    if (!list.length) h(box, 'div', { cls: 'rw-hn-hint rw-ms-revhint', text: '审稿意见、导师的批注一条条放进来：每条标上对应的章节，改完写一句怎么改的。返修时这就是回复信的底稿，也不会漏掉哪一条。' });
+    else if (!shown.length) h(box, 'div', { cls: 'rw-hn-hint', text: '这个筛选下没有意见。' });
+    const secMenu = (e, it) => { e.stopPropagation(); const m = new Menu(); m.addItem((i) => i.setTitle('（不对应章节）').setChecked(!it.sec).onClick(() => { c.P().comments.find((x) => x.id === it.id).sec = ''; c.save(); })); for (const s of M.sections) m.addItem((i) => i.setTitle('　'.repeat(s.level - 1) + (s.num ? s.num + ' ' : '') + s.title).setChecked(it.sec === s.key).onClick(() => { c.P().comments.find((x) => x.id === it.id).sec = s.key; c.save(); })); m.showAtMouseEvent(e); };
+    for (const it of shown) {
+      const r = h(box, 'div', { cls: 'rw-ms-rev st-' + it.st });
+      const sb = h(r, 'button', { cls: 'rw-ms-revst', text: it.st, title: '点击改状态' });
+      sb.addEventListener('click', (e) => { e.stopPropagation(); const m = new Menu(); for (const s of ST) m.addItem((i) => i.setTitle(s).setChecked(it.st === s).onClick(() => { c.P().comments.find((x) => x.id === it.id).st = s; c.save(); })); m.showAtMouseEvent(e); });
+      const mid = h(r, 'div', { cls: 'rw-ms-rev-mid' });
+      h(mid, 'div', { cls: 'rw-ms-rev-t', text: it.t, title: it.d ? it.t + '\n\n' + it.d : it.t });
+      const sub = h(mid, 'div', { cls: 'rw-ms-rev-sub' });
+      if (it.src) h(sub, 'span', { cls: 'rw-ms-rev-src', text: trunc(it.src, 22), title: it.src });
+      const s = M.sections.find((x) => x.key === it.sec);
+      const sc = h(sub, 'button', { cls: 'rw-ms-tsec' + (s ? '' : ' is-empty'), text: s ? (s.num ? s.num + ' ' : '') + trunc(s.title, 18) : '＋ 对应章节' }); sc.addEventListener('click', (e) => secMenu(e, it));
+      if (it.reply) h(sub, 'span', { cls: 'rw-ms-rev-reply', text: '↳ ' + it.reply, title: it.reply });
+      r.addEventListener('click', () => edit(it));
+    }
+  }
+
+  /* ---------- 项目总览：生命线 + 整体情况 + 研究问题 / 里程碑 / 结论与证据 / 卡点与决定 ---------- */
+  renderProjectOverview(el, p) {
+    const pl = this.plugin, idx = this.index;
+    const notes = idx.notes.filter((n) => n.projectName === p.name);
+    const wrap = h(el, 'div', { cls: 'rw-ov' });
+    wrap.style.setProperty('--pc', projectColor(p.name));
+    const goFiles = (key) => { this._pdTab = this._pdTab || {}; this._pdTab[p.name] = 'files'; this._pdCat = this._pdCat || {}; this._pdCat[p.name] = key || ''; this.render(); };
+
+    // ① 生命线
+    const life = h(wrap, 'div', { cls: 'rw-ov-card rw-ov-lifecard' });
+    const lh = h(life, 'div', { cls: 'rw-ov-head' });
+    ic(lh, 'activity'); h(lh, 'b', { text: '生命线' });
+    h(lh, 'span', { cls: 'rw-status st-' + p.status, text: p.status });
+    if (stagesOf(p).length) {
+      const sc = h(lh, 'button', { cls: 'rw-pd-stage rw-ov-stagebtn', text: (p.stage || '未设阶段') + ' ▾', title: '当前阶段，点击切换' });
+      sc.addEventListener('click', (e) => { const m = new Menu(); for (const s2 of stagesOf(p)) m.addItem((i) => i.setTitle(s2.id).setIcon(s2.icon).setChecked(p.stage === s2.id).onClick(async () => { await pl.setProjectStage(p, s2.id); this.render(); })); m.showAtMouseEvent(e); });
+    }
+    const sum = h(lh, 'span', { cls: 'rw-ov-sum' });
+    h(lh, 'span', { cls: 'rw-tp-sp' });
+    const lg = h(lh, 'span', { cls: 'rw-life-legend' });
+    for (const [c, t] of [['prog', '进展'], ['meet', '会议'], ['ms', '里程碑'], ['bar', '每周改动']]) { const x = h(lg, 'span', { cls: 'rw-life-lg' }); h(x, 'i', { cls: 'is-' + c }); h(x, 'span', { text: t }); }
+    const io = !!pl.settings.detailInfoOpen;
+    const itg = h(lh, 'button', { cls: 'rw-linkbtn rw-ov-attr', text: io ? '收起属性 ▴' : '属性 ▾', title: '类型、流程、优先级、阶段进度条' });
+    itg.addEventListener('click', () => { pl.settings.detailInfoOpen = !io; pl.saveSettingsSoon(); this.render(); });
+    const lifeBody = h(life, 'div', { cls: 'rw-life-wrap' });
+
+    // ② 整体情况：数量 + 需要注意的地方
+    const tiles = h(wrap, 'div', { cls: 'rw-ov-tiles' });
+    const tile = (icon, label, n, sub, fn, tip) => {
+      const t = h(tiles, 'button', { cls: 'rw-ov-tile', title: tip || '' });
+      ic(t, icon, 'rw-ov-tile-ic');
+      const mid = h(t, 'span', { cls: 'rw-ov-tile-mid' });
+      h(mid, 'span', { cls: 'rw-ov-tile-label', text: label });
+      const s = h(mid, 'span', { cls: 'rw-ov-tile-sub', text: sub || '' });
+      const num = h(t, 'span', { cls: 'rw-ov-tile-n', text: String(n) });
+      t.addEventListener('click', fn);
+      return { el: t, num, sub: s };
+    };
+    const lit = notes.filter((n) => n.type === 'literature');
+    const exp = notes.filter((n) => n.type === 'experiment' || n.type === 'data');
+    const meet = notes.filter((n) => n.type === 'meeting').sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    const drafts = notes.filter((n) => n.type === 'draft');
+    tile('book-open', '文献', lit.length, lit.length ? '读完 ' + lit.filter((n) => /已读|已整理/.test(n.status)).length + ' · 在读 ' + lit.filter((n) => n.status === '在读').length : '还没有文献', () => goFiles('n:literature'));
+    tile('flask-conical', '实验与数据', exp.length, exp.length ? '完成 ' + exp.filter((n) => /已完成|已出图|已归档/.test(n.status)).length + ' · 进行中 ' + exp.filter((n) => /进行中|分析中/.test(n.status)).length : '还没有记录', () => goFiles('n:experiment'));
+    const wt = tile('pen-line', '写作', drafts.length, drafts.length ? '看稿件进度 →' : '还没有稿件', () => this.switchTab('draft', { project: p.name }), '打开「写作」页的稿件驾驶舱');
+    tile('users', '会议', meet.length, meet.length ? '最近 ' + (meet[0].date || '').slice(5) : '还没有纪要', () => goFiles('n:meeting'));
+    const tt = tile('check-square', '待办', '…', '', () => goFiles('tasks'));
+    const linked = pl.foldersOf(p.name, idx);
+    tile('paperclip', '文件', p.fileCount || 0, linked.length ? '另挂 ' + linked.length + ' 个文件夹' : '点开看文件夹', () => goFiles(''));
+    if (pl.msList) pl.msList().then((list) => { const mine = list.filter((m) => m.project === p.name); const total = new Set(drafts.map((n) => n.file.path).concat(mine.map((m) => m.path))).size; wt.num.textContent = String(total); if (total) wt.sub.textContent = '看稿件进度 →'; });
+    const flags = h(wrap, 'div', { cls: 'rw-ov-flags' });
+
+    // ③ 三栏
+    const cols = h(wrap, 'div', { cls: 'rw-ov-cols' });
+    const c1 = h(cols, 'div', { cls: 'rw-ov-col' }), c2 = h(cols, 'div', { cls: 'rw-ov-col' }), c3 = h(cols, 'div', { cls: 'rw-ov-col' });
+
+    (async () => {
+      const L = await pl.projectLife(p, idx);
+      const tasks = await pl.collectTasks({ projects: [p], notes, byName: idx.byName });
+      if (!wrap.isConnected) return;
+      this.renderLifeline(lifeBody, p, L);
+      sum.textContent = '已进行 ' + L.days + ' 天' + (p.stage ? ' · 「' + p.stage + '」第 ' + (L.stageDays + 1) + ' 天' : '') + ' · 最近改动 ' + relTime(p.lastActivity) + ' · 本周 ' + L.weekNow + ' 处改动';
+      const open = tasks.filter((t) => !t.done);
+      const late = open.filter((t) => t.due && t.due < today());
+      tt.num.textContent = String(open.length);
+      tt.sub.textContent = late.length ? '逾期 ' + late.length + ' 条' : open.length ? '都在期限内' : '没有未完成的';
+      tt.el.classList.toggle('is-warn', late.length > 0);
+      // 需要注意的地方
+      const flag = (cls, icon, text, fn) => { const f = h(flags, 'button', { cls: 'rw-ov-flag is-' + cls }); ic(f, icon); h(f, 'span', { text }); if (fn) f.addEventListener('click', fn); };
+      const stale = Math.floor((Date.now() - p.lastActivity) / 86400000);
+      const openQ = L.hn.question.filter((x) => !x.done), openI = L.hn.issue.filter((x) => !x.done);
+      const nextMs = L.hn.milestone.filter((m) => !m.done && m.date).sort((a, b) => a.date.localeCompare(b.date))[0];
+      const editNext = () => pl.promptText('下一步要做什么？', p.next, (v) => pl.setField(p.file, 'next', v));
+      if (p.next) { const nf = h(flags, 'button', { cls: 'rw-ov-flag is-next', title: '下一步（点击修改）' }); ic(nf, 'arrow-right-circle'); h(nf, 'span', { text: '下一步：' + p.next }); nf.addEventListener('click', editNext); }
+      if (p.status === '已完成') flag('ok', 'check-circle-2', '项目已完成');
+      else {
+        if (!isNaN(L.deadline)) { const d = daysUntil(p.deadline); flag(d < 0 ? 'bad' : d <= 14 ? 'warn' : 'ok', 'alarm-clock', d < 0 ? '已过截止 ' + -d + ' 天' : d === 0 ? '今天截止' : '离截止还有 ' + d + ' 天'); }
+        if (nextMs) { const d = daysUntil(nextMs.date); flag(d < 0 ? 'bad' : d <= 7 ? 'warn' : 'ok', 'flag', '下一个里程碑：' + trunc(nextMs.text, 18) + (d < 0 ? '（逾期 ' + -d + ' 天）' : d === 0 ? '（今天）' : '（还有 ' + d + ' 天）')); }
+        else flag('ask', 'flag', '还没有里程碑', () => this.ovStartAdd(p, 'milestone'));
+        if (!p.next) flag('ask', 'arrow-right-circle', '还没写下一步', editNext);
+        if (!L.hn.question.length) flag('ask', 'circle-help', '还没写研究问题', () => this.ovStartAdd(p, 'question'));
+        if (stale >= 14) flag('warn', 'moon', stale + ' 天没有动静');
+        if (late.length) flag('bad', 'check-square', late.length + ' 条待办逾期', () => goFiles('tasks'));
+        if (openI.length) flag('warn', 'construction', openI.length + ' 个卡点 / 待决定');
+        if (openQ.length && !L.hn.claim.length && L.days > 30) flag('ask', 'scale', '还没有写下任何结论', () => this.ovStartAdd(p, 'claim'));
+      }
+      this.hnCard(c1, p, 'question', L.hn.question);
+      this.hnCard(c1, p, 'claim', L.hn.claim);
+      this.hnCard(c2, p, 'milestone', L.hn.milestone);
+      this.hnCard(c2, p, 'issue', L.hn.issue);
+      this.ovProgressCard(c3, p, L);
+      this.ovFoldersCard(c3, p, linked);
+    })().catch((e) => { console.error('[科研工作台] 项目总览', e); h(wrap, 'div', { cls: 'rw-empty-sm', text: '总览加载出错：' + (e.message || e) }); });
+  }
+
+  renderLifeline(box, p, L) {
+    const DAY = 86400000;
+    const span = Math.max(DAY, L.end - L.start);
+    const X = (t) => Math.max(0, Math.min(100, ((t - L.start) / span) * 100));
+    const fmtD = (t) => fmtDate(new Date(t)).slice(5);
+    const el = h(box, 'div', { cls: 'rw-life' });
+    // 月份刻度
+    const mrow = h(el, 'div', { cls: 'rw-life-months' });
+    const months = [];
+    for (let d = new Date(new Date(L.start).getFullYear(), new Date(L.start).getMonth(), 1); d.getTime() <= L.end; d = new Date(d.getFullYear(), d.getMonth() + 1, 1)) months.push(d);
+    const step = Math.max(1, Math.ceil(months.length / 12));
+    months.forEach((d, i) => {
+      const t = d.getTime();
+      if (t < L.start || i % step) return;
+      const m = h(mrow, 'span', { cls: 'rw-life-month', text: (d.getMonth() === 0 ? d.getFullYear() + ' 年 ' : '') + (d.getMonth() + 1) + ' 月' });
+      m.style.left = X(t) + '%';
+    });
+    // 里程碑文字（放不下就只留菱形）
+    const lrow = h(el, 'div', { cls: 'rw-life-labels' });
+    let lastRight = -1;
+    for (const e of L.ev.filter((x) => x.kind === 'ms').sort((a, b) => a.t - b.t)) {
+      const x = X(e.t), w = Math.min(24, 2.2 + e.title.length * 1.25);
+      const left = Math.min(x, 100 - w);
+      if (left < lastRight + 1) continue;
+      const lb = h(lrow, 'span', { cls: 'rw-life-label' + (e.done ? ' is-done' : e.late ? ' is-late' : ''), text: trunc(e.title, 16), title: e.date + ' ' + e.title });
+      lb.style.left = left + '%'; lastRight = left + w;
+    }
+    // 事件点
+    const marks = h(el, 'div', { cls: 'rw-life-marks' });
+    const KN = { prog: '进展', meet: '会议', sub: '投稿', ms: '里程碑' };
+    for (const e of L.ev.slice().sort((a, b) => (a.kind === 'ms' ? 1 : 0) - (b.kind === 'ms' ? 1 : 0) || a.t - b.t)) {
+      if (e.t < L.start || e.t > L.end) continue;
+      const m = h(marks, 'span', { cls: 'rw-life-mark is-' + e.kind + (e.done ? ' is-done' : '') + (e.late ? ' is-late' : ''), title: e.date + ' ' + KN[e.kind] + '：' + e.title });
+      m.style.left = X(e.t) + '%';
+      if (e.note) m.addEventListener('click', () => this.openNoteTitle(e.note));
+      else if (e.kind === 'ms') m.addEventListener('click', () => this.hnEdit(p, 'milestone', e.item));
+    }
+    // 阶段带
+    const track = h(el, 'div', { cls: 'rw-life-track' });
+    for (const s of L.segs) {
+      const days = Math.max(0, Math.round((s.to - s.from) / DAY));
+      const w = X(s.to) - X(s.from);
+      if (w <= 0 && !s.current) continue;
+      const seg = h(track, 'div', { cls: 'rw-life-seg' + (s.current ? ' is-current' : ''), title: (s.stage || '进行中') + ' · ' + fmtD(s.from) + ' → ' + (s.current ? '今天' : fmtD(s.to)) + ' · ' + (days + (s.current ? 1 : 0)) + ' 天' });
+      seg.style.left = X(s.from) + '%'; seg.style.width = Math.max(0.8, w) + '%';
+      seg.style.setProperty('--sc', s.color);
+      if (s.stage) h(seg, 'span', { text: s.stage });
+    }
+    if (!isNaN(L.deadline) && L.deadline > L.today) { const f = h(track, 'div', { cls: 'rw-life-future', title: '今天 → 截止日 ' + p.deadline }); f.style.left = X(L.today) + '%'; f.style.width = X(L.deadline) - X(L.today) + '%'; }
+    const start = h(el, 'span', { cls: 'rw-life-start', text: '开始 ' + fmtD(L.start), title: '项目开始：' + fmtDate(new Date(L.start)) });
+    start.style.left = '0%';
+    const td = h(el, 'div', { cls: 'rw-life-today', title: '今天 ' + today() }); td.style.left = X(L.today) + '%'; h(td, 'span', { text: '今天' });
+    if (!isNaN(L.deadline)) { const dl = h(el, 'div', { cls: 'rw-life-deadline' + (L.deadline < L.today ? ' is-late' : ''), title: '截止 ' + p.deadline }); dl.style.left = X(L.deadline) + '%'; h(dl, 'span', { text: '截止 ' + String(p.deadline).slice(5) }); }
+    // 每周改动
+    const pulse = h(el, 'div', { cls: 'rw-life-pulse' });
+    const max = Math.max(1, ...L.weeks.values());
+    const bw = (7 * DAY / span) * 100;
+    for (const [w, n] of L.weeks) {
+      const b = h(pulse, 'span', { cls: 'rw-life-bar', title: fmtD(w) + ' 起的一周：' + n + ' 处改动' });
+      b.style.left = X(Math.max(w, L.start)) + '%'; b.style.width = 'calc(' + Math.min(bw, 100 - X(w)) + '% - 2px)';
+      b.style.height = Math.max(10, Math.round(Math.sqrt(n / max) * 100)) + '%';
+    }
+    if (!L.weeks.size) h(pulse, 'span', { cls: 'rw-life-nopulse', text: '还没有改动记录' });
+  }
+
+  ovStartAdd(p, key, kind) { this._ovAdd = { p: p.name, key, kind: kind || '', v: '', date: '' }; this._keepFocus = { key: 'hn:' + p.name + ':' + key, at: Date.now(), force: true }; this.render(); }
+  /* 重绘后把光标还给正在打字的输入框（页面随时会因为文件变化重绘） */
+  keepFocus(inp, key) {
+    inp.dataset.rwKeep = key;
+    const k = this._keepFocus;
+    if (!k || k.key !== key) return;
+    this._keepFocus = null;
+    setTimeout(() => { if (!inp.isConnected) return; inp.focus(); try { if (k.s != null && inp.setSelectionRange && inp.type !== 'date') inp.setSelectionRange(k.s, k.e); } catch (e) { /* ignore */ } }, 0);
+  }
+  /* 修改一条（弹小窗） */
+  hnEdit(p, key, it) {
+    const pl = this.plugin;
+    const del = { text: '删除', fn: async () => { if (await pl.confirmDelete({ title: '删除这条' + HN_SECS[key].label, lines: [it.text], noTrashNote: true })) await pl.hnSet(p, key, it, null); } };
+    if (key === 'milestone') return new FieldsModal(this.app, { title: '里程碑', fields: [{ key: 'text', label: '要拿到什么成果', value: it.text, required: true }, { key: 'date', label: '哪天', type: 'date', value: it.date }], danger: del, onDone: (v) => pl.hnSet(p, key, it, Object.assign({}, it, { text: v.text, date: v.date })) }).open();
+    if (key === 'issue') return new FieldsModal(this.app, { title: it.kind === 'decide' ? '待决定的事' : '卡点', fields: [{ key: 'text', label: it.kind === 'decide' ? '要决定什么' : '卡在哪', value: it.text, required: true }, { key: 'result', label: it.kind === 'decide' ? '决定（填了就算已决定）' : '怎么解决的（填了就算已解决）', type: 'textarea', rows: 2, value: it.result }], danger: del, onDone: (v) => pl.hnSet(p, key, it, Object.assign({}, it, { text: v.text, result: v.result, done: !!String(v.result).trim() || it.done, date: it.date || (String(v.result).trim() ? today() : '') })) }).open();
+    return new FieldsModal(this.app, { title: HN_SECS[key].label, fields: [{ key: 'text', label: key === 'claim' ? '结论（一句话）' : '问题', type: 'textarea', rows: 2, value: it.text, required: true }], danger: del, onDone: (v) => pl.hnSet(p, key, it, Object.assign({}, it, { text: v.text })) }).open();
+  }
+  hnCard(col, p, key, items) {
+    const pl = this.plugin, def = HN_SECS[key], idx = this.index;
+    const card = h(col, 'div', { cls: 'rw-ov-card rw-hn is-' + key });
+    const hd = h(card, 'div', { cls: 'rw-ov-head' });
+    ic(hd, def.icon); h(hd, 'b', { text: def.label });
+    const openN = key === 'claim' ? items.length : items.filter((x) => !x.done).length;
+    if (items.length) h(hd, 'span', { cls: 'rw-tab-count', text: key === 'claim' ? items.length : openN + (items.length > openN ? ' / ' + items.length : '') });
+    h(hd, 'span', { cls: 'rw-tp-sp' });
+    const addBtn = (text, kind) => { const b = h(hd, 'button', { cls: 'rw-linkbtn rw-hn-add', text }); b.addEventListener('click', () => this.ovStartAdd(p, key, kind)); };
+    if (key === 'issue') { addBtn('＋卡点', 'block'); addBtn('＋待决定', 'decide'); } else addBtn('＋ 添加');
+    const list = h(card, 'div', { cls: 'rw-hn-list' });
+    const HINT = {
+      question: '这个项目到底想回答什么？写下 1–3 个问题，实验和文献都围着它转。',
+      milestone: '下一个看得见的成果是什么、哪天拿到？比如「跑通基线」「初稿给导师」。',
+      claim: '做出来的结果能下什么结论？写一句，再挂上支撑它的实验、图和文献——证据齐了才往论文里写。',
+      issue: '现在卡在哪？有什么事要等导师拍板？记在这里，解决后自动留成决定记录。',
+    };
+    if (!items.length) h(list, 'div', { cls: 'rw-hn-hint', text: HINT[key] });
+    const menu = (e, it, extra) => {
+      e.preventDefault();
+      const m = new Menu();
+      m.addItem((i) => i.setTitle('修改…').setIcon('pencil').onClick(() => this.hnEdit(p, key, it)));
+      for (const x of extra || []) m.addItem((i) => i.setTitle(x[0]).setIcon(x[1]).onClick(x[2]));
+      m.addItem((i) => i.setTitle('在项目主页里打开').setIcon('file-text').onClick(() => pl.openFile(p.file)));
+      addDeleteItem(m, '删除这条…', async () => { if (await pl.confirmDelete({ title: '删除这条' + def.label, lines: [it.text], noTrashNote: true })) await pl.hnSet(p, key, it, null); });
+      m.showAtMouseEvent(e);
+    };
+    const tog = (r, it, on, tip) => { const b = h(r, 'button', { cls: 'rw-hn-check' + (on ? ' is-on' : ''), title: tip }); if (on) ic(b, 'check'); b.addEventListener('click', (e) => { e.stopPropagation(); pl.hnSet(p, key, it, Object.assign({}, it, { done: !it.done, doneDate: !it.done ? today() : '' })); }); return b; };
+    if (key === 'question') {
+      for (const it of items) {
+        const r = h(list, 'div', { cls: 'rw-hn-row' + (it.done ? ' is-done' : '') });
+        tog(r, it, it.done, it.done ? '已回答，点一下改回未回答' : '标为已回答');
+        h(r, 'span', { cls: 'rw-hn-text', text: it.text, title: it.text });
+        r.addEventListener('click', () => this.hnEdit(p, key, it));
+        r.addEventListener('contextmenu', (e) => menu(e, it));
+      }
+    } else if (key === 'milestone') {
+      const sorted = items.slice().sort((a, b) => (a.done ? 1 : 0) - (b.done ? 1 : 0) || (a.date || '9999').localeCompare(b.date || '9999'));
+      for (const it of sorted) {
+        const r = h(list, 'div', { cls: 'rw-hn-row' + (it.done ? ' is-done' : '') });
+        tog(r, it, it.done, it.done ? '已完成，点一下改回未完成' : '标为完成');
+        h(r, 'span', { cls: 'rw-hn-text', text: it.text, title: it.text });
+        if (it.date) { const d = daysUntil(it.date); h(r, 'span', { cls: 'rw-hn-date' + (it.done ? '' : d < 0 ? ' is-late' : d <= 7 ? ' is-soon' : ''), text: it.date.slice(5) + (it.done ? '' : d < 0 ? ' · 逾期 ' + -d + ' 天' : d === 0 ? ' · 今天' : ' · ' + d + ' 天后') }); }
+        r.addEventListener('click', () => this.hnEdit(p, key, it));
+        r.addEventListener('contextmenu', (e) => menu(e, it));
+      }
+    } else if (key === 'claim') {
+      const ST = { obs: ['只是观察', '还没有挂证据'], part: ['证据不全', ''], ok: ['证据齐了', '有实验/数据，也有图'], written: ['已写进论文', ''] };
+      const KI = { exp: 'flask-conical', fig: 'image', lit: 'book-open', note: 'file-text', file: 'paperclip', missing: 'circle-alert' };
+      for (const it of items) {
+        const cs = pl.claimState(it, p, idx);
+        const r = h(list, 'div', { cls: 'rw-hn-row rw-hn-claim' });
+        const top = h(r, 'div', { cls: 'rw-hn-ctop' });
+        h(top, 'span', { cls: 'rw-hn-st is-' + cs.st, text: ST[cs.st][0], title: cs.st === 'part' ? '还缺：' + cs.lack.join('、') : ST[cs.st][1] });
+        h(top, 'span', { cls: 'rw-hn-text', text: it.text, title: it.text });
+        const evs = h(r, 'div', { cls: 'rw-hn-evs' });
+        for (const e of cs.ev) {
+          const c = h(evs, 'button', { cls: 'rw-hn-ev is-' + e.kind, title: (e.kind === 'missing' ? '找不到这个文件：' : '') + e.link + '（右键移除）' });
+          ic(c, KI[e.kind]); h(c, 'span', { text: trunc(e.label, 22) });
+          c.addEventListener('click', (ev) => { ev.stopPropagation(); if (e.note) this.openNoteTitle(e.note); else if (e.file) pl.openAny ? pl.openAny(e.file) : pl.openFile(e.file); });
+          c.addEventListener('contextmenu', (ev) => { ev.preventDefault(); ev.stopPropagation(); const m = new Menu(); m.addItem((i) => i.setTitle('移除这条证据').setIcon('unlink').onClick(() => pl.hnSet(p, key, it, Object.assign({}, it, { links: it.links.filter((l) => l !== e.link) })))); m.showAtMouseEvent(ev); });
+        }
+        const add = h(evs, 'button', { cls: 'rw-hn-ev is-add', text: '＋证据', title: '挂一个实验 / 数据笔记、图或文献' });
+        add.addEventListener('click', (ev) => { ev.stopPropagation(); new EvidencePickModal(this.app, pl, p, (file) => { const lt = file.extension === 'md' ? file.path.replace(/\.md$/, '') : file.path; if (!it.links.includes(lt)) pl.hnSet(p, key, it, Object.assign({}, it, { links: it.links.concat(lt) })); }).open(); });
+        if (cs.st === 'part' || cs.st === 'obs') h(evs, 'span', { cls: 'rw-hn-lack', text: '还缺 ' + cs.lack.join('、') });
+        r.addEventListener('click', () => this.hnEdit(p, key, it));
+        r.addEventListener('contextmenu', (e) => menu(e, it, [[it.written ? '取消「已写进论文」' : '标为「已写进论文」', 'pen-line', () => pl.hnSet(p, key, it, Object.assign({}, it, { written: !it.written }))]]));
+      }
+    } else {
+      const open = items.filter((x) => !x.done), done = items.filter((x) => x.done).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+      for (const it of open) {
+        const r = h(list, 'div', { cls: 'rw-hn-row is-' + it.kind });
+        h(r, 'span', { cls: 'rw-hn-kind', text: it.kind === 'decide' ? '待决定' : '卡点' });
+        h(r, 'span', { cls: 'rw-hn-text', text: it.text, title: it.text });
+        const b = h(r, 'button', { cls: 'rw-linkbtn rw-hn-resolve', text: it.kind === 'decide' ? '定了' : '解决了' });
+        b.addEventListener('click', (e) => { e.stopPropagation(); new FieldsModal(this.app, { title: it.kind === 'decide' ? '决定了什么' : '怎么解决的', desc: it.text, fields: [{ key: 'result', label: it.kind === 'decide' ? '决定' : '解决办法（可不填）', type: 'textarea', rows: 2, value: '' }], submitText: it.kind === 'decide' ? '记下决定' : '标为已解决', onDone: (v) => pl.hnSet(p, key, it, Object.assign({}, it, { done: true, date: today(), result: v.result })) }).open(); });
+        r.addEventListener('click', () => this.hnEdit(p, key, it));
+        r.addEventListener('contextmenu', (e) => menu(e, it));
+      }
+      if (done.length) {
+        this._ovDone = this._ovDone || new Set();
+        const k = p.name + '|issue', show = this._ovDone.has(k);
+        const tg = h(list, 'button', { cls: 'rw-linkbtn rw-hn-donetoggle', text: (show ? '收起' : '决定记录 / 已解决 ' + done.length + ' 条') + (show ? ' ▴' : ' ▾') });
+        tg.addEventListener('click', () => { if (show) this._ovDone.delete(k); else this._ovDone.add(k); this.render(); });
+        if (show) for (const it of done) {
+          const r = h(list, 'div', { cls: 'rw-hn-row is-done is-' + it.kind });
+          h(r, 'span', { cls: 'rw-hn-date', text: (it.date || '').slice(5) });
+          const tx = h(r, 'span', { cls: 'rw-hn-text', title: it.text + (it.result ? ' → ' + it.result : '') });
+          h(tx, 'span', { text: it.text }); if (it.result) h(tx, 'b', { text: ' → ' + it.result });
+          r.addEventListener('click', () => this.hnEdit(p, key, it));
+          r.addEventListener('contextmenu', (e) => menu(e, it, [['改回未解决', 'undo-2', () => pl.hnSet(p, key, it, Object.assign({}, it, { done: false, date: '', result: '' }))]]));
+        }
+      }
+    }
+    // 行内添加：回车保存，接着写下一条；Esc 收起
+    const st = this._ovAdd;
+    if (st && st.p === p.name && st.key === key) {
+      const row = h(card, 'div', { cls: 'rw-hn-addrow' });
+      const PH = { question: '写一个研究问题，回车保存', milestone: '要拿到什么成果', claim: '写一句结论，回车保存（之后再挂证据）', issue: st.kind === 'decide' ? '有什么事要决定 / 等导师拍板' : '现在卡在哪' };
+      const inp = h(row, 'input', { cls: 'rw-hn-input', attr: { type: 'text', placeholder: PH[key] } });
+      inp.value = st.v || '';
+      inp.addEventListener('input', () => (st.v = inp.value));
+      let dIn = null;
+      if (key === 'milestone') { dIn = h(row, 'input', { cls: 'rw-hn-dinput', attr: { type: 'date', title: '哪天（可不填）' } }); dIn.value = st.date || ''; dIn.addEventListener('change', () => (st.date = dIn.value)); }
+      const save = async () => {
+        const v = inp.value.trim();
+        if (!v) return;
+        const it = key === 'question' ? { text: v } : key === 'milestone' ? { text: v, date: dIn.value } : key === 'claim' ? { text: v, links: [] } : { text: v, kind: st.kind || 'block' };
+        st.v = ''; st.date = '';
+        this._keepFocus = { key: 'hn:' + p.name + ':' + key, at: Date.now(), force: true };
+        await pl.hnAdd(p, key, it);
+      };
+      const onKey = (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); save(); } else if (e.key === 'Escape') { this._ovAdd = null; row.remove(); } };
+      inp.addEventListener('keydown', onKey); if (dIn) dIn.addEventListener('keydown', onKey);
+      const ok = h(row, 'button', { cls: 'rw-btn rw-btn-sm mod-cta', text: '记下' }); ok.addEventListener('click', save);
+      const x = h(row, 'button', { cls: 'rw-iconbtn', title: '收起' }); ic(x, 'x'); x.addEventListener('click', () => { this._ovAdd = null; row.remove(); });
+      this.keepFocus(inp, 'hn:' + p.name + ':' + key);
+      if (dIn) this.keepFocus(dIn, 'hnd:' + p.name + ':' + key);
+    }
+  }
+  ovProgressCard(col, p, L) {
+    const pl = this.plugin;
+    const card = h(col, 'div', { cls: 'rw-ov-card rw-hn is-prog' });
+    const hd = h(card, 'div', { cls: 'rw-ov-head' });
+    ic(hd, 'git-commit-horizontal'); h(hd, 'b', { text: '进展' });
+    const items = L.prog.slice().reverse();
+    if (items.length) h(hd, 'span', { cls: 'rw-tab-count', text: items.filter((x) => !x.auto).length });
+    const inp = h(card, 'input', { cls: 'rw-hn-input rw-ov-proginput', attr: { type: 'text', placeholder: '今天推进了什么？写一句，回车记下' } });
+    inp.value = (this._ovProg && this._ovProg[p.name]) || '';
+    inp.addEventListener('input', () => { this._ovProg = this._ovProg || {}; this._ovProg[p.name] = inp.value; });
+    inp.addEventListener('keydown', async (e) => {
+      if (e.key !== 'Enter' || e.isComposing) return;
+      e.preventDefault();
+      const v = inp.value.trim(); if (!v) return;
+      this._ovProg[p.name] = ''; this._keepFocus = { key: 'prog:' + p.name, at: Date.now(), force: true };
+      inp.disabled = true;
+      await pl.addProjectProgress(p, v);
+    });
+    this.keepFocus(inp, 'prog:' + p.name);
+    const list = h(card, 'div', { cls: 'rw-hn-list rw-ov-proglist' });
+    if (!items.length) h(list, 'div', { cls: 'rw-hn-hint', text: '每推进一点就写一句，生命线上会多一个点；周末回头看，这周做了什么一目了然。' });
+    const all = this._ovProgAll && this._ovProgAll.has(p.name);
+    let last = '';
+    for (const it of all ? items : items.slice(0, 7)) {
+      const r = h(list, 'div', { cls: 'rw-hn-row rw-ov-prog' + (it.auto ? ' is-auto' : '') });
+      h(r, 'span', { cls: 'rw-hn-date', text: it.date === last ? it.time || '' : it.date.slice(5), title: it.date + (it.time ? ' ' + it.time : '') });
+      last = it.date;
+      h(r, 'span', { cls: 'rw-hn-text', text: it.text, title: it.text });
+      r.addEventListener('click', () => pl.promptText('修改这条进展（' + it.date + '）', it.text, async (v) => { if (v != null) await pl.editProjectProgress(p, it, v); }));
+      r.addEventListener('contextmenu', (e) => { e.preventDefault(); const m = new Menu(); addDeleteItem(m, '删除这条…', async () => { if (await pl.confirmDelete({ title: '删除进展', lines: [it.date + ' ' + it.text], noTrashNote: true })) await pl.editProjectProgress(p, it, ''); }); m.showAtMouseEvent(e); });
+    }
+    if (items.length > 7) { const mb = h(list, 'button', { cls: 'rw-linkbtn rw-hn-donetoggle', text: all ? '收起 ▴' : '还有 ' + (items.length - 7) + ' 条 ▾' }); mb.addEventListener('click', () => { this._ovProgAll = this._ovProgAll || new Set(); if (all) this._ovProgAll.delete(p.name); else this._ovProgAll.add(p.name); this.render(); }); }
+  }
+  ovFoldersCard(col, p, linked) {
+    const pl = this.plugin;
+    const card = h(col, 'div', { cls: 'rw-ov-card rw-hn is-folders' });
+    const hd = h(card, 'div', { cls: 'rw-ov-head' });
+    ic(hd, 'folders'); h(hd, 'b', { text: '挂在这个项目上的文件夹' });
+    if (linked.length) h(hd, 'span', { cls: 'rw-tab-count', text: linked.length });
+    h(hd, 'span', { cls: 'rw-tp-sp' });
+    const b = h(hd, 'button', { cls: 'rw-linkbtn rw-hn-add', text: '＋ 关联' });
+    b.addEventListener('click', () => {
+      const all = this.index.folders || [];
+      new PickManyModal(this.app, { title: '把哪些文件夹挂到「' + p.title + '」', desc: '文件夹只放文件、不算项目。挂上后在这里一点就开，文件不会移动。', empty: '还没有文件夹', items: all.map((f) => ({ key: f.name, label: f.title, sub: (f.fileCount || 0) + ' 个文件', checked: (f.links || []).includes(p.name) })), extra: { text: '新建文件夹…', fn: () => pl.newFolderModal({ projects: [p.name] }) }, onDone: async (keys) => { for (const f of all) { const on = keys.includes(f.name), was = (f.links || []).includes(p.name); if (on !== was) await pl.toggleFolderLink(f, p.name, on); } } }).open();
+    });
+    const list = h(card, 'div', { cls: 'rw-hn-list' });
+    if (!linked.length) h(list, 'div', { cls: 'rw-hn-hint', text: '课程资料、讲解 PPT 这类只是放文件的地方，建成文件夹再挂过来，不用塞进项目里。' });
+    for (const f of linked) {
+      const r = h(list, 'div', { cls: 'rw-hn-row rw-ov-folder' });
+      ic(r, 'folder', 'rw-fcard-ic');
+      h(r, 'span', { cls: 'rw-hn-text', text: f.title, title: f.description || f.title });
+      h(r, 'span', { cls: 'rw-hn-date', text: (f.fileCount || 0) + ' 个文件' });
+      r.addEventListener('click', () => this.openProject(f.name));
+      r.addEventListener('contextmenu', (e) => this.folderEntityMenu(e, f));
     }
   }
 
@@ -5342,7 +6439,8 @@ class NewProjectModal extends Modal {
     h(contentEl, 'div', { cls: 'rw-field-label', text: '项目类型' });
     const kinds = h(contentEl, 'div', { cls: 'rw-kind-grid' });
     this.kindEls = {};
-    for (const k of KIND_ORDER) {
+    if (this.v.kind === 'collection') this.v.kind = 'paper';
+    for (const k of projectKinds()) {
       const d = KINDS[k];
       const c = h(kinds, 'div', { cls: 'rw-kind-card' });
       c.style.setProperty('--kc', d.color);
@@ -5353,6 +6451,12 @@ class NewProjectModal extends Modal {
       h(c, 'div', { cls: 'rw-kind-card-flow', text: d.stages.length ? d.stages.map((x) => x.id).join(' → ') : '无流程 · 只存文件' });
       c.addEventListener('click', () => this.setKind(k));
       this.kindEls[k] = c;
+    }
+    {
+      const fh = h(contentEl, 'div', { cls: 'rw-kind-manage rw-folder-hint' });
+      h(fh, 'span', { cls: 'rw-muted', text: '只是想找个地方放文件（课程资料、PPT、别人发来的材料）？那不算项目 → ' });
+      const fb = h(fh, 'button', { cls: 'rw-linkbtn', text: '新建文件夹' });
+      fb.addEventListener('click', () => { this.close(); this.plugin.newFolderModal({ name: this.v.name, description: this.v.description }); });
     }
     // 2) 基本信息
     new Setting(contentEl).setName('项目名称').addText((t) => { t.setPlaceholder('例如：DOA 对抗攻击论文 / 某团队 SIM 工作研读').setValue(this.v.name).onChange((x) => (this.v.name = x)); setTimeout(() => t.inputEl.focus(), 30); });
@@ -5453,6 +6557,143 @@ function noteFolderSetting(container, plugin, v, typeOf) {
   });
   fill();
   return { refresh: fill };
+}
+
+/* 选一个稿件文件（.tex / .md）：同项目的排前面 */
+class MsPickModal extends obsidian.FuzzySuggestModal {
+  constructor(app, plugin, project, onPick, o) {
+    super(app); this.onPick = onPick; o = o || {};
+    const idx = plugin.buildIndex();
+    const data = plugin.dataDir() + '/', root = normalizePath(plugin.settings.rootFolder || '科研') + '/';
+    const home = new Set(idx.projects.concat(idx.folders).map((p) => p.file.path));
+    const items = [];
+    for (const f of app.vault.getFiles()) {
+      const ext = (f.extension || '').toLowerCase();
+      if (!(ext === 'md' || (!o.mdOnly && (ext === 'tex' || ext === 'ltx')))) continue;
+      if (f.path.startsWith(data) || home.has(f.path) || !f.path.startsWith(root)) continue;
+      items.push({ file: f, mine: project && plugin.ownerOfPath(f.path, idx) === project, tex: ext !== 'md' });
+    }
+    this.items = items.sort((a, b) => (a.mine ? 0 : 1) - (b.mine ? 0 : 1) || (o.mdOnly ? 0 : (a.tex ? 0 : 1) - (b.tex ? 0 : 1)) || b.file.stat.mtime - a.file.stat.mtime);
+    this.setPlaceholder(o.placeholder || '搜稿件文件名：Overleaf 导出的 main.tex，或库里的 Markdown 稿…');
+  }
+  getItems() { return this.items; }
+  getItemText(it) { return it.file.name + '   ' + (it.file.parent ? it.file.parent.path : ''); }
+  onChooseItem(it) { this.onPick(it.file); }
+}
+
+/* 几个输入框的小弹窗 */
+class FieldsModal extends Modal {
+  constructor(app, o) { super(app); this.o = o; this.v = {}; for (const f of o.fields) this.v[f.key] = f.value == null ? '' : f.value; }
+  onOpen() {
+    this.titleEl.setText(this.o.title);
+    const c = this.contentEl; c.classList.add('rw-modal', 'rw-fields-modal');
+    if (this.o.desc) h(c, 'div', { cls: 'rw-muted rw-pm-desc', text: this.o.desc });
+    let first = null;
+    for (const f of this.o.fields) {
+      h(c, 'div', { cls: 'rw-field-label', text: f.label });
+      const el = h(c, f.type === 'textarea' ? 'textarea' : 'input', { cls: 'rw-fm-input', attr: f.type === 'textarea' ? { rows: String(f.rows || 3) } : { type: f.type || 'text' } });
+      if (f.placeholder) el.setAttribute('placeholder', f.placeholder);
+      el.value = this.v[f.key];
+      el.addEventListener('input', () => (this.v[f.key] = el.value));
+      el.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing && (f.type !== 'textarea' || e.ctrlKey || e.metaKey)) { e.preventDefault(); this.submit(); } });
+      if (!first) first = el;
+    }
+    const row = h(c, 'div', { cls: 'rw-modal-btns' });
+    if (this.o.danger) { const d = h(row, 'button', { cls: 'rw-btn-danger', text: this.o.danger.text }); d.addEventListener('click', async () => { this.close(); await this.o.danger.fn(); }); h(row, 'span', { cls: 'rw-tp-sp' }); }
+    const no = h(row, 'button', { text: '取消' }); no.addEventListener('click', () => this.close());
+    const ok = h(row, 'button', { cls: 'mod-cta', text: this.o.submitText || '保存' }); ok.addEventListener('click', () => this.submit());
+    setTimeout(() => { if (first) { first.focus(); if (first.select && first.type !== 'date') first.select(); } }, 30);
+  }
+  async submit() { const req = this.o.fields.find((f) => f.required && !String(this.v[f.key]).trim()); if (req) { new Notice('先填「' + req.label + '」'); return; } this.close(); await this.o.onDone(this.v); }
+  onClose() { clear(this.contentEl); }
+}
+/* 给结论挑证据：项目里的实验 / 数据笔记、图、文献排前面 */
+class EvidencePickModal extends obsidian.FuzzySuggestModal {
+  constructor(app, plugin, p, onPick) {
+    super(app); this.plugin = plugin; this.p = p; this.onPick = onPick;
+    const idx = plugin.buildIndex();
+    const rank = { exp: 0, fig: 1, lit: 2, note: 3, file: 4 };
+    const items = [];
+    for (const n of idx.notes) items.push({ file: n.file, title: n.title, kind: n.type === 'literature' ? 'lit' : n.type === 'experiment' || n.type === 'data' ? 'exp' : 'note', mine: n.projectName === p.name, sub: NOTE_TYPES[n.type].label });
+    for (const x of idx.files) { if (x.kind !== 'file') continue; const img = IMG_EXTS.includes(x.ext); items.push({ file: x.file, title: x.name, kind: img ? 'fig' : x.cat === 'literature' ? 'lit' : x.cat === 'data' ? 'exp' : 'file', mine: x.projectName === p.name, sub: img ? '图' : (FILE_CATS[x.cat] || FILE_CATS.other).label }); }
+    this.items = items.sort((a, b) => (a.mine ? 0 : 1) - (b.mine ? 0 : 1) || rank[a.kind] - rank[b.kind] || b.file.stat.mtime - a.file.stat.mtime);
+    this.setPlaceholder('搜一个实验 / 数据笔记、图、文献，作为这条结论的证据…');
+  }
+  getItems() { return this.items; }
+  getItemText(it) { return '[' + it.sub + '] ' + it.title + (it.mine ? '' : '  · ' + (it.file.parent ? it.file.parent.path : '')); }
+  onChooseItem(it) { this.onPick(it.file); }
+}
+
+/* 简单的确认框（不是删除） */
+class ConfirmModal extends Modal {
+  constructor(app, o, res) { super(app); this.o = o; this.res = res; this.done = false; }
+  onOpen() {
+    this.titleEl.setText(this.o.title || '确认');
+    this.contentEl.classList.add('rw-modal');
+    for (const l of this.o.lines || []) h(this.contentEl, 'p', { text: l });
+    const row = h(this.contentEl, 'div', { cls: 'rw-modal-btns' });
+    const no = h(row, 'button', { text: '取消' }); no.addEventListener('click', () => this.close());
+    const yes = h(row, 'button', { cls: 'mod-cta', text: this.o.confirmText || '确定' });
+    yes.addEventListener('click', () => { this.done = true; this.close(); });
+  }
+  onClose() { clear(this.contentEl); this.res(this.done); }
+}
+/* 多选：勾选若干项 */
+class PickManyModal extends Modal {
+  constructor(app, o) { super(app); this.o = o; this.sel = new Set(o.items.filter((x) => x.checked).map((x) => x.key)); }
+  onOpen() {
+    this.titleEl.setText(this.o.title);
+    const c = this.contentEl; c.classList.add('rw-modal');
+    if (this.o.desc) h(c, 'div', { cls: 'rw-muted rw-pm-desc', text: this.o.desc });
+    const list = h(c, 'div', { cls: 'rw-pm-list' });
+    if (!this.o.items.length) h(list, 'div', { cls: 'rw-empty-sm', text: this.o.empty || '没有可选的' });
+    for (const it of this.o.items) {
+      const r = h(list, 'label', { cls: 'rw-pm-item' });
+      const cb = h(r, 'input', { attr: { type: 'checkbox' } }); cb.checked = this.sel.has(it.key);
+      cb.addEventListener('change', () => { if (cb.checked) this.sel.add(it.key); else this.sel.delete(it.key); });
+      h(r, 'span', { cls: 'rw-pm-name', text: it.label });
+      if (it.sub) h(r, 'span', { cls: 'rw-muted', text: it.sub });
+    }
+    const row = h(c, 'div', { cls: 'rw-modal-btns' });
+    if (this.o.extra) { const x = h(row, 'button', { text: this.o.extra.text }); x.addEventListener('click', () => { this.close(); this.o.extra.fn(); }); h(row, 'span', { cls: 'rw-tp-sp' }); }
+    const no = h(row, 'button', { text: '取消' }); no.addEventListener('click', () => this.close());
+    const ok = h(row, 'button', { cls: 'mod-cta', text: '确定' });
+    ok.addEventListener('click', async () => { this.close(); await this.o.onDone([...this.sel]); });
+  }
+  onClose() { clear(this.contentEl); }
+}
+class NewFolderModal extends Modal {
+  constructor(app, plugin, preset) { super(app); this.plugin = plugin; this.v = Object.assign({ name: '', description: '', projects: [] }, preset || {}); }
+  onOpen() {
+    const c = this.contentEl; c.classList.add('rw-modal');
+    this.titleEl.setText('新建文件夹');
+    h(c, 'div', { cls: 'rw-muted', text: '文件夹只用来放文件（课程资料、PPT、别人发来的材料…），不算项目，不会出现在项目看板和时间轴里。可以挂到相关的项目上，在项目里一眼看到。' });
+    new Setting(c).setName('文件夹名称').addText((t) => { t.setPlaceholder('例如：各种文件 / 课程资料 / 讲座 PPT').setValue(this.v.name).onChange((x) => (this.v.name = x)); setTimeout(() => t.inputEl.focus(), 30); t.inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) this.submit(); }); });
+    new Setting(c).setName('备注').setDesc('可选：放什么、从哪来').addText((t) => t.setValue(this.v.description).onChange((x) => (this.v.description = x)));
+    const projects = this.plugin.buildIndex().projects.filter((p) => p.status !== '已完成');
+    if (projects.length) {
+      h(c, 'div', { cls: 'rw-field-label', text: '挂到哪些项目上（可不选，可多选）' });
+      const box = h(c, 'div', { cls: 'rw-chips rw-nf-projects' });
+      const sel = new Set(this.v.projects);
+      for (const p of projects) {
+        const chip = h(box, 'button', { cls: 'rw-catchip' + (sel.has(p.name) ? ' is-active' : ''), text: p.title });
+        chip.addEventListener('click', () => { if (sel.has(p.name)) sel.delete(p.name); else sel.add(p.name); chip.classList.toggle('is-active'); this.v.projects = [...sel]; });
+      }
+    }
+    const row = h(c, 'div', { cls: 'rw-modal-btns' });
+    const no = h(row, 'button', { text: '取消' }); no.addEventListener('click', () => this.close());
+    const ok = h(row, 'button', { cls: 'mod-cta', text: '新建文件夹' }); ok.addEventListener('click', () => this.submit());
+  }
+  async submit() {
+    if (!String(this.v.name || '').trim()) { new Notice('先给文件夹起个名字'); return; }
+    const file = await this.plugin.createFolderEntity(this.v);
+    if (!file) return;
+    this.close();
+    this.plugin.refreshViews();
+    const v = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
+    if (v && v.view && v.view.openProject) setTimeout(() => v.view.openProject(file.basename), 200);
+  }
+  onClose() { clear(this.contentEl); }
 }
 
 class NewNoteModal extends Modal {
@@ -6965,8 +8206,8 @@ class ImportFilesModal extends Modal {
       sel.addEventListener('change', () => { it.cat = sel.value; iw.className = 'rw-ficon cat-' + it.cat.replace('note:', ''); this.updateDest(); });
       if (it.ext !== 'md') { sel.classList.add('rw-cat-sel'); it.sel = sel; }
     }
-    const projects = this.plugin.buildIndex().projects.filter((p) => p.status !== '已完成' || p.name === this.project);
-    new Setting(c).setName('放进哪个项目').addDropdown((d) => {
+    const projects = this.plugin.ownersForPick(this.project);
+    new Setting(c).setName('放进哪个项目 / 文件夹').addDropdown((d) => {
       d.addOption('', '（不归属项目）');
       projects.forEach((p) => d.addOption(p.name, p.title));
       d.setValue(this.project).onChange((v) => { this.project = v; if (!v) this.dest = 'auto'; else if (this.dest !== 'auto' && this.dest !== '') this.dest = 'auto'; this.drawDestPick(); this.updateDest(); });
@@ -7117,7 +8358,7 @@ class FolderPickModal extends Modal {
     clear(c);
     const pl = this.plugin;
     // 目标项目：可以换成别的项目（跨项目移动）
-    const projects = pl.buildIndex().projects.filter((p) => p.status !== '已完成' || p.name === this.project || p.name === this.o.from).map((p) => ({ name: p.name, title: p.title }));
+    const projects = pl.ownersForPick(this.project, this.o.from);
     projects.push({ name: '__kb', title: '📚 知识库' }, { name: '__life', title: '🌿 生活' });
     if (!this.project && projects.length) this.project = this.o.from || projects[0].name;
     const top = h(c, 'div', { cls: 'rw-fp-top' });
@@ -17412,7 +18653,7 @@ class ExcerptModal extends Modal {
     ta.value = this.text || "";
 
     contentEl.createDiv({ cls: "dh-ex-label", text: "出处（谁说的 / 哪本书 / 链接，可不填）" });
-    const src = contentEl.createEl("input", { cls: "dh-ex-field", attr: { type: "text", placeholder: "例如：吴老师 组会 / 《原则》瑞·达利欧 / https://…" } });
+    const src = contentEl.createEl("input", { cls: "dh-ex-field", attr: { type: "text", placeholder: "例如：导师 组会 / 《原则》瑞·达利欧 / https://…" } });
     src.value = this.entry?.source || "";
     const known = [...new Set((await this.view.readExcerpts()).map((e) => e.source).filter(Boolean))].slice(0, 30);
     if (known.length) {
@@ -19270,6 +20511,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     this.registerEvent(this.app.vault.on('modify', (f) => this.onDataFileChanged(f)));
     this.registerEvent(this.app.vault.on('create', (f) => { if (this.app.workspace.layoutReady) this.onDataFileChanged(f); }));
     this.registerEvent(this.app.vault.on('rename', (f, old) => { this.onProjectRenamed(f, old); }));
+    this.registerEvent(this.app.vault.on('rename', (f, old) => { this.msRename(old, f.path); }));
     this.registerEvent(this.app.vault.on('rename', async (f, old) => {
       try { await this.mfStore.rename(old, f.path); } catch (e) { /* ignore */ }
       if (this._pg && this._pg[old]) { this._pg[f.path] = this._pg[old]; delete this._pg[old]; this.pgSaveSoon(); }
@@ -19331,6 +20573,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     const root = normalizePath(this.settings.rootFolder || '科研');
     const projRoot = root + '/项目/';
     const projects = [];
+    const folders = [];
     const notes = [];
     const files = [];
     const byName = new Map();
@@ -19375,7 +20618,13 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
         const raw = str(fm.stage).trim();
         const alias = normStage(raw);
         p.stage = stages.some((x) => x.id === raw) ? raw : alias && stages.some((x) => x.id === alias) ? alias : stages[0] ? stages[0].id : '';
-        projects.push(p);
+        if (isFolderFm(fm)) {
+          // 文件夹：只放文件，不出现在项目列表 / 看板 / 时间轴里；projects 属性 = 挂在哪些项目上
+          p.isFolder = true; p.stage = ''; p.parentName = ''; p.customStages = [];
+          if (!KINDS[p.pkind]) p.pkind = 'paper';
+          p.links = linkNames(fm.projects);
+          folders.push(p);
+        } else projects.push(p);
         byName.set(p.name, p);
       } else if (type === 'resource') {
         const extPath = str(fm.path);
@@ -19422,7 +20671,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     }
     // 项目文件夹名和主页名不一样时（在 Obsidian 里只改了其中一个）：文件夹里的东西仍算这个项目
     const folderToProj = new Map();
-    for (const p of projects) {
+    for (const p of projects.concat(folders)) {
       if (!p.file.path.startsWith(projRoot)) continue;
       const rest = p.file.path.slice(projRoot.length);
       if (rest.split('/').length !== 2) continue;
@@ -19454,13 +20703,15 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       if (p.parentName && !byName.has(p.parentName)) p.parentName = '';
     }
     projects.sort((a, b) => KIND_ORDER.indexOf(a.pkind) - KIND_ORDER.indexOf(b.pkind) || stageIdxOf(a) - stageIdxOf(b) || b.lastActivity - a.lastActivity);
-    this._lastIdx = { projects, notes, files, byName };
+    for (const f of folders) f.links = f.links.filter((n) => byName.has(n) && !byName.get(n).isFolder);
+    folders.sort((a, b) => b.lastActivity - a.lastActivity);
+    this._lastIdx = { projects, notes, files, byName, folders };
     return this._lastIdx;
   }
 
   countOpenTasks(index) {
     let c = 0;
-    for (const p of index.projects) {
+    for (const p of index.projects.concat(index.folders || [])) {
       const cache = this.app.metadataCache.getFileCache(p.file);
       if (cache && cache.listItems) c += cache.listItems.filter((li) => TASK_OPEN(li.task)).length;
     }
@@ -19471,7 +20722,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
   planFilePath() { return normalizePath(this.settings.rootFolder + '/计划.md'); }
   async collectTasks(index, withDone) {
     const out = [];
-    const items = index.projects.map((p) => ({ file: p.file, projectName: p.name })).concat(index.notes.map((n) => ({ file: n.file, projectName: n.projectName })));
+    const items = index.projects.concat(index.folders || []).map((p) => ({ file: p.file, projectName: p.name })).concat(index.notes.map((n) => ({ file: n.file, projectName: n.projectName })));
     const pf = this.app.vault.getAbstractFileByPath(this.planFilePath());
     if (pf instanceof TFile && !items.some((x) => x.file === pf)) items.push({ file: pf, projectName: '' });
     for (const it of items) {
@@ -22649,6 +23900,10 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       const old = this.mfStore.cache.get(obj.key);
       if (old) { for (const k of Object.keys(old)) delete old[k]; Object.assign(old, obj); } else this.mfStore.cache.set(obj.key, obj);
       this.mfEmit({ type: 'reload', key: obj.key });
+    } else if (obj.msKey) {
+      this._ms = this._ms || new Map();
+      this._ms.set(obj.msKey, obj);
+      this.refreshViews();
     } else if (obj.waKey) {
       this._wa = this._wa || new Map();
       obj._loaded = true;
@@ -22725,6 +23980,294 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     if (pdf.kind === 'path') return openFsPath(pdf.path);
   }
   pickPdfFor(n) { new PdfPickModal(this.app, this, n).open(); }
+
+  /* ---------- 稿件驾驶舱：章节计划、提纲、证据、修改意见（存在 工作台数据/稿件计划/，跟着库同步） ---------- */
+  async msLoadAll() {
+    this._ms = this._ms || new Map();
+    if (this._msLoaded) return this._ms;
+    const dir = this.app.vault.getAbstractFileByPath(normalizePath(this.dataDir() + '/稿件计划'));
+    if (dir && dir.children) for (const f of dir.children) { if (!(f instanceof TFile)) continue; const o = await this.dataRead(f); if (o && o.msKey && !this._ms.has(o.msKey)) this._ms.set(o.msKey, o); }
+    this._msLoaded = true;
+    return this._ms;
+  }
+  ownerOfPath(path, idx) {
+    idx = idx || this._lastIdx || this.buildIndex();
+    const n = idx.notes.find((x) => x.file.path === path);
+    if (n) return n.projectName || '';
+    const x = idx.files.find((y) => y.file && y.file.path === path);
+    if (x) return x.projectName || '';
+    const nm = projectOfPathIn(path, this.settings.rootFolder);
+    return idx.byName.has(nm) ? nm : '';
+  }
+  msEnsure(path) {
+    this._ms = this._ms || new Map();
+    let p = this._ms.get(path);
+    if (!p) { p = { msKey: path, project: this.ownerOfPath(path), journal: '', deadline: '', sections: {}, comments: [] }; this._ms.set(path, p); }
+    if (!p.sections || typeof p.sections !== 'object') p.sections = {};
+    if (!Array.isArray(p.comments)) p.comments = [];
+    return p;
+  }
+  msSec(plan, key) {
+    const s = plan.sections[key] || (plan.sections[key] = {});
+    for (const k of ['goals', 'outline', 'issues', 'need', 'claims']) if (!Array.isArray(s[k])) s[k] = [];
+    return s;
+  }
+  msSaveSoon(path) {
+    this._msT = this._msT || {};
+    clearTimeout(this._msT[path]);
+    this._msT[path] = setTimeout(() => {
+      const p = this._ms && this._ms.get(path);
+      if (!p) return;
+      p.updated = Date.now();
+      const base = path.split('/').pop().replace(/\.(md|tex|ltx)$/i, '');
+      this.dataWrite('稿件计划', base, path, p, '稿件驾驶舱：「' + base + '」的章节计划、提纲、证据和修改意见');
+    }, 500);
+  }
+  /* 驾驶舱里的稿件：登记过的（.tex / .md）+ 所有写作笔记 */
+  async msList() {
+    await this.msLoadAll();
+    const idx = this._lastIdx || this.buildIndex();
+    const out = new Map();
+    for (const [path, plan] of this._ms) {
+      const f = this.app.vault.getAbstractFileByPath(path);
+      if (!(f instanceof TFile)) continue;
+      const n = idx.notes.find((x) => x.file.path === path);
+      out.set(path, { path, file: f, plan, note: n || null, project: this.ownerOfPath(path, idx) || plan.project || '', title: n ? n.title : f.basename });
+    }
+    for (const n of idx.notes) if (n.type === 'draft' && !out.has(n.file.path)) out.set(n.file.path, { path: n.file.path, file: n.file, plan: null, note: n, project: n.projectName || '', title: n.title });
+    return [...out.values()].sort((a, b) => (b.plan ? 1 : 0) - (a.plan ? 1 : 0) || b.file.stat.mtime - a.file.stat.mtime);
+  }
+  async msRegister(file) { await this.msLoadAll(); const p = this.msEnsure(file.path); this.msSaveSoon(file.path); return p; }
+  async msRemove(path) {
+    const f = this.dataFind('稿件计划', path);
+    if (f) { this._dataSelf = this._dataSelf || new Map(); this._dataSelf.set(f.path, Date.now()); await this.trash(f); }
+    if (this._ms) this._ms.delete(path);
+    this.refreshViews();
+  }
+  async msRename(old, np) {
+    if (!/\.(md|tex|ltx)$/i.test(String(old))) return;
+    await this.msLoadAll();
+    if (!this._ms.has(old) || old === np) return;
+    const p = this._ms.get(old);
+    this._ms.delete(old);
+    const f = this.dataFind('稿件计划', old);
+    if (f) { try { this._dataSelf = this._dataSelf || new Map(); this._dataSelf.set(f.path, Date.now()); await this.app.vault.delete(f); } catch (e) { /* ignore */ } }
+    p.msKey = np; this._ms.set(np, p);
+    this.msSaveSoon(np);
+  }
+  /* 解析稿件，并把图、引用对到库里的文件 / 实验笔记 / 文献笔记上 */
+  async msParse(file) {
+    this._msCache = this._msCache || new Map();
+    const hit = this._msCache.get(file.path);
+    const idx = this._lastIdx || this.buildIndex();
+    const stamp = file.stat.mtime + ':' + this.app.vault.getFiles().length + ':' + idx.notes.length;
+    if (hit && hit.stamp === stamp) return hit.M;
+    const src = await this.app.vault.cachedRead(file);
+    const isTex = /^(tex|ltx)$/i.test(file.extension || '');
+    const M = isTex ? msParseTex(src) : msParseMd(src);
+    const noteOf = new Map(idx.notes.map((n) => [n.file.path, n]));
+    M.file = file;
+    M.title = M.title || (noteOf.has(file.path) ? noteOf.get(file.path).title : file.basename);
+    const owner = this.ownerOfPath(file.path, idx);
+    const byBase = new Map();
+    for (const f of this.app.vault.getFiles()) {
+      const ext = (f.extension || '').toLowerCase();
+      if (!MS_FIG_EXT.includes(ext)) continue;
+      const b = f.basename.toLowerCase();
+      if (!byBase.has(b)) byBase.set(b, []);
+      byBase.get(b).push(f);
+    }
+    // 哪些笔记嵌了 / 链了同名的图（实验、数据笔记排前面）——这就是「图 ← 实验」这条证据链
+    const users = new Map();
+    const rl = this.app.metadataCache.resolvedLinks || {};
+    for (const sp in rl) {
+      if (sp === file.path) continue;
+      for (const dp in rl[sp]) {
+        if (!MS_FIG_EXT.includes(dp.split('.').pop().toLowerCase())) continue;
+        const b = dp.split('/').pop().replace(/\.[^.]+$/, '').toLowerCase();
+        if (!users.has(b)) users.set(b, new Set());
+        users.get(b).add(sp);
+      }
+    }
+    const rank = (x) => (x.note ? (x.note.type === 'experiment' || x.note.type === 'data' ? 0 : 1) : 2);
+    const figInfo = (raw) => {
+      const name = String(raw).split('/').pop();
+      const b = name.replace(/\.[^.]+$/, '').toLowerCase();
+      const cands = byBase.get(b) || [];
+      const mine = cands.filter((f) => this.ownerOfPath(f.path, idx) === owner);
+      const pick = (mine.length ? mine : cands).slice().sort((x, y) => (IMG_EXTS.includes((x.extension || '').toLowerCase()) ? 0 : 1) - (IMG_EXTS.includes((y.extension || '').toLowerCase()) ? 0 : 1) || y.stat.mtime - x.stat.mtime)[0] || null;
+      const sources = [...(users.get(b) || [])].map((p) => ({ path: p, note: noteOf.get(p) || null, file: this.app.vault.getAbstractFileByPath(p) })).filter((x) => x.file instanceof TFile).sort((x, y) => rank(x) - rank(y));
+      return { raw, name, file: pick, sources };
+    };
+    let bib = new Map();
+    if (isTex && file.parent) {
+      const names = M.bibs.map((b) => b.split('/').pop() + '.bib');
+      const kids = (file.parent.children || []).filter((f) => f instanceof TFile && (f.extension || '').toLowerCase() === 'bib');
+      const use = kids.filter((f) => names.includes(f.name));
+      for (const bf of use.length ? use : kids) { try { for (const [k, v] of msParseBib(await this.app.vault.cachedRead(bf))) if (!bib.has(k)) bib.set(k, v); } catch (e) { /* ignore */ } }
+    }
+    const litByKey = new Map();
+    for (const n of idx.notes) if (n.type === 'literature') { const k = str(n.fm.citekey).trim(); if (k) litByKey.set(k, n); }
+    const citeInfo = (key) => { const b = bib.get(key), n = litByKey.get(key) || null; return { key, title: b && b.title ? b.title : n ? n.title : '', meta: b ? [b.author, b.year].filter(Boolean).join(' ') : '', note: n, known: !!(b || n) }; };
+    for (const s of M.sections) {
+      s.figInfo = s.figs.map(figInfo);
+      s.citeInfo = [];
+      s.expNotes = [];
+      if (!isTex) {
+        for (const l of s.links || []) {
+          const f = this.app.metadataCache.getFirstLinkpathDest(l, file.path);
+          const n = f && noteOf.get(f.path);
+          if (n && n.type === 'literature') { if (!s.citeInfo.some((c) => c.note === n)) s.citeInfo.push({ key: str(n.fm.citekey) || n.file.basename, title: n.title, meta: [str(n.fm.authors || n.fm.author).split(/[,;，；]/)[0], str(n.fm.year)].filter(Boolean).join(' '), note: n, known: true }); }
+          else if (n && (n.type === 'experiment' || n.type === 'data') && !s.expNotes.includes(n)) s.expNotes.push(n);
+        }
+      }
+      for (const k of s.cites) s.citeInfo.push(citeInfo(k));
+      for (const fi of s.figInfo) for (const x of fi.sources) if (x.note && (x.note.type === 'experiment' || x.note.type === 'data') && !s.expNotes.includes(x.note)) s.expNotes.push(x.note);
+    }
+    M.bibCount = bib.size;
+    M.words = M.sections.filter((s) => !s.parent).reduce((a, s) => a + s.total, 0);
+    this._msCache.set(file.path, { stamp, M });
+    return M;
+  }
+  msStatusOf(plan, s) { const st = plan && plan.sections && plan.sections[s.key] && plan.sections[s.key].status; return st && MS_STATUS.includes(st) ? st : s.total < 20 ? '待开始' : '未标记'; }
+
+  /* ---------- 项目总览：主页小节读写、证据分类、生命线数据 ---------- */
+  async hnRead(p) { try { return hnParse(await this.app.vault.cachedRead(p.file)); } catch (e) { return hnParse(''); } }
+  async hnAdd(p, key, it) { const line = hnLine(key, it); await this.app.vault.process(p.file, (d) => hnInsert(d, key, line)); this.refreshViews(); }
+  async hnSet(p, key, old, it) { const line = it ? hnLine(key, it) : null; await this.app.vault.process(p.file, (d) => hnReplace(d, key, old, line)); this.refreshViews(); }
+  /* 一条证据链接是什么：实验 / 图表 / 文献 / 其他 */
+  evidenceOf(link, p, idx) {
+    const f = this.app.metadataCache.getFirstLinkpathDest(String(link).split('#')[0], p.file.path);
+    if (!f) return { kind: 'missing', label: String(link).split('/').pop(), file: null };
+    const ext = (f.extension || '').toLowerCase();
+    if (ext === 'md') {
+      const n = idx.notes.find((x) => x.file.path === f.path);
+      const kind = n ? (n.type === 'literature' ? 'lit' : n.type === 'experiment' || n.type === 'data' ? 'exp' : 'note') : 'note';
+      return { kind, label: n ? n.title : f.basename, file: f, note: n };
+    }
+    if (IMG_EXTS.includes(ext)) return { kind: 'fig', label: f.name, file: f };
+    const c = catOfExt(ext);
+    return { kind: c === 'literature' ? 'lit' : c === 'data' ? 'exp' : 'file', label: f.name, file: f };
+  }
+  claimState(c, p, idx) {
+    const ev = (c.links || []).map((l) => Object.assign({ link: l }, this.evidenceOf(l, p, idx)));
+    const has = (k) => ev.some((e) => e.kind === k);
+    const lack = [];
+    if (!has('exp')) lack.push('实验/数据'); if (!has('fig')) lack.push('图表'); if (!has('lit')) lack.push('文献');
+    const st = c.written ? 'written' : has('exp') && has('fig') ? 'ok' : ev.length ? 'part' : 'obs';
+    return { ev, lack, st };
+  }
+  /* 生命线：从创建到现在（再到截止日）——阶段变化、进展、会议、里程碑、每周改动量 */
+  async projectLife(p, idx) {
+    const DAY = 86400000;
+    const prog = (await this.readProjectProgress(p)).slice().sort((a, b) => (a.date + (a.time || '')).localeCompare(b.date + (b.time || '')) || a.idx - b.idx);
+    const hn = await this.hnRead(p);
+    const notes = idx.notes.filter((n) => n.projectName === p.name);
+    const todayT = dayStart(today());
+    const starts = [dayStart(str(p.fm.created).slice(0, 10)), prog.length ? dayStart(prog[0].date) : NaN];
+    for (const n of notes) if (n.date) starts.push(dayStart(n.date));
+    let start = Math.min(...starts.filter((t) => !isNaN(t) && t > todayT - 730 * DAY && t <= todayT));
+    if (!isFinite(start)) start = dayStart(new Date(p.file.stat.ctime));
+    if (isNaN(start) || start > todayT) start = todayT;
+    const dl = dayStart(p.deadline);
+    let end = todayT + 21 * DAY;
+    if (!isNaN(dl)) end = Math.max(end, dl + 7 * DAY);
+    for (const m of hn.milestone) { const t = dayStart(m.date); if (!isNaN(t) && t < todayT + 730 * DAY) end = Math.max(end, t + 7 * DAY); }
+    if (end - start < 28 * DAY) end = start + 28 * DAY;
+    // 阶段带：靠进展日志里的「进入「X」阶段」
+    const flow = stagesOf(p);
+    const segs = [];
+    let cur = { t: start, stage: flow[0] ? flow[0].id : '' }, logged = false;
+    for (const e of prog) {
+      const m = e.text.match(/^进入「(.+)」阶段$/);
+      if (!m) continue;
+      logged = true;
+      const t = Math.min(todayT, Math.max(start, dayStart(e.date)));
+      if (t > cur.t) segs.push({ from: cur.t, to: t, stage: cur.stage });
+      cur = { t: Math.max(cur.t, t), stage: m[1] };
+    }
+    segs.push({ from: cur.t, to: todayT, stage: p.stage || (logged ? cur.stage : ''), current: true });
+    for (const s of segs) {
+      const def = flow.find((x) => x.id === s.stage) || flow.find((x) => x.id === normStage(s.stage)) || STAGES.find((x) => x.id === normStage(s.stage));
+      s.color = def ? def.color : '#94a3b8';
+    }
+    const ev = [];
+    for (const e of prog) if (!e.auto) ev.push({ t: dayStart(e.date), kind: 'prog', title: e.text, date: e.date, item: e });
+    for (const n of notes) {
+      if (!n.date || isNaN(dayStart(n.date))) continue;
+      if (n.type === 'meeting') ev.push({ t: dayStart(n.date), kind: 'meet', title: n.title, date: n.date, note: n });
+      else if (n.type === 'submission') ev.push({ t: dayStart(n.date), kind: 'sub', title: n.title, date: n.date, note: n });
+    }
+    for (const m of hn.milestone) if (m.date && !isNaN(dayStart(m.date))) ev.push({ t: dayStart(m.date), kind: 'ms', title: m.text, date: m.date, done: m.done, late: !m.done && dayStart(m.date) < todayT, item: m });
+    // 每周改动量（新建 / 修改过的笔记和文件）
+    const weeks = new Map();
+    let weekNow = 0;
+    const w0 = weekStartOf(todayT);
+    for (const [day, items] of this.activityByDay(idx)) {
+      const n = items.filter((x) => x.project === p.name).length;
+      if (!n) continue;
+      const t = dayStart(day);
+      if (isNaN(t) || t < start || t > todayT) continue;
+      const w = weekStartOf(t);
+      weeks.set(w, (weeks.get(w) || 0) + n);
+      if (w === w0) weekNow += n;
+    }
+    const lastStage = segs[segs.length - 1];
+    return { start, end, today: todayT, deadline: dl, segs, ev, weeks, weekNow, prog, hn, notes, days: Math.round((todayT - start) / DAY), stageDays: Math.round((todayT - lastStage.from) / DAY), logged };
+  }
+
+  /* ---------- 文件夹（只放文件，不算项目；可以挂到项目上） ---------- */
+  ownersForPick(cur, from) {
+    const idx = this.buildIndex();
+    const out = idx.projects.filter((p) => p.status !== '已完成' || p.name === cur || p.name === from).map((p) => ({ name: p.name, title: p.title }));
+    for (const f of idx.folders) out.push({ name: f.name, title: '📁 ' + f.title });
+    return out;
+  }
+  newFolderModal(preset) { new NewFolderModal(this.app, this, preset).open(); }
+  async createFolderEntity(o) {
+    const name = sanitize(o.name || '');
+    if (!name) { new Notice('先给文件夹起个名字'); return null; }
+    if (this.buildIndex().byName.has(name)) { new Notice('已经有同名的项目或文件夹：' + name); return null; }
+    const folder = normalizePath(this.settings.rootFolder + '/项目/' + name);
+    const path = normalizePath(folder + '/' + name + '.md');
+    if (this.app.vault.getAbstractFileByPath(path)) { new Notice('已经存在：' + name); return null; }
+    await this.ensureFolder(folder);
+    const links = (o.projects || []).filter(Boolean);
+    const body = ['---', 'type: folder', 'description: ' + q(o.description || ''), links.length ? 'projects:\n' + links.map((n) => '  - ' + q('[[' + n + ']]')).join('\n') : 'projects: []', 'created: ' + today(), 'tags: [文件夹]', '---', '# ' + name, '',
+      '> [!abstract] 文件夹', '> ' + (o.description || '只用来放文件，不算项目。'), '', '这个文件夹只放文件，不出现在项目看板和时间轴里。可以在科研工作台「文件」页把它挂到相关的项目上。', ''].join('\n');
+    const file = await this.app.vault.create(path, body);
+    new Notice('📁 已新建文件夹：' + name);
+    return file;
+  }
+  async setFolderLinks(f, names) {
+    const list = [...new Set((names || []).filter(Boolean))];
+    await this.app.fileManager.processFrontMatter(f.file, (fm) => { fm.projects = list.map((n) => '[[' + n + ']]'); });
+    this.refreshViews();
+  }
+  async toggleFolderLink(f, projectName, on) {
+    const cur = new Set(f.links || []);
+    if (on) cur.add(projectName); else cur.delete(projectName);
+    await this.setFolderLinks(f, [...cur]);
+  }
+  async convertToFolder(p) {
+    const ok = await new Promise((res) => new ConfirmModal(this.app, { title: '转为文件夹', lines: ['把「' + p.title + '」从项目改成文件夹？', '它不再出现在项目看板、时间树和时间轴里，改到「文件」页的文件夹区；里面的文件一个都不动，随时可以转回项目。'], confirmText: '转为文件夹' }, res).open());
+    if (!ok) return;
+    await this.app.fileManager.processFrontMatter(p.file, (fm) => { fm.type = 'folder'; if (!Array.isArray(fm.projects)) fm.projects = []; });
+    new Notice('📁「' + p.title + '」已转为文件夹，在「文件」页可以找到');
+    this.refreshViews();
+  }
+  async convertToProject(p) {
+    await this.app.fileManager.processFrontMatter(p.file, (fm) => {
+      fm.type = 'project';
+      const k = KIND_ALIASES[String(fm.kind == null ? '' : fm.kind).trim()];
+      if (!k || k === 'collection' || !KINDS[k]) { fm.kind = KINDS.paper.label; fm.stage = stagesOfKind('paper')[0] ? stagesOfKind('paper')[0].id : ''; }
+      if (!fm.status) fm.status = '进行中';
+    });
+    new Notice('「' + p.title + '」已转为项目');
+    this.refreshViews();
+  }
+  /* 挂在某个项目上的文件夹 */
+  foldersOf(projectName, idx) { return ((idx || this._lastIdx || this.buildIndex()).folders || []).filter((f) => (f.links || []).includes(projectName)); }
 
   /* ---------- 项目文件夹 ---------- */
   projectDir(name) {
@@ -23495,16 +25038,17 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     const outside = idx.notes.filter((n) => n.projectName === p.name && !inFolder(n.file)).length;
     const homeInFolder = inFolder(p.file);
     const choices = [];
-    if (folder && homeInFolder) choices.push(['folder', '删除整个项目文件夹：项目主页 + ' + notesIn + ' 条笔记 + ' + filesIn + ' 个文件']);
-    choices.push(['home', '只删除项目主页，保留该项目的笔记和文件（它们会变成“未归属项目”）']);
-    const lines = ['确定删除项目「' + p.title + '」吗？'];
+    const noun = p.isFolder ? '文件夹' : '项目';
+    if (folder && homeInFolder) choices.push(['folder', p.isFolder ? '删除整个文件夹：里面的 ' + notesIn + ' 条笔记 + ' + filesIn + ' 个文件' : '删除整个项目文件夹：项目主页 + ' + notesIn + ' 条笔记 + ' + filesIn + ' 个文件']);
+    choices.push(['home', p.isFolder ? '只把它从工作台的文件夹列表里去掉（删除说明页），里面的文件保留在库里' : '只删除项目主页，保留该项目的笔记和文件（它们会变成“未归属项目”）']);
+    const lines = ['确定删除' + noun + '「' + p.title + '」吗？'];
     if (outside) lines.push('另有 ' + outside + ' 条笔记放在项目文件夹外，不会被删除，只会失去项目归属。');
-    lines.push('如果只是项目结束了，也可以把状态改成「已完成」来归档，而不必删除。');
-    const choice = await this.confirmDelete({ title: '删除项目', lines, choices, confirmText: '删除项目' });
+    if (!p.isFolder) lines.push('如果只是项目结束了，也可以把状态改成「已完成」来归档，而不必删除。');
+    const choice = await this.confirmDelete({ title: '删除' + noun, lines, choices, confirmText: '删除' + noun });
     if (!choice) return false;
     if (choice === 'folder' && folder) await this.trash(folder);
     else await this.trash(p.file);
-    new Notice('🗑 已删除项目：' + p.title + (choice === 'folder' ? '（含全部笔记和文件）' : ''));
+    new Notice('🗑 已删除' + noun + '：' + p.title + (choice === 'folder' ? '（含全部笔记和文件）' : ''));
     this.refreshViews();
     return choice;
   }
