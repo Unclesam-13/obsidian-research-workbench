@@ -2312,7 +2312,6 @@ class WorkbenchView extends ItemView {
     }
     const inferredList = this.index.notes.filter((n) => ofType(n) && n.inferred);
     if (inferredList.length) this.btn(right, '补全属性（' + inferredList.length + '）', 'wand', () => this.plugin.fillProps(inferredList), 'rw-btn-warn');
-    if (type === 'idea') this.btn(right, '梳理想法（画布）', 'brain', () => this.plugin.thought.start(), '');
     if (type === 'draft') {
       this.btn(right, '自己写（写作工作台）', 'pen-tool', () => this.plugin.pickWritingNote({ project: curProject }), 'mod-cta');
       this.btn(right, 'AI 文献综合', 'quote', () => this.plugin.litWriteModal({ project: curProject }), '');
@@ -4520,15 +4519,19 @@ class WorkbenchView extends ItemView {
     clearInterval(this._clockT);
     this._clockT = setInterval(() => { if (!clock.isConnected) return clearInterval(this._clockT); tickClock(); }, 30000);
     this.btn(right, '添加待办', 'plus', () => this.plugin.addTaskModal({ date: today() }), 'mod-cta');
-    const ps = this.section(el, '常驻待办', 'pin');
+    const split = h(el, 'div', { cls: 'rw-plan-split' });
+    const lc = h(split, 'div', { cls: 'rw-plan-left' });
+    const rc = h(split, 'div', { cls: 'rw-plan-right' });
+    this.renderThoughtPanel(rc);
+    const ps = this.section(lc, '常驻待办', 'pin');
     h(ps.right, 'span', { cls: 'rw-muted', text: '没有日期的待办都在这里，一直显示，直到完成 / 不做了 / 忽略' });
     const psBody = ps.body;
-    const cs = this.section(el, '日历', 'calendar-days');
+    const cs = this.section(lc, '日历', 'calendar-days');
     this.renderCalendar(cs.body, true);
-    const two = h(el, 'div', { cls: 'rw-two rw-two-wide' });
+    const two = h(lc, 'div', { cls: 'rw-two rw-two-wide' });
     const left = this.section(two, '未完成待办', 'check-square');
     const loading = h(left.body, 'div', { cls: 'rw-empty-sm', text: '加载中…' });
-    const closedSec = this.section(el, '已处理的待办（近两周，可以恢复）', 'archive');
+    const closedSec = this.section(lc, '已处理的待办（近两周，可以恢复）', 'archive');
     closedSec.el.classList.add('rw-closed-sec');
     this.plugin.collectTasks(this.index, true).then((allT) => {
       this.renderPinnedTasks(psBody, allT);
@@ -4558,10 +4561,57 @@ class WorkbenchView extends ItemView {
     if (!dls.length) h(dsec.body, 'div', { cls: 'rw-empty-sm', text: '在项目主页或笔记中设置 deadline: YYYY-MM-DD' });
     for (const x of dls) this.rowItem(dsec.body, x.item, x.date + ' · ' + deadlineText(x.date), deadlineCls(x.date));
 
-    const mt = this.section(el, '近期会议', 'users');
+    const mt = this.section(lc, '近期会议', 'users');
     const meetings = this.index.notes.filter((n) => n.type === 'meeting').sort((a, b) => (b.date || '').localeCompare(a.date || '')).slice(0, 6);
     if (!meetings.length) h(mt.body, 'div', { cls: 'rw-empty-sm', text: '暂无会议纪要' });
     for (const n of meetings) this.rowItem(mt.body, n, n.date || '');
+  }
+
+  /* ---------- 计划页右栏：梳理画布（把脑子里的杂乱内容倒出来） ---------- */
+  renderThoughtPanel(rc) {
+    const td = this.plugin.thought;
+    const sec = this.section(rc, '梳理想法 · 画布', 'brain');
+    sec.el.classList.add('rw-tdp');
+    h(sec.body, 'div', { cls: 'rw-muted rw-tdp-hint', text: '脑子里乱的时候，写个主题回车，打开一张画布和悬浮输入框：想到什么打什么，回车一条变一个节点。' });
+    const row = h(sec.body, 'div', { cls: 'rw-tdp-new' });
+    const inp = h(row, 'input', { cls: 'rw-tdp-input', attr: { type: 'text', placeholder: '想梳理什么？回车新建一张画布（可不填）' } });
+    inp.value = this._tdpDraft || '';
+    inp.addEventListener('input', () => (this._tdpDraft = inp.value));
+    const go = async () => { const v = inp.value.trim(); this._tdpDraft = ''; inp.value = ''; try { await td.create(v); } catch (e) { new Notice('新建画布失败：' + (e.message || e)); } };
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); go(); } });
+    const nb = h(row, 'button', { cls: 'rw-btn mod-cta' }); ic(nb, 'plus'); h(nb, 'span', { text: '新建' }); nb.addEventListener('click', go);
+    const list = td.recent();
+    if (!list.length) { h(sec.body, 'div', { cls: 'rw-empty-sm', text: '还没有画布。写个主题回车，开始第一张。' }); return; }
+    const grid = h(sec.body, 'div', { cls: 'rw-tdp-grid' });
+    const LIM = 12, all = !!this._tdpAll;
+    for (const f of all ? list : list.slice(0, LIM)) {
+      const card = h(grid, 'div', { cls: 'rw-tdp-card' + (td.file && td.file.path === f.path ? ' is-open' : ''), title: f.path });
+      const thumb = h(card, 'div', { cls: 'rw-tdp-thumb' });
+      const meta = h(card, 'div', { cls: 'rw-tdp-meta' });
+      const name = f.basename.replace(/^\d{4}-\d{2}-\d{2} \d{4} ?/, '') || '想法梳理';
+      h(meta, 'div', { cls: 'rw-tdp-name', text: name });
+      const sub = h(meta, 'div', { cls: 'rw-tdp-sub' });
+      const ds = (f.basename.match(/^(\d{4}-\d{2}-\d{2})/) || [])[1];
+      const cnt = h(sub, 'span', { text: (ds ? ds.slice(5) : '') });
+      h(sub, 'span', { cls: 'rw-tp-sp' });
+      h(sub, 'span', { text: '改于 ' + relTime(f.stat.mtime) });
+      const del = h(card, 'button', { cls: 'rw-tdp-del', attr: { 'aria-label': '删除这张画布' } });
+      ic(del, 'trash-2');
+      const remove = async () => {
+        const ok = await this.plugin.confirmDelete({ title: '删除画布', lines: ['删除「' + f.basename + '」这张画布？', '画布上的节点会一起删掉。'], confirmText: '删除' });
+        if (!ok) return;
+        if (td.file && td.file.path === f.path) td.close();
+        for (const l of this.app.workspace.getLeavesOfType('canvas')) if (l.view && l.view.file && l.view.file.path === f.path) l.detach();
+        await this.plugin.trash(f);
+        new Notice('🗑 已删除画布：' + f.basename);
+        this.render();
+      };
+      del.addEventListener('click', (e) => { e.stopPropagation(); remove(); });
+      card.addEventListener('click', () => td.open(f));
+      card.addEventListener('contextmenu', (e) => { e.preventDefault(); const m = new Menu(); m.addItem((i) => i.setTitle('打开（带悬浮输入框）').setIcon('layout-dashboard').onClick(() => td.open(f))); addDeleteItem(m, '删除这张画布…', remove); m.showAtMouseEvent(e); });
+      this.app.vault.cachedRead(f).then((raw) => { let d = {}; try { d = JSON.parse(raw || '{}'); } catch (e) { /* ignore */ } const n = (d.nodes || []).filter((x) => x.type !== 'group').length; cnt.textContent = (ds ? ds.slice(5) + ' · ' : '') + n + ' 个节点'; drawCanvasThumb(thumb, d); }).catch(() => {});
+    }
+    if (list.length > LIM) { const mb = h(sec.body, 'button', { cls: 'rw-linkbtn rw-tdp-more', text: all ? '收起 ▴' : '展开全部 ' + list.length + ' 张 ▾' }); mb.addEventListener('click', () => { this._tdpAll = !all; this.render(); }); }
   }
 
   /* ---------- AI 助手页 ---------- */
@@ -20207,6 +20257,45 @@ class ThoughtDump {
   }
 }
 
+/* 画布缩略图：按节点位置缩放画出方块、文字和连线 */
+const TD_COLORS = { 1: '#e5484d', 2: '#f97316', 3: '#eab308', 4: '#22a06b', 5: '#06b6d4', 6: '#8b5cf6' };
+function drawCanvasThumb(box, d) {
+  box.empty();
+  const nodes = (d.nodes || []).filter((n) => typeof n.x === 'number' && typeof n.y === 'number');
+  if (!nodes.length) { h(box, 'div', { cls: 'rw-tdp-blank', text: '空白画布' }); return; }
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const n of nodes) { x0 = Math.min(x0, n.x); y0 = Math.min(y0, n.y); x1 = Math.max(x1, n.x + (n.width || 200)); y1 = Math.max(y1, n.y + (n.height || 60)); }
+  const pad = 20; x0 -= pad; y0 -= pad; x1 += pad; y1 += pad;
+  // 保持比例：按缩略图 4:3 补齐
+  let w = x1 - x0, hh = y1 - y0;
+  const R = 4 / 3;
+  if (w / hh > R) { const nh = w / R; y0 -= (nh - hh) / 2; hh = nh; } else { const nw = hh * R; x0 -= (nw - w) / 2; w = nw; }
+  const X = (v) => ((v - x0) / w) * 100, Y = (v) => ((v - y0) / hh) * 100;
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 100 100'); svg.setAttribute('preserveAspectRatio', 'none'); svg.classList.add('rw-tdp-edges');
+  for (const e of d.edges || []) {
+    const a = byId.get(e.fromNode), b = byId.get(e.toNode);
+    if (!a || !b) continue;
+    const ln = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    ln.setAttribute('x1', X(a.x + (a.width || 200) / 2)); ln.setAttribute('y1', Y(a.y + (a.height || 60) / 2));
+    ln.setAttribute('x2', X(b.x + (b.width || 200) / 2)); ln.setAttribute('y2', Y(b.y + (b.height || 60) / 2));
+    ln.setAttribute('vector-effect', 'non-scaling-stroke');
+    svg.appendChild(ln);
+  }
+  box.appendChild(svg);
+  const scale = 100 / w; // 每画布像素在缩略图里占的百分比
+  for (const n of nodes.slice(0, 120)) {
+    const el = h(box, 'div', { cls: 'rw-tdp-node' + (n.type === 'group' ? ' is-group' : '') });
+    el.style.left = X(n.x) + '%'; el.style.top = Y(n.y) + '%';
+    el.style.width = Math.max(1.5, (n.width || 200) * scale) + '%'; el.style.height = Math.max(1.5, ((n.height || 60) / hh) * 100) + '%';
+    const c = TD_COLORS[n.color] || (/^#/.test(n.color || '') ? n.color : '');
+    if (c) el.style.setProperty('--nc', c);
+    const t = n.type === 'text' ? String(n.text || '') : n.type === 'file' ? String(n.file || '').split('/').pop() : n.type === 'link' ? String(n.url || '') : n.label || '';
+    if (t && n.type !== 'group') h(el, 'span', { text: t.replace(/^#+\s*/, '').replace(/\s+/g, ' ').slice(0, 40) });
+  }
+}
+
 class ThoughtStartModal extends Modal {
   constructor(app, td) { super(app); this.td = td; }
   onOpen() {
@@ -20554,6 +20643,12 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     this.addCommand({ id: 'thought-dump', name: '梳理想法：新建 / 继续一张画布（悬浮输入框）', callback: () => this.thought.start() });
     this.addCommand({ id: 'thought-attach', name: '梳理想法：在当前画布打开悬浮输入框', checkCallback: (chk) => { const v = this.app.workspace.activeLeaf && this.app.workspace.activeLeaf.view; const f = v && v.getViewType && v.getViewType() === 'canvas' && v.file; if (!f) return false; if (!chk) this.thought.attach(f); return true; } });
     this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.thought.onLeafChange()));
+    {
+      let t = 0;
+      const upd = (f) => { if (!f || !this.thought.isOurs(f)) return; clearTimeout(t); t = setTimeout(() => { for (const l of this.app.workspace.getLeavesOfType(VIEW_TYPE)) if (l.view && l.view.tab === 'plan' && l.view.render) l.view.render(); }, 800); };
+      this.registerEvent(this.app.vault.on('modify', upd));
+      this.registerEvent(this.app.vault.on('create', upd));
+    }
     this.registerEvent(this.app.workspace.on('layout-change', () => this.thought.onLeafChange()));
     this.register(() => this.thought.close());
     this.app.workspace.onLayoutReady(() => { if (this.settings.openOnStartup) this.activateView(true); });

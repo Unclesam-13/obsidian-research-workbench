@@ -5289,3 +5289,34 @@ input.rw-lw-extra { width: 100%; }
 .rw-td-ritem:hover .rw-td-rdel { opacity: 1; }
 .rw-td-modal button.rw-td-rdel:hover { color: var(--text-error, #e5484d); background: color-mix(in srgb, #e5484d 12%, transparent); }
 .rw-td-rdel svg { width: 14px; height: 14px; }
+
+/* ===== 计划页：左计划待办 · 右梳理画布 ===== */
+.rw-plan-split { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(320px, 1fr); gap: 18px; align-items: start; }
+.rw-plan-left { min-width: 0; }
+.rw-plan-right { min-width: 0; position: sticky; top: 0; }
+.rw-narrow .rw-plan-split { grid-template-columns: 1fr; }
+.rw-narrow .rw-plan-right { position: static; }
+@media (max-width: 1000px) { .rw-plan-split { grid-template-columns: 1fr; } .rw-plan-right { position: static; } }
+.rw-plan-left .rw-two-wide { grid-template-columns: 1fr; }
+.rw-tdp-hint { font-size: 12.5px; line-height: 1.6; margin-bottom: 8px; }
+.rw-tdp-new { display: flex; gap: 6px; margin-bottom: 12px; }
+.rw-tdp-input { flex: 1; min-width: 0; height: 34px !important; font-size: 13.5px; }
+.rw-tdp-new .rw-btn { height: 34px; display: inline-flex; align-items: center; gap: 4px; }
+.rw-tdp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; max-height: calc(100vh - 330px); overflow-y: auto; padding: 2px; }
+.rw-tdp-card { position: relative; border: 1px solid var(--rw-border, var(--background-modifier-border)); border-radius: 12px; background: var(--rw-surface, var(--background-primary)); cursor: pointer; overflow: hidden; transition: border-color .12s, box-shadow .12s; }
+.rw-tdp-card:hover { border-color: var(--rw-accent, var(--interactive-accent)); box-shadow: 0 3px 12px rgba(0,0,0,.08); }
+.rw-tdp-card.is-open { border-color: var(--interactive-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--interactive-accent) 30%, transparent); }
+.rw-tdp-thumb { position: relative; aspect-ratio: 4 / 3; background: var(--background-secondary); background-image: radial-gradient(color-mix(in srgb, var(--text-faint) 35%, transparent) 1px, transparent 1px); background-size: 12px 12px; overflow: hidden; border-bottom: 1px solid var(--rw-border, var(--background-modifier-border)); }
+.rw-tdp-edges { position: absolute; inset: 0; width: 100%; height: 100%; }
+.rw-tdp-edges line { stroke: var(--text-faint); stroke-width: 1; }
+.rw-tdp-node { position: absolute; border-radius: 3px; border: 1px solid color-mix(in srgb, var(--nc, var(--text-faint)) 70%, transparent); background: color-mix(in srgb, var(--nc, #ffffff) 14%, var(--background-primary)); overflow: hidden; padding: 1px 2px; box-sizing: border-box; }
+.rw-tdp-node.is-group { background: color-mix(in srgb, var(--nc, var(--text-faint)) 6%, transparent); border-style: dashed; }
+.rw-tdp-node span { display: block; font-size: 7px; line-height: 1.25; color: var(--text-muted); word-break: break-all; }
+.rw-tdp-blank { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; color: var(--text-faint); }
+.rw-tdp-meta { padding: 7px 10px 8px; }
+.rw-tdp-name { font-weight: 650; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 22px; }
+.rw-tdp-sub { display: flex; gap: 6px; font-size: 11.5px; color: var(--text-muted); margin-top: 2px; }
+.rw-root button.rw-tdp-del { position: absolute; right: 6px; bottom: 30px; width: 26px; height: 26px; padding: 0; border: none; box-shadow: none; border-radius: 6px; background: transparent; color: var(--text-faint); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+.rw-root button.rw-tdp-del:hover { color: var(--text-error, #e5484d); background: color-mix(in srgb, #e5484d 12%, transparent); }
+.rw-tdp-del svg { width: 14px; height: 14px; }
+.rw-tdp-more { margin-top: 8px; }
