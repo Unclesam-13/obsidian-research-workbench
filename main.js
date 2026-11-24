@@ -2542,7 +2542,16 @@ class WorkbenchView extends ItemView {
         const t = h(c, 'div', { cls: 'rw-meet-dtext' });
         h(t, 'div', { cls: 'rw-meet-dname', text: ext === 'md' ? a.file.basename : a.file.name });
         h(t, 'div', { cls: 'rw-muted rw-meet-dmeta', text: ext.toUpperCase() + ' · ' + fmtSize(a.file.stat.size) });
-        c.addEventListener('click', () => pl.openFile(a.file));
+        const canPv = ext !== 'md' && ['pptx', 'docx', 'xlsx', 'xlsm', 'html', 'htm', 'pdf', 'csv', 'txt', 'json', 'tex', 'bib', 'py', 'm'].includes(ext);
+        if (canPv) {
+          // PPT / 网页 / Word / PDF …：点卡片直接弹窗预览（左右键可在本次会议的材料间切换），右侧按钮用系统程序打开
+          const pvList = docs.filter((d) => d.file.extension !== 'md').map((d) => ({ kind: 'file', file: d.file, name: d.file.name, ext: (d.file.extension || '').toLowerCase(), cat: EXT_CAT[(d.file.extension || '').toLowerCase()] || 'other', size: d.file.stat.size, mtime: d.file.stat.mtime }));
+          const idx = pvList.findIndex((d) => d.file.path === a.file.path);
+          c.title = '点击预览 · ' + a.file.path;
+          c.addEventListener('click', () => pl.previewEntries(pvList, idx));
+          const ob = h(c, 'button', { cls: 'rw-iconbtn', title: '用默认程序打开' }); ic(ob, 'external-link');
+          ob.addEventListener('click', (e) => { e.stopPropagation(); pl.openWithDefault(a.file); });
+        } else c.addEventListener('click', () => pl.openFile(a.file));
         if (ext === 'md') {
           const pv = h(c, 'button', { cls: 'rw-iconbtn', title: '在这里预览' }); ic(pv, 'eye');
           pv.addEventListener('click', async (e) => {
