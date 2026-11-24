@@ -5367,3 +5367,11 @@ input.rw-lw-extra { width: 100%; }
 .rw-plan-main.is-canvas .rw-tdp-grid { max-height: none; overflow: visible; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
 .rw-plan-main.is-canvas .rw-tdp-new { max-width: 720px; }
 .rw-narrow .rw-plan-todos { grid-template-columns: 1fr; }
+/* 首页项目时间树：按项目切换 */
+.rw-ptree-switch { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 0 8px; margin-bottom: 4px; }
+.rw-root button.rw-ptree-chip { flex: none; display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 11px; border-radius: 14px; font-size: 12.5px; border: 1px solid var(--rw-border); background: var(--rw-surface, var(--background-primary)); box-shadow: none; cursor: pointer; color: var(--text-muted); }
+.rw-root button.rw-ptree-chip:hover { color: var(--text-normal); border-color: var(--pc, var(--rw-accent)); }
+.rw-root button.rw-ptree-chip.is-active { color: var(--text-normal); font-weight: 650; border-color: var(--pc, var(--rw-accent)); background: color-mix(in srgb, var(--pc, var(--rw-accent)) 14%, var(--background-primary)); }
+.rw-root button.rw-ptree-chip.is-all.is-active { background: var(--rw-accent); border-color: var(--rw-accent); color: var(--rw-accent-ink, #111); }
+.rw-ptree-one > .rw-ptree { border-top-width: 3px; }
+.rw-ptree-one .rw-ptree-list { max-height: none; }

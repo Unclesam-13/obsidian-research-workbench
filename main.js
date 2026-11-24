@@ -1765,9 +1765,22 @@ class WorkbenchView extends ItemView {
   /* 首页：每个项目一棵时间树（项目主页「📌 进展日志」里自己写的一句话） */
   renderProjectTrees(body, list) {
     const pl = this.plugin;
-    const wrap = h(body, 'div', { cls: 'rw-ptree-grid' });
     const sorted = list.slice().sort((a, b) => b.lastActivity - a.lastActivity);
+    // 一排项目按钮切换，一次只看一个项目的时间树（「全部」= 原来的平铺）
+    let sel = pl.settings.homeTreeProj;
+    if (sel !== '__all' && !sorted.some((p) => p.name === sel)) sel = sorted[0] ? sorted[0].name : '';
+    const bar = h(body, 'div', { cls: 'rw-ptree-switch' });
     for (const p of sorted) {
+      const b = h(bar, 'button', { cls: 'rw-ptree-chip' + (p.name === sel ? ' is-active' : ''), title: p.title + (p.stage ? ' · ' + p.stage : '') });
+      b.style.setProperty('--pc', projectColor(p.name));
+      h(b, 'span', { cls: 'rw-ptree-dot' });
+      h(b, 'span', { text: p.title });
+      b.addEventListener('click', () => { pl.settings.homeTreeProj = p.name; pl.saveSettingsSoon(); this.render(); });
+    }
+    if (sorted.length > 1) { const b = h(bar, 'button', { cls: 'rw-ptree-chip is-all' + (sel === '__all' ? ' is-active' : ''), text: '全部' }); b.addEventListener('click', () => { pl.settings.homeTreeProj = '__all'; pl.saveSettingsSoon(); this.render(); }); }
+    const single = sel !== '__all';
+    const wrap = h(body, 'div', { cls: single ? 'rw-ptree-one' : 'rw-ptree-grid' });
+    for (const p of single ? sorted.filter((x) => x.name === sel) : sorted) {
       const card = h(wrap, 'div', { cls: 'rw-ptree' });
       card.style.setProperty('--pc', projectColor(p.name));
       const hd = h(card, 'div', { cls: 'rw-ptree-head' });
@@ -1789,7 +1802,8 @@ class WorkbenchView extends ItemView {
       pl.readProjectProgress(p).then((items) => {
         if (!items.length) { h(tree, 'div', { cls: 'rw-muted rw-ptree-empty', text: '还没有进展记录' }); return; }
         const showAll = this._ptreeAll && this._ptreeAll.has(p.name);
-        const shownItems = showAll ? items : items.slice(0, 5);
+        const LIM = single ? 30 : 5;
+        const shownItems = showAll ? items : items.slice(0, LIM);
         let lastDate = '';
         for (const it of shownItems) {
           const r = h(tree, 'div', { cls: 'rw-ptree-item' + (it.auto ? ' is-auto' : '') });
@@ -1808,8 +1822,8 @@ class WorkbenchView extends ItemView {
             m.showAtMouseEvent(e);
           });
         }
-        if (items.length > 5) {
-          const mb = h(tree, 'button', { cls: 'rw-linkbtn rw-ptree-more', text: showAll ? '收起' : '还有 ' + (items.length - 5) + ' 条 →' });
+        if (items.length > LIM) {
+          const mb = h(tree, 'button', { cls: 'rw-linkbtn rw-ptree-more', text: showAll ? '收起' : '还有 ' + (items.length - LIM) + ' 条 →' });
           mb.addEventListener('click', () => { this._ptreeAll = this._ptreeAll || new Set(); if (showAll) this._ptreeAll.delete(p.name); else this._ptreeAll.add(p.name); this.render(); });
         }
       });
