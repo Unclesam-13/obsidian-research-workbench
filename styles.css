@@ -5346,3 +5346,6 @@ input.rw-lw-extra { width: 100%; }
 .rw-sidenav .rw-side .rw-top-actions { flex-direction: column; align-items: stretch; gap: 0; padding: 4px; flex: none; }
 .rw-sidenav .rw-side button.rw-top-btn { justify-content: flex-start; width: 100%; border-radius: 8px; }
 .rw-sidenav .rw-main > .rw-topbar { margin-bottom: 18px; }
+/* 计划页：日历在最上面整行，下面左右两栏 */
+.rw-plan-cal { margin-bottom: 14px; }
+.rw-plan-scope { display: inline-flex; margin-right: 4px; }
