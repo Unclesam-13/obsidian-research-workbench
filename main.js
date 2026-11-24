@@ -1201,7 +1201,9 @@ class WorkbenchView extends ItemView {
       const was = el.classList.contains('rw-narrow');
       el.classList.toggle('rw-narrow', narrow);
       el.classList.toggle('rw-xnarrow', w < 430);
+      el.style.setProperty('--rw-vh', el.clientHeight + 'px');
       if (was !== narrow && this.bodyEl && this.tab === 'home') this.render();
+      else if (was !== narrow && this.tabsEl && this.index) requestAnimationFrame(() => this.renderTabs());
     };
     apply();
     if (typeof ResizeObserver !== 'undefined') {
@@ -1236,7 +1238,7 @@ class WorkbenchView extends ItemView {
   /* 在工作台里挂载 Mindflow 对话界面（复用 Mindflow 的视图类，只是装在工作台的「Mindflow」标签里） */
   async showMindflow() {
     const pl = this.plugin;
-    if (!this.mfHost) this.mfHost = h(this.contentEl, 'div', { cls: 'rw-mfhost' });
+    if (!this.mfHost) this.mfHost = h(this.mainEl || this.contentEl, 'div', { cls: 'rw-mfhost' });
     this.mfHost.style.display = '';
     if (this.mfView) { try { this.mfView.updateCompact(); } catch (e) { /* ignore */ } return this.mfView; }
     if (this._mfOpening) return this._mfOpening;
@@ -1262,7 +1264,7 @@ class WorkbenchView extends ItemView {
   /* 生活面板：把 Daily Hub 的主页嵌进来（常驻，切走只隐藏） */
   async showLife() {
     const pl = this.plugin;
-    if (!this.lifeHost) this.lifeHost = h(this.contentEl, 'div', { cls: 'rw-lifehost' });
+    if (!this.lifeHost) this.lifeHost = h(this.mainEl || this.contentEl, 'div', { cls: 'rw-lifehost' });
     this.lifeHost.style.display = '';
     if (this.lifeView) { try { this.lifeView.refresh(); } catch (e) { /* ignore */ } return this.lifeView; }
     if (this._lifeOpening) return this._lifeOpening;
@@ -1322,7 +1324,10 @@ class WorkbenchView extends ItemView {
     clear(root);
     root.classList.add('rw-root');
 
-    const top = h(root, 'div', { cls: 'rw-topbar' });
+    // 电脑上的科研面板：模式切换、标签、主题/设置/更多 放在左侧栏（renderTabs 里按需搬过去）
+    this.sideEl = h(root, 'div', { cls: 'rw-side' });
+    const main = (this.mainEl = h(root, 'div', { cls: 'rw-main' }));
+    const top = (this.topEl = h(main, 'div', { cls: 'rw-topbar' }));
     this.modeEl = h(top, 'div', { cls: 'rw-mode', title: '切换科研 / 生活面板' });
     this.searchWrap = h(top, 'div', { cls: 'rw-search' });
     ic(this.searchWrap, 'search', 'rw-search-icon');
@@ -1335,7 +1340,7 @@ class WorkbenchView extends ItemView {
     this.searchInput.addEventListener('focus', () => { if (this.searchInput.value.trim()) this.runSearch(false); });
     this.searchInput.addEventListener('keydown', (e) => this.onSearchKey(e));
 
-    const actions = h(top, 'div', { cls: 'rw-top-actions' });
+    const actions = (this.actionsEl = h(top, 'div', { cls: 'rw-top-actions' }));
     const bTheme = h(actions, 'button', { cls: 'rw-top-btn', title: '切换工作台背景配色' });
     ic(bTheme, 'palette'); h(bTheme, 'span', { text: '主题' });
     bTheme.addEventListener('click', () => new ThemeModal(this.app, this.plugin).open());
@@ -1345,9 +1350,9 @@ class WorkbenchView extends ItemView {
     ic(bMore, 'more-horizontal'); h(bMore, 'span', { text: '更多' });
     bMore.addEventListener('click', (e) => this.moreMenu(e));
 
-    this.tabsEl = h(root, 'div', { cls: 'rw-tabs' });
-    this.dropBanner = h(root, 'div', { cls: 'rw-drop-banner' });
-    this.bodyEl = h(root, 'div', { cls: 'rw-body' });
+    this.tabsEl = h(main, 'div', { cls: 'rw-tabs' });
+    this.dropBanner = h(main, 'div', { cls: 'rw-drop-banner' });
+    this.bodyEl = h(main, 'div', { cls: 'rw-body' });
 
     // 从电脑任意位置拖文件进工作台
     let depth = 0;
@@ -1423,7 +1428,21 @@ class WorkbenchView extends ItemView {
       b.addEventListener('click', () => { if (this.mode !== id) this.setMode(id); });
     }
   }
+  /* 左侧栏布局：只在电脑上、科研面板、不太窄的时候用；手机和窄屏保持原来的上方标签栏 */
+  placeNav() {
+    if (!this.sideEl || !this.topEl) return;
+    const side = this.mode === 'research' && !IS_MOBILE && !this.contentEl.classList.contains('rw-narrow');
+    this.contentEl.classList.toggle('rw-sidenav', side);
+    if (side) {
+      if (this.modeEl.parentElement !== this.sideEl) this.sideEl.append(this.modeEl, this.tabsEl, this.actionsEl);
+    } else if (this.modeEl.parentElement !== this.topEl) {
+      this.topEl.prepend(this.modeEl);
+      this.topEl.append(this.actionsEl);
+      this.topEl.after(this.tabsEl);
+    }
+  }
   renderTabs() {
+    this.placeNav();
     clear(this.tabsEl);
     this.renderMode();
     const counts = {};

@@ -2117,8 +2117,8 @@ mark.cmf-note.is-flash, .math.cmf-note-math.is-flash mjx-math {
 
 /* ===== v0.17 Mindflow 装进工作台的「Mindflow」标签 ===== */
 .rw-root.rw-mfmode { display: flex; flex-direction: column; overflow: hidden !important; padding-bottom: 0 !important; }
-.rw-root.rw-mfmode > .rw-topbar, .rw-root.rw-mfmode > .rw-tabs { flex-shrink: 0; }
-.rw-root.rw-mfmode > .rw-tabs { margin-bottom: 0; }
+.rw-root.rw-mfmode .rw-main > .rw-topbar, .rw-root.rw-mfmode .rw-main > .rw-tabs { flex-shrink: 0; }
+.rw-root.rw-mfmode .rw-main > .rw-tabs { margin-bottom: 0; }
 .rw-mfhost { flex: 1 1 auto; min-height: 0; display: flex; position: relative; margin: 0 -24px; }
 .rw-mfhost > .cmf-embed { flex: 1 1 auto; min-width: 0; min-height: 0; height: auto; padding: 0 !important; overflow: hidden; }
 .rw-narrow .rw-mfhost { margin: 0 -12px; }
@@ -5320,3 +5320,29 @@ input.rw-lw-extra { width: 100%; }
 .rw-root button.rw-tdp-del:hover { color: var(--text-error, #e5484d); background: color-mix(in srgb, #e5484d 12%, transparent); }
 .rw-tdp-del svg { width: 14px; height: 14px; }
 .rw-tdp-more { margin-top: 8px; }
+
+/* ===== 电脑端科研面板：左侧栏导航 ===== */
+.rw-side { display: none; }
+.rw-main { display: contents; }
+.rw-root.rw-sidenav { display: flex !important; flex-direction: row !important; align-items: flex-start; gap: 22px; padding-left: 16px !important; }
+.rw-root.rw-sidenav > .rw-main { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.rw-root.rw-sidenav.rw-dash-mode > .rw-main { min-height: calc(var(--rw-vh, 100vh) - 32px); }
+.rw-root.rw-sidenav.rw-mfmode > .rw-main { height: calc(var(--rw-vh, 100vh) - 18px); min-height: 0; }
+.rw-root.rw-sidenav.rw-mfmode > .rw-side { height: calc(var(--rw-vh, 100vh) - 36px); }
+.rw-sidenav .rw-mfhost { margin-left: 0; }
+.rw-root.rw-sidenav > .rw-side {
+  display: flex; flex-direction: column; gap: 12px; flex: none; width: 184px;
+  position: sticky; top: 0; height: calc(var(--rw-vh, 100vh) - 40px);
+  padding-right: 14px; border-right: 1px solid var(--rw-border);
+}
+.rw-sidenav .rw-side .rw-mode { width: 100%; }
+.rw-sidenav .rw-side .rw-mode-btn { flex: 1; justify-content: center; }
+.rw-sidenav .rw-side .rw-tabs { flex: 1; min-height: 0; flex-direction: column; flex-wrap: nowrap; gap: 2px; margin: 0; padding: 0 2px 0 0; border: none; overflow-y: auto; }
+.rw-sidenav .rw-side button.rw-tab { width: 100%; flex: none; justify-content: flex-start; height: 36px; padding: 0 10px; box-shadow: none; }
+.rw-sidenav .rw-side button.rw-tab.is-active { box-shadow: none; }
+.rw-sidenav .rw-side .rw-tab > span:not(.rw-icon):not(.rw-tab-count):not(.rw-tab-close) { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.rw-sidenav .rw-side .rw-tab-count { margin-left: auto; }
+.rw-sidenav .rw-side button.rw-tab-detail { margin-top: 6px; border: 1px dashed var(--pc, var(--rw-border)); }
+.rw-sidenav .rw-side .rw-top-actions { flex-direction: column; align-items: stretch; gap: 0; padding: 4px; flex: none; }
+.rw-sidenav .rw-side button.rw-top-btn { justify-content: flex-start; width: 100%; border-radius: 8px; }
+.rw-sidenav .rw-main > .rw-topbar { margin-bottom: 18px; }
