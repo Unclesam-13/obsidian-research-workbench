@@ -5360,3 +5360,10 @@ input.rw-lw-extra { width: 100%; }
 .rw-narrow .rw-plan-top { grid-template-columns: 1fr; }
 .rw-narrow .rw-plan-side { max-height: none; }
 @media (max-width: 1000px) { .rw-plan-top { grid-template-columns: 1fr; } .rw-plan-side { max-height: none; } }
+/* 计划页 v0.29.6：日历 / 待办 / 画布 三选一，占同一块位置 */
+.rw-plan-main { margin-bottom: 14px; }
+.rw-plan-todos { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+.rw-plan-todos > .rw-section { margin: 0; }
+.rw-plan-main.is-canvas .rw-tdp-grid { max-height: none; overflow: visible; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+.rw-plan-main.is-canvas .rw-tdp-new { max-width: 720px; }
+.rw-narrow .rw-plan-todos { grid-template-columns: 1fr; }

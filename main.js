@@ -4541,21 +4541,22 @@ class WorkbenchView extends ItemView {
     const sw = h(right, 'div', { cls: 'rw-plan-scope', title: '「我加的」= 在工作台里添加的待办和 计划.md 里的待办；「全部」= 还包括各篇笔记、会议纪要里的 - [ ]' });
     this.seg(sw, [['mine', '我加的'], ['all', '全部']], mineOnly ? 'mine' : 'all', (v) => { this.plugin.settings.planMineOnly = v === 'mine'; this.plugin.saveSettingsSoon(); this.render(); });
     this.btn(right, '添加待办', 'plus', () => this.plugin.addTaskModal({ date: today() }), 'mod-cta');
-    // 上面一行：左边日历，右边一栏在「待办 / 画布」之间切换（按钮在日历标题旁边）
-    const sideMode = this.plugin.settings.planSide === 'canvas' ? 'canvas' : 'todo';
-    const topRow = h(el, 'div', { cls: 'rw-plan-top' });
-    const cs = this.section(topRow, '日历', 'calendar-days');
-    cs.el.classList.add('rw-plan-cal');
-    const swb = h(cs.right, 'div', { cls: 'rw-plan-sidesw', title: '右边一栏显示待办还是梳理画布' });
-    this.seg(swb, [['todo', '待办'], ['canvas', '画布']], sideMode, (v) => { this.plugin.settings.planSide = v; this.plugin.saveSettingsSoon(); this.render(); });
-    this.renderCalendar(cs.body, true);
-    const side = h(topRow, 'div', { cls: 'rw-plan-side is-' + sideMode });
+    // 最上面一块：「日历 / 待办 / 画布」三选一，点按钮直接换掉这一块的内容
+    const view = ['cal', 'todo', 'canvas'].includes(this.plugin.settings.planSide) ? this.plugin.settings.planSide : 'cal';
+    const VT = { cal: ['日历', 'calendar-days'], todo: ['待办', 'check-square'], canvas: ['梳理想法 · 画布', 'brain'] };
+    const cs = this.section(el, VT[view][0], VT[view][1]);
+    cs.el.classList.add('rw-plan-main', 'is-' + view);
+    const swb = h(cs.right, 'div', { cls: 'rw-plan-sidesw', title: '这一块显示日历、待办还是梳理画布' });
+    this.seg(swb, [['cal', '日历'], ['todo', '待办'], ['canvas', '画布']], view, (v) => { this.plugin.settings.planSide = v; this.plugin.saveSettingsSoon(); this.render(); });
     let psBody = null, left = null, loading = null;
-    if (sideMode === 'canvas') this.renderThoughtPanel(side);
+    if (view === 'cal') this.renderCalendar(cs.body, true);
+    else if (view === 'canvas') this.renderThoughtPanel(cs.body, true);
     else {
-      const ps = this.section(side, '常驻待办', 'pin');
+      const tw = h(cs.body, 'div', { cls: 'rw-two rw-plan-todos' });
+      const ps = this.section(tw, '常驻待办', 'pin');
+      h(ps.right, 'span', { cls: 'rw-muted', text: '没有日期，一直显示到处理掉' });
       psBody = ps.body;
-      left = this.section(side, '有日期的待办', 'check-square');
+      left = this.section(tw, '有日期的待办', 'calendar-check');
       loading = h(left.body, 'div', { cls: 'rw-empty-sm', text: '加载中…' });
     }
     const two = h(el, 'div', { cls: 'rw-two rw-plan-below' });
@@ -4601,9 +4602,9 @@ class WorkbenchView extends ItemView {
   }
 
   /* ---------- 计划页右栏：梳理画布（把脑子里的杂乱内容倒出来） ---------- */
-  renderThoughtPanel(rc) {
+  renderThoughtPanel(rc, bare) {
     const td = this.plugin.thought;
-    const sec = this.section(rc, '梳理想法 · 画布', 'brain');
+    const sec = bare ? { el: rc, body: h(rc, 'div', { cls: 'rw-tdp' }) } : this.section(rc, '梳理想法 · 画布', 'brain');
     sec.el.classList.add('rw-tdp');
     h(sec.body, 'div', { cls: 'rw-muted rw-tdp-hint', text: '脑子里乱的时候，写个主题回车，打开一张画布和悬浮输入框：想到什么打什么，回车一条变一个节点。' });
     const row = h(sec.body, 'div', { cls: 'rw-tdp-new' });
