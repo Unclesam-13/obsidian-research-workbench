@@ -5349,3 +5349,14 @@ input.rw-lw-extra { width: 100%; }
 /* 计划页：日历在最上面整行，下面左右两栏 */
 .rw-plan-cal { margin-bottom: 14px; }
 .rw-plan-scope { display: inline-flex; margin-right: 4px; }
+/* 计划页 v0.29.5：日历 + 右侧「待办 / 画布」切换栏 */
+.rw-plan-top { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(320px, 1fr); gap: 16px; align-items: stretch; margin-bottom: 14px; }
+.rw-plan-top > .rw-plan-cal { margin-bottom: 0; min-width: 0; }
+.rw-plan-sidesw { display: inline-flex; }
+.rw-plan-side { min-width: 0; display: flex; flex-direction: column; gap: 12px; max-height: calc(var(--rw-vh, 100vh) - 150px); overflow-y: auto; padding-right: 2px; }
+.rw-plan-side > .rw-section { margin: 0; }
+.rw-plan-side.is-canvas .rw-tdp-grid { max-height: none; overflow: visible; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
+.rw-plan-below { margin-bottom: 14px; }
+.rw-narrow .rw-plan-top { grid-template-columns: 1fr; }
+.rw-narrow .rw-plan-side { max-height: none; }
+@media (max-width: 1000px) { .rw-plan-top { grid-template-columns: 1fr; } .rw-plan-side { max-height: none; } }

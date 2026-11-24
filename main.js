@@ -4541,28 +4541,37 @@ class WorkbenchView extends ItemView {
     const sw = h(right, 'div', { cls: 'rw-plan-scope', title: '「我加的」= 在工作台里添加的待办和 计划.md 里的待办；「全部」= 还包括各篇笔记、会议纪要里的 - [ ]' });
     this.seg(sw, [['mine', '我加的'], ['all', '全部']], mineOnly ? 'mine' : 'all', (v) => { this.plugin.settings.planMineOnly = v === 'mine'; this.plugin.saveSettingsSoon(); this.render(); });
     this.btn(right, '添加待办', 'plus', () => this.plugin.addTaskModal({ date: today() }), 'mod-cta');
-    // 日历放最上面，占满整行
-    const cs = this.section(el, '日历', 'calendar-days');
+    // 上面一行：左边日历，右边一栏在「待办 / 画布」之间切换（按钮在日历标题旁边）
+    const sideMode = this.plugin.settings.planSide === 'canvas' ? 'canvas' : 'todo';
+    const topRow = h(el, 'div', { cls: 'rw-plan-top' });
+    const cs = this.section(topRow, '日历', 'calendar-days');
     cs.el.classList.add('rw-plan-cal');
+    const swb = h(cs.right, 'div', { cls: 'rw-plan-sidesw', title: '右边一栏显示待办还是梳理画布' });
+    this.seg(swb, [['todo', '待办'], ['canvas', '画布']], sideMode, (v) => { this.plugin.settings.planSide = v; this.plugin.saveSettingsSoon(); this.render(); });
     this.renderCalendar(cs.body, true);
-    const split = h(el, 'div', { cls: 'rw-plan-split' });
-    const lc = h(split, 'div', { cls: 'rw-plan-left' });
-    const rc = h(split, 'div', { cls: 'rw-plan-right' });
-    this.renderThoughtPanel(rc);
-    const ps = this.section(lc, '常驻待办', 'pin');
-    h(ps.right, 'span', { cls: 'rw-muted', text: '没有日期的待办都在这里，一直显示，直到完成 / 不做了 / 忽略' });
-    const psBody = ps.body;
-    const two = h(lc, 'div', { cls: 'rw-two rw-two-wide' });
-    const left = this.section(two, '未完成待办', 'check-square');
-    const loading = h(left.body, 'div', { cls: 'rw-empty-sm', text: '加载中…' });
-    const closedSec = this.section(lc, '已处理的待办（近两周，可以恢复）', 'archive');
+    const side = h(topRow, 'div', { cls: 'rw-plan-side is-' + sideMode });
+    let psBody = null, left = null, loading = null;
+    if (sideMode === 'canvas') this.renderThoughtPanel(side);
+    else {
+      const ps = this.section(side, '常驻待办', 'pin');
+      psBody = ps.body;
+      left = this.section(side, '有日期的待办', 'check-square');
+      loading = h(left.body, 'div', { cls: 'rw-empty-sm', text: '加载中…' });
+    }
+    const two = h(el, 'div', { cls: 'rw-two rw-plan-below' });
+    const lc = two;
+    const closedSec = this.section(el, '已处理的待办（近两周，可以恢复）', 'archive');
     closedSec.el.classList.add('rw-closed-sec');
     this.plugin.planTasks(this.index, true).then((allT) => {
-      this.renderPinnedTasks(psBody, allT);
+      if (psBody) this.renderPinnedTasks(psBody, allT);
       this.renderClosedTasks(closedSec.body, allT);
     });
-    this.plugin.planTasks(this.index).then((tasks) => {
+    if (left) this.plugin.planTasks(this.index).then((all) => {
       loading.remove();
+      // 没有日期的（常驻）已经在上面列过了，这里只列有日期的
+      const at = new Map(all.map((t) => [t.file.path + ':' + t.line, t]));
+      const topOf = (t) => { let x = t, n = 0; while (x.parentLine >= 0 && at.has(x.file.path + ':' + x.parentLine) && n++ < 10) x = at.get(x.file.path + ':' + x.parentLine); return x; };
+      const tasks = all.filter((t) => topOf(t).due).sort((a, b) => (topOf(a).due || '').localeCompare(topOf(b).due || ''));
       if (!tasks.length) { h(left.body, 'div', { cls: 'rw-empty-sm', text: mineOnly ? '🎉 没有未完成的待办（只显示在工作台里添加的；笔记里的 - [ ] 切到右上角「全部」能看到）' : '🎉 没有未完成的待办' }); return; }
       const groups = new Map();
       for (const t of tasks) {
