@@ -4531,15 +4531,15 @@ class WorkbenchView extends ItemView {
 
   /* ---------- 计划页 ---------- */
   renderPlan(el) {
-    const right = this.header(el, '计划与待办', '默认只显示你在工作台里添加的待办（右上角可切到「全部」，包括各篇笔记里的 - [ ]）；点一条待办就在窗口里修改（内容、日期、时间、备注、完成），会自动写回原笔记。待办写「📅 日期 ⏰ 时间」就会出现在日历上', 'calendar-check');
+    const right = this.header(el, '计划与待办', '默认只显示「计划」里的待办（科研/计划.md，在工作台里添加的都写在这里；右上角可切到「全部」）；点一条待办就在窗口里修改（内容、日期、时间、备注、完成），会自动写回原笔记。待办写「📅 日期 ⏰ 时间」就会出现在日历上', 'calendar-check');
     const clock = h(right, 'div', { cls: 'rw-clock' });
     const tickClock = () => { const n = new Date(); clock.textContent = pad(n.getHours()) + ':' + pad(n.getMinutes()) + ' · ' + (n.getMonth() + 1) + '月' + n.getDate() + '日 星期' + '日一二三四五六'[n.getDay()]; };
     tickClock();
     clearInterval(this._clockT);
     this._clockT = setInterval(() => { if (!clock.isConnected) return clearInterval(this._clockT); tickClock(); }, 30000);
     const mineOnly = this.plugin.planMineOnly();
-    const sw = h(right, 'div', { cls: 'rw-plan-scope', title: '「我加的」= 在工作台里添加的待办和 计划.md 里的待办；「全部」= 还包括各篇笔记、会议纪要里的 - [ ]' });
-    this.seg(sw, [['mine', '我加的'], ['all', '全部']], mineOnly ? 'mine' : 'all', (v) => { this.plugin.settings.planMineOnly = v === 'mine'; this.plugin.saveSettingsSoon(); this.render(); });
+    const sw = h(right, 'div', { cls: 'rw-plan-scope', title: '「只看计划」= 只显示 科研/计划.md 里的待办（在工作台里添加的待办都写在这里）；「全部」= 还包括各篇笔记、会议纪要里的 - [ ]' });
+    this.seg(sw, [['mine', '只看计划'], ['all', '全部']], mineOnly ? 'mine' : 'all', (v) => { this.plugin.settings.planMineOnly = v === 'mine'; this.plugin.saveSettingsSoon(); this.render(); });
     this.btn(right, '添加待办', 'plus', () => this.plugin.addTaskModal({ date: today() }), 'mod-cta');
     // 最上面一块：「日历 / 待办 / 画布」三选一，点按钮直接换掉这一块的内容
     const view = ['cal', 'todo', 'canvas'].includes(this.plugin.settings.planSide) ? this.plugin.settings.planSide : 'cal';
@@ -4573,7 +4573,7 @@ class WorkbenchView extends ItemView {
       const at = new Map(all.map((t) => [t.file.path + ':' + t.line, t]));
       const topOf = (t) => { let x = t, n = 0; while (x.parentLine >= 0 && at.has(x.file.path + ':' + x.parentLine) && n++ < 10) x = at.get(x.file.path + ':' + x.parentLine); return x; };
       const tasks = all.filter((t) => topOf(t).due).sort((a, b) => (topOf(a).due || '').localeCompare(topOf(b).due || ''));
-      if (!tasks.length) { h(left.body, 'div', { cls: 'rw-empty-sm', text: mineOnly ? '🎉 没有未完成的待办（只显示在工作台里添加的；笔记里的 - [ ] 切到右上角「全部」能看到）' : '🎉 没有未完成的待办' }); return; }
+      if (!tasks.length) { h(left.body, 'div', { cls: 'rw-empty-sm', text: mineOnly ? '🎉 没有未完成的待办（只显示计划里的；笔记里的 - [ ] 切到右上角「全部」能看到）' : '🎉 没有未完成的待办' }); return; }
       const groups = new Map();
       for (const t of tasks) {
         const k = t.projectName || '（未归属项目）';
@@ -5993,6 +5993,7 @@ class TaskModal extends Modal {
     this.v.cancelAt = cancelAt ? cancelAt[1] : '';
     this.v.text = this.v.text.replace(/❌\s*\d{4}-\d{2}-\d{2}/, '').replace(/\s+/g, ' ').trim();
     { const cm = this.v.text.match(/➕\s*(\d{4}-\d{2}-\d{2})/); if (cm) { this.v.created = cm[1]; this.v.text = this.v.text.replace(/\s*➕\s*\d{4}-\d{2}-\d{2}/, '').trim(); } }
+    { const pm = this.v.text.match(/\s*\[\[([^\]|#]+)\]\]\s*$/); if (pm && this.plugin.buildIndex().byName.has(pm[1].trim())) { this.v.projLink = pm[1].trim(); this.v.text = this.v.text.slice(0, pm.index).trim(); } }
     // 下面缩进更深的行 = 这条待办的备注
     const notes = [];
     let k = ln + 1;
@@ -6058,7 +6059,7 @@ class TaskModal extends Modal {
     const v = this.v;
     const text = String(v.text || '').replace(/\s+/g, ' ').trim();
     const sc = v.status != null ? v.status : (v.done ? 'x' : ' ');
-    let line = this.indent + this.bullet + ' [' + sc + '] ' + text + (v.date ? ' 📅 ' + v.date : '') + (v.time ? ' ⏰ ' + v.time : '') + (v.created ? ' ➕ ' + v.created : '');
+    let line = this.indent + this.bullet + ' [' + sc + '] ' + text + (v.date ? ' 📅 ' + v.date : '') + (v.time ? ' ⏰ ' + v.time : '') + (v.projLink ? ' [[' + v.projLink + ']]' : '') + (v.created ? ' ➕ ' + v.created : '');
     if (sc === 'x') line += ' ✅ ' + (v.doneAt || today());
     else if (sc === '-') line += ' ❌ ' + (v.cancelAt || today());
     const notes = String(v.notes || '').split('\n').map((x) => x.trim()).filter(Boolean).map((x) => this.notePrefix + x);
@@ -20890,16 +20891,19 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
         const tm = text.match(/⏰\s*(\d{1,2}):(\d{2})/) || text.match(/(?:📅|due:)\s*\d{4}-\d{2}-\d{2}\s+(\d{1,2}):(\d{2})/);
         const endM = text.match(/(?:✅|❌)\s*(\d{4}-\d{2}-\d{2})/);
         const clean = text.replace(/(?:📅|due:)\s*\d{4}-\d{2}-\d{2}(\s+\d{1,2}:\d{2})?/, '').replace(/⏰\s*\d{1,2}:\d{2}/, '').replace(/(?:✅|❌)\s*\d{4}-\d{2}-\d{2}/, '').replace(/\s*➕\s*\d{4}-\d{2}-\d{2}/, '').trim();
-        const mine = it.file === pf || /➕\s*\d{4}-\d{2}-\d{2}/.test(text);
+        const mine = it.file === pf;
+        // 计划.md 里的待办可以用 [[项目名]] 挂到项目上
+        let projName = it.projectName, clean2 = clean;
+        if (mine) { const lm = clean.match(/\s*\[\[([^\]|#]+)\]\]\s*$/); if (lm && index.byName && index.byName.has(lm[1].trim())) { projName = lm[1].trim(); clean2 = clean.slice(0, lm.index).trim(); } }
         const par = li.parent >= 0 && taskAt.has(li.parent) ? li.parent : -1;
         const kids = all.filter((x) => x.parent === line && x.task !== undefined);
-        out.push({ file: it.file, projectName: it.projectName, line, raw, text: clean, mine, due: dm ? dm[1] : '', time: tm ? pad(Number(tm[1])) + ':' + tm[2] : '', done: !TASK_OPEN(li.task), status: li.task === 'X' ? 'x' : li.task, endDate: endM ? endM[1] : '', parentLine: par, parentOpen: par >= 0 && TASK_OPEN(taskAt.get(par).task), subTotal: kids.filter((x) => x.task !== '~').length, subDone: kids.filter((x) => x.task !== '~' && !TASK_OPEN(x.task)).length });
+        out.push({ file: it.file, projectName: projName, line, raw, text: clean2, mine, due: dm ? dm[1] : '', time: tm ? pad(Number(tm[1])) + ':' + tm[2] : '', done: !TASK_OPEN(li.task), status: li.task === 'X' ? 'x' : li.task, endDate: endM ? endM[1] : '', parentLine: par, parentOpen: par >= 0 && TASK_OPEN(taskAt.get(par).task), subTotal: kids.filter((x) => x.task !== '~').length, subDone: kids.filter((x) => x.task !== '~' && !TASK_OPEN(x.task)).length });
       }
     }
     // 小步骤跟着大点：大点是自己加的，小步骤也算
     const key = (t) => t.file.path + ':' + t.line;
     const byKey = new Map(out.map((t) => [key(t), t]));
-    for (const t of out) if (!t.mine && t.parentLine >= 0) { const pt = byKey.get(t.file.path + ':' + t.parentLine); if (pt && pt.mine) t.mine = true; }
+    for (const t of out) if (t.parentLine >= 0) { const pt = byKey.get(t.file.path + ':' + t.parentLine); if (pt) { if (pt.mine) t.mine = true; if (t.file === pf && pt.projectName) t.projectName = pt.projectName; } }
     return out;
   }
   /* 计划页 / 日历是否只显示「在工作台里加的」待办（默认是） */
@@ -21157,8 +21161,8 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
     if (subs.length) line += '\n' + subs.map((x) => '\t- [ ] ' + x).join('\n');
     let file;
     const p = o.project ? this.buildIndex().byName.get(o.project) : null;
-    if (p) file = p.file;
-    else {
+    if (p) line = line.replace(/^(- \[ \] [^\n]*?)( ➕ \d{4}-\d{2}-\d{2})/, '$1 [[' + p.name + ']]$2');
+    {
       file = this.app.vault.getAbstractFileByPath(this.planFilePath());
       if (!(file instanceof TFile)) {
         await this.ensureFolder(normalizePath(this.settings.rootFolder));
@@ -21176,7 +21180,7 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       const before = lines.slice(0, k).filter((l) => !/^\s*[-*+]\s*\[ \]\s*$/.test(l));
       return data.slice(0, startI) + before.concat([line]).concat(lines.slice(k)).join('\n');
     });
-    new Notice('✅ 已添加待办' + (subs.length ? '（' + subs.length + ' 个小步骤）' : '') + (o.date ? '：' + o.date + (o.time ? ' ' + o.time : '') : '') + (p ? ' → ' + p.title : ' → 计划.md'));
+    new Notice('✅ 已添加待办' + (subs.length ? '（' + subs.length + ' 个小步骤）' : '') + (o.date ? '：' + o.date + (o.time ? ' ' + o.time : '') : '') + ' → 计划.md' + (p ? '（' + p.title + '）' : ''));
     this.refreshViews();
     return file;
   }
