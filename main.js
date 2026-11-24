@@ -2466,7 +2466,7 @@ class WorkbenchView extends ItemView {
       h(b, 'div', { cls: 'rw-meet-ititle', text: n.title.replace(/^\d{4}-\d{2}-\d{2}\s*/, '') || n.title });
       const meta = h(b, 'div', { cls: 'rw-meet-imeta' });
       if (n.projectName) this.projectChip(meta, (this.index.byName.get(n.projectName) || {}).title || n.projectName);
-      const atts = pl.attachmentsOf(n);
+      const atts = pl.meetingMaterials(n);
       const nAudio = atts.filter((a) => FILE_CATS.meeting.exts.includes((a.file.extension || '').toLowerCase())).length;
       if (nAudio) { const s = h(meta, 'span', { cls: 'rw-meet-badge', title: '录音 / 视频' }); ic(s, 'mic'); h(s, 'span', { text: String(nAudio) }); }
       if (atts.length - nAudio) { const s = h(meta, 'span', { cls: 'rw-meet-badge', title: '其他材料' }); ic(s, 'paperclip'); h(s, 'span', { text: String(atts.length - nAudio) }); }
@@ -2504,7 +2504,7 @@ class WorkbenchView extends ItemView {
 
     if (str(fm.summary)) { const sm = h(main, 'div', { cls: 'rw-meet-summary-box' }); h(sm, 'div', { cls: 'rw-meet-lab', text: '简介' }); h(sm, 'div', { text: str(fm.summary) }); }
 
-    const atts = pl.attachmentsOf(n);
+    const atts = pl.meetingMaterials(n);
     const MEDIA = FILE_CATS.meeting.exts, IMG = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'];
     const media = atts.filter((a) => MEDIA.includes((a.file.extension || '').toLowerCase()));
     const imgs = atts.filter((a) => IMG.includes((a.file.extension || '').toLowerCase()));
@@ -22786,6 +22786,24 @@ module.exports = class ResearchWorkbenchPlugin extends Plugin {
       walk(dir);
     }
     for (const x of out) if (x.file.path.startsWith(this.attachDir(n.file) + '/')) x.inDir = true;
+    return out;
+  }
+  /* 会议的材料：附件（属性 / 附件文件夹）+ 纪要正文里链接到的文件和笔记（比如「材料」表格里的 PPT、演讲稿） */
+  meetingMaterials(n) {
+    const out = this.attachmentsOf(n);
+    const seen = new Set(out.map((x) => x.file.path));
+    const c = n && n.file && this.app.metadataCache.getFileCache(n.file);
+    if (!c) return out;
+    const idx = this._lastIdx || this.buildIndex();
+    const homes = new Set(idx.projects.concat(idx.folders || []).map((p) => p.file.path));
+    for (const l of (c.links || []).concat(c.embeds || [])) {
+      const f = this.app.metadataCache.getFirstLinkpathDest(String(l.link).split('#')[0], n.file.path);
+      if (!(f instanceof TFile) || f.path === n.file.path || seen.has(f.path) || homes.has(f.path)) continue;
+      const other = f.extension === 'md' && idx.notes.find((x) => x.file === f && x.type === 'meeting');
+      if (other) continue;
+      seen.add(f.path);
+      out.push({ file: f, listed: false, linked: true });
+    }
     return out;
   }
   /* items：库里的 TFile，或从电脑选 / 拖进来的 File。电脑上的文件总是复制进附件文件夹；库里的文件按 move 决定移不移 */
