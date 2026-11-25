@@ -4571,7 +4571,7 @@ class WorkbenchView extends ItemView {
     cs.el.classList.add('rw-plan-main', 'is-' + view);
     const swb = h(cs.right, 'div', { cls: 'rw-plan-sidesw', title: '这一块显示日历、待办还是梳理画布' });
     this.seg(swb, [['cal', '日历'], ['todo', '待办'], ['canvas', '画布']], view, (v) => { this.plugin.settings.planSide = v; this.plugin.saveSettingsSoon(); this.render(); });
-    let psBody = null, left = null, loading = null;
+    let psBody = null, left = null, loading = null, todayMode = false;
     if (view === 'cal') this.renderCalendar(cs.body, true);
     else if (view === 'canvas') this.renderThoughtPanel(cs.body, true);
     else {
@@ -4579,7 +4579,22 @@ class WorkbenchView extends ItemView {
       const ps = this.section(tw, '常驻待办', 'pin');
       h(ps.right, 'span', { cls: 'rw-muted', text: '没有日期，一直显示到处理掉' });
       psBody = ps.body;
-      left = this.section(tw, '有日期的待办', 'calendar-check');
+      todayMode = this.plugin.settings.planTodoMode === 'today';
+      left = this.section(tw, todayMode ? '今日待办' : '有日期的待办', todayMode ? 'sun' : 'calendar-check');
+      const tsw = h(left.right, 'div', { cls: 'rw-plan-todosw', title: '切换：所有有日期的待办 ｜ 只看今天要做的' });
+      this.seg(tsw, [['dated', '有日期的'], ['today', '今日待办']], todayMode ? 'today' : 'dated', (v) => { this.plugin.settings.planTodoMode = v; this.plugin.saveSettingsSoon(); this.render(); });
+      if (todayMode) {
+        // 今日待办：输入框回车直接加一条日期是今天的待办
+        const add = h(left.body, 'div', { cls: 'rw-pin-add rw-today-add' });
+        const inp = h(add, 'input', { attr: { type: 'text', placeholder: '今天要做什么？回车加进今日待办' } });
+        inp.value = this._todayDraft || '';
+        inp.addEventListener('input', () => (this._todayDraft = inp.value));
+        const ab = h(add, 'button', { cls: 'rw-btn rw-btn-sm mod-cta' }); ic(ab, 'plus'); h(ab, 'span', { text: '添加' });
+        const go = async () => { const v = inp.value.trim(); if (!v) return; inp.value = ''; this._todayDraft = ''; this._keepFocus = { key: 'today-add', at: Date.now(), force: true }; await this.plugin.addTask({ text: v, date: today(), project: '' }); };
+        ab.addEventListener('click', go);
+        inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); go(); } });
+        this.keepFocus(inp, 'today-add');
+      }
       loading = h(left.body, 'div', { cls: 'rw-empty-sm', text: '加载中…' });
     }
     const two = h(el, 'div', { cls: 'rw-two rw-plan-below' });
@@ -4595,7 +4610,22 @@ class WorkbenchView extends ItemView {
       // 没有日期的（常驻）已经在上面列过了，这里只列有日期的
       const at = new Map(all.map((t) => [t.file.path + ':' + t.line, t]));
       const topOf = (t) => { let x = t, n = 0; while (x.parentLine >= 0 && at.has(x.file.path + ':' + x.parentLine) && n++ < 10) x = at.get(x.file.path + ':' + x.parentLine); return x; };
-      const tasks = all.filter((t) => topOf(t).due).sort((a, b) => (topOf(a).due || '').localeCompare(topOf(b).due || ''));
+      let tasks = all.filter((t) => topOf(t).due).sort((a, b) => (topOf(a).due || '').localeCompare(topOf(b).due || '') || (topOf(a).time || '99').localeCompare(topOf(b).time || '99'));
+      if (todayMode) {
+        const td = today();
+        const late = tasks.filter((t) => topOf(t).due < td);
+        tasks = tasks.filter((t) => topOf(t).due === td);
+        const nTop = (arr) => arr.filter((t) => !(t.parentLine >= 0 && t.parentOpen)).length;
+        if (!tasks.length) h(left.body, 'div', { cls: 'rw-empty-sm', text: '今天还没有待办，在上面写一条回车就加进来' });
+        else { const g = h(left.body, 'div', { cls: 'rw-task-group' }); const gh = h(g, 'div', { cls: 'rw-task-group-head' }); h(gh, 'span', { text: '今天 · ' + td.slice(5) }); h(gh, 'span', { cls: 'rw-col-count', text: nTop(tasks) }); this.taskTree(g, tasks); }
+        if (late.length) {
+          const g = h(left.body, 'div', { cls: 'rw-task-group rw-today-late' });
+          const gh = h(g, 'div', { cls: 'rw-task-group-head' }); h(gh, 'span', { cls: 'rw-deadline is-overdue', text: '之前没做完的' }); h(gh, 'span', { cls: 'rw-col-count', text: nTop(late) });
+          h(gh, 'span', { cls: 'rw-muted', text: '右边「⋯」可以推迟到明天' });
+          this.taskTree(g, late);
+        }
+        return;
+      }
       if (!tasks.length) { h(left.body, 'div', { cls: 'rw-empty-sm', text: mineOnly ? '🎉 没有未完成的待办（只显示计划里的；笔记里的 - [ ] 切到右上角「全部」能看到）' : '🎉 没有未完成的待办' }); return; }
       const groups = new Map();
       for (const t of tasks) {
